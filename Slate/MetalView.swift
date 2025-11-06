@@ -144,31 +144,27 @@ func screenToNDC(point: CGPoint, viewSize: CGSize, panOffset: SIMD2<Float>, zoom
 }
 
 func screenToWorld(point: CGPoint, viewSize: CGSize, panOffset: SIMD2<Float>, zoomScale: Float) -> CGPoint {
-    // This is the INVERSE of what the GPU shader does
+    // This must be the EXACT INVERSE of the GPU shader transform
     
-    // 1. Normalize to 0...1
-    let normX = Float(point.x) / Float(viewSize.width)
-    let normY = Float(point.y) / Float(viewSize.height)
+    // 1. Convert screen pixels to NDC (-1 to 1)
+    let ndcX = (Float(point.x) / Float(viewSize.width)) * 2.0 - 1.0
+    let ndcY = -((Float(point.y) / Float(viewSize.height)) * 2.0 - 1.0)  // Flip Y
     
-    // 2. Center around 0.5
-    let centeredX = normX - 0.5
-    let centeredY = normY - 0.5
+    // 2. Unapply pan (subtract what GPU adds)
+    let panX = (panOffset.x / Float(viewSize.width)) * 2.0
+    let panY = -(panOffset.y / Float(viewSize.height)) * 2.0
+    let unpannedX = ndcX - panX
+    let unpannedY = ndcY - panY
     
-    // 3. Unapply zoom (divide)
-    let worldX = centeredX / zoomScale
-    let worldY = centeredY / zoomScale
+    // 3. Unapply zoom (divide what GPU multiplies)
+    let worldX = unpannedX / zoomScale
+    let worldY = unpannedY / zoomScale
     
-    // 4. Unapply pan (must match screenToNDC exactly!)
-    let panNormX = panOffset.x / Float(viewSize.width)
-    let panNormY = panOffset.y / Float(viewSize.height)
-    let finalX = worldX - panNormX
-    let finalY = worldY - panNormY
+    // 4. Convert back to screen pixels
+    let screenX = ((worldX + 1.0) / 2.0) * Float(viewSize.width)
+    let screenY = ((-(worldY) + 1.0) / 2.0) * Float(viewSize.height)  // Flip Y back
     
-    // 5. Convert back to screen pixel coordinates (0...width/height)
-    let worldPointX = (finalX + 0.5) * Float(viewSize.width)
-    let worldPointY = (finalY + 0.5) * Float(viewSize.height)
-    
-    return CGPoint(x: CGFloat(worldPointX), y: CGFloat(worldPointY))
+    return CGPoint(x: CGFloat(screenX), y: CGFloat(screenY))
 }
 
 struct MetalView: UIViewRepresentable {
@@ -200,7 +196,7 @@ struct MetalView: UIViewRepresentable {
         weak var coordinator: Coordinator?
         
         var panGesture: UIPanGestureRecognizer!
-//        var pinchGesture: UIPinchGestureRecognizer!
+        var pinchGesture: UIPinchGestureRecognizer!
         
         // Then set it up in a function
         override init(frame: CGRect, device: MTLDevice?) {
@@ -221,12 +217,12 @@ struct MetalView: UIViewRepresentable {
             self.addGestureRecognizer(panGesture)
             
             // Pinch gesture automatically requires 2 fingers
-//            pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
-//            self.addGestureRecognizer(pinchGesture)
+            pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+            self.addGestureRecognizer(pinchGesture)
             
             // Allow both gestures to work simultaneously
             panGesture.delegate = self
-//            pinchGesture.delegate = self
+            pinchGesture.delegate = self
         }
         
         @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
@@ -245,7 +241,7 @@ struct MetalView: UIViewRepresentable {
             
             // Corrected property name from `panOfffset` to `panOffset` on Coordinator
             coordinator?.panOffset.x += translationx
-            coordinator?.panOffset.y -= translationy
+            coordinator?.panOffset.y += translationy
             
             // Consume the translation so next call provides the delta since we last handled it
             gesture.setTranslation(.zero, in: self)
@@ -415,6 +411,8 @@ struct MetalView: UIViewRepresentable {
         
         // Touch handling methods
         // Touch handling methods
+        // Touch handling methods
+        // Touch handling methods
         func handleTouchBegan(at point: CGPoint) {
             guard let view = metalView else { return }
             
@@ -427,7 +425,7 @@ struct MetalView: UIViewRepresentable {
             )
             
             currentTouchPoints = []
-            currentTouchPoints.append(worldPoint)  // ← Use worldPoint, not point!
+            currentTouchPoints.append(worldPoint)  // ← Use worldPoint
             print("Touch began at screen: \(point), world: \(worldPoint)")
         }
 
@@ -443,7 +441,7 @@ struct MetalView: UIViewRepresentable {
             )
             
             print("Touch moved to screen: \(point), world: \(worldPoint)")
-            currentTouchPoints.append(worldPoint)  // ← Use worldPoint!
+            currentTouchPoints.append(worldPoint)  // ← Use worldPoint
         }
 
         func handleTouchEnded(at point: CGPoint) {
@@ -458,7 +456,7 @@ struct MetalView: UIViewRepresentable {
             )
             
             print("Touch ended at screen: \(point), world: \(worldPoint)")
-            currentTouchPoints.append(worldPoint)  // ← Use worldPoint!
+            currentTouchPoints.append(worldPoint)  // ← Use worldPoint
             
             guard currentTouchPoints.count >= 4 else {
                 currentTouchPoints = []
@@ -483,10 +481,9 @@ struct MetalView: UIViewRepresentable {
             currentTouchPoints = []
         }
 
-        
         func handleTouchCancelled() {
             print("Touch cancelled")
-            // Add your touch handling logic here
+            currentTouchPoints = []
         }
         
 
