@@ -14,7 +14,7 @@ Slate demonstrates how to build a performant drawing app using Metal's GPU accel
 
 - ✅ **Smooth Stroke Rendering** - Catmull-Rom spline interpolation for high-quality curves
 - ✅ **Two-Finger Pan Navigation** - Intuitive canvas navigation without interfering with drawing
-- ✅ **Pinch-to-Zoom** - Smooth scaling with maintained stroke accuracy
+- ✅ **Pinch-to-Zoom and Rotation** - Smooth scaling with maintained stroke accuracy
 - ✅ **GPU-Accelerated Transforms** - Pan and zoom operations handled entirely on GPU
 - ✅ **Accurate Touch Positioning** - Precise coordinate space management across all zoom levels
 - ✅ **High Performance** - 60fps rendering with 240Hz touch input capture
