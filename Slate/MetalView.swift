@@ -596,7 +596,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         if currentTouchPoints.count >= 2 {
             let currentVertices = tessellateStroke(
                 centerPoints: currentTouchPoints,
-                width: 10.0,
+                width: 10.0 / CGFloat(zoomScale),  // ← Fixed width in world pixels
                 viewSize: view.bounds.size,
                 panOffset: .zero,      // ← Identity, not current!
                 zoomScale: 1.0
@@ -726,7 +726,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                                             segmentsPerCurve: 20)
 
         let stroke = Stroke(centerPoints: smoothPoints,
-                            width: 10.0,
+                            width: 10.0 / CGFloat(zoomScale),
                             color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0),
                             viewSize: view.bounds.size)
 
