@@ -4,37 +4,37 @@ import MetalKit
 
 // MARK: - Geometry / Tessellation
 
-/// Convert a world (canvas pixel) point to NDC, applying pan/zoom.
+/// Convert a world (canvas pixel) point to model-space NDC using double precision.
 func worldPixelToNDC(point w: CGPoint,
                      viewSize: CGSize,
                      panOffset: SIMD2<Float>,
-                     zoomScale: Float) -> SIMD2<Float> {
-    let cx = Float(viewSize.width)  * 0.5
-    let cy = Float(viewSize.height) * 0.5
+                     zoomScale: Float) -> SIMD2<Double> {
+    let cx = Double(viewSize.width) * 0.5
+    let cy = Double(viewSize.height) * 0.5
 
-    let wx = Float(w.x), wy = Float(w.y)
+    let wx = Double(w.x), wy = Double(w.y)
 
     // Remove center (world -> centered)
     let centeredX = wx - cx
     let centeredY = wy - cy
 
     // Apply zoom (centered -> zoomed)
-    let zx = centeredX * zoomScale
-    let zy = centeredY * zoomScale
+    let zx = centeredX * Double(zoomScale)
+    let zy = centeredY * Double(zoomScale)
 
     // Apply pan (in pixels)
-    let px = zx + panOffset.x
-    let py = zy + panOffset.y
+    let px = zx + Double(panOffset.x)
+    let py = zy + Double(panOffset.y)
 
     // Back to screen pixels
     let sx = px + cx
     let sy = py + cy
 
     // Screen pixels -> NDC
-    let ndcX = (sx / Float(viewSize.width)) * 2.0 - 1.0
-    let ndcY = -((sy / Float(viewSize.height)) * 2.0 - 1.0)
+    let ndcX = (sx / Double(viewSize.width)) * 2.0 - 1.0
+    let ndcY = -((sy / Double(viewSize.height)) * 2.0 - 1.0)
 
-    return SIMD2<Float>(ndcX, ndcY)
+    return SIMD2<Double>(ndcX, ndcY)
 }
 
 /// Create triangles for a stroke from world (canvas pixel) center points.
@@ -42,8 +42,8 @@ func tessellateStroke(centerPoints: [CGPoint],
                       width: CGFloat,
                       viewSize: CGSize,
                       panOffset: SIMD2<Float> = .zero,
-                      zoomScale: Float = 1.0) -> [SIMD2<Float>] {
-    var vertices: [SIMD2<Float>] = []
+                      zoomScale: Float = 1.0) -> [SIMD2<Double>] {
+    var vertices: [SIMD2<Double>] = []
 
     guard centerPoints.count >= 2 else {
         if centerPoints.count == 1 {
@@ -56,7 +56,7 @@ func tessellateStroke(centerPoints: [CGPoint],
         return vertices
     }
 
-    let halfWidth = Float(width / 2.0)
+    let halfWidth = Double(width / 2.0)
 
     // 1) START CAP
     let startCapVertices = createCircle(
@@ -81,9 +81,9 @@ func tessellateStroke(centerPoints: [CGPoint],
         guard len > 0 else { continue }
         let n = dir / len
 
-        let perp = SIMD2<Float>(-n.y, n.x)
+        let perp = SIMD2<Double>(-n.y, n.x)
 
-        let widthInNDC = (halfWidth / Float(viewSize.width)) * 2.0 * zoomScale
+        let widthInNDC = (halfWidth / Double(viewSize.width)) * 2.0 * Double(zoomScale)
 
         let T1 = p1 + perp * widthInNDC
         let B1 = p1 - perp * widthInNDC
@@ -125,20 +125,20 @@ func createCircle(at point: CGPoint,
                   viewSize: CGSize,
                   panOffset: SIMD2<Float> = .zero,
                   zoomScale: Float = 1.0,
-                  segments: Int = 30) -> [SIMD2<Float>] {
-    var vertices: [SIMD2<Float>] = []
+                  segments: Int = 30) -> [SIMD2<Double>] {
+    var vertices: [SIMD2<Double>] = []
 
     let center = worldPixelToNDC(point: point, viewSize: viewSize, panOffset: panOffset, zoomScale: zoomScale)
-    let radiusInNDC = (Float(radius) / Float(viewSize.width)) * 2.0 * zoomScale
+    let radiusInNDC = (Double(radius) / Double(viewSize.width)) * 2.0 * Double(zoomScale)
 
     for i in 0..<segments {
-        let a1 = Float(i) * (2.0 * .pi / Float(segments))
-        let a2 = Float(i + 1) * (2.0 * .pi / Float(segments))
+        let a1 = Double(i) * (2.0 * .pi / Double(segments))
+        let a2 = Double(i + 1) * (2.0 * .pi / Double(segments))
 
-        let p1 = SIMD2<Float>(center.x + cos(a1) * radiusInNDC,
-                              center.y + sin(a1) * radiusInNDC)
-        let p2 = SIMD2<Float>(center.x + cos(a2) * radiusInNDC,
-                              center.y + sin(a2) * radiusInNDC)
+        let p1 = SIMD2<Double>(center.x + cos(a1) * radiusInNDC,
+                               center.y + sin(a1) * radiusInNDC)
+        let p2 = SIMD2<Double>(center.x + cos(a2) * radiusInNDC,
+                               center.y + sin(a2) * radiusInNDC)
 
         vertices.append(center)
         vertices.append(p1)
@@ -188,25 +188,25 @@ func screenToWorldPixels(_ p: CGPoint,
                          panOffset: SIMD2<Float>,
                          zoomScale: Float,
                          rotationAngle: Float) -> CGPoint {
-    let W = Float(viewSize.width)
-    let H = Float(viewSize.height)
+    let W = Double(viewSize.width)
+    let H = Double(viewSize.height)
 
     // screen -> NDC
-    let ndcX = (Float(p.x) / W) * 2.0 - 1.0
-    let ndcY = -((Float(p.y) / H) * 2.0 - 1.0)
+    let ndcX = (Double(p.x) / W) * 2.0 - 1.0
+    let ndcY = -((Double(p.y) / H) * 2.0 - 1.0)
 
     // unpan in NDC (NOTE: same conversion/signs as shader)
-    let panNDCx = (panOffset.x / W) * 2.0
-    let panNDCy = -(panOffset.y / H) * 2.0
+    let panNDCx = (Double(panOffset.x) / W) * 2.0
+    let panNDCy = -(Double(panOffset.y) / H) * 2.0
     let upX = ndcX - panNDCx
     let upY = ndcY - panNDCy
 
     // unzoom
-    let uzX = upX / zoomScale
-    let uzY = upY / zoomScale
+    let uzX = upX / Double(zoomScale)
+    let uzY = upY / Double(zoomScale)
 
     // unrotate (R(-θ))
-    let c = cos(rotationAngle), s = sin(rotationAngle)
+    let c = cos(Double(rotationAngle)), s = sin(Double(rotationAngle))
     let posX =  uzX * c - uzY * s
     let posY =  uzX * s + uzY * c
 
@@ -222,25 +222,25 @@ func worldToScreenPixels(_ w: CGPoint,
                          panOffset: SIMD2<Float>,
                          zoomScale: Float,
                          rotationAngle: Float) -> CGPoint {
-    let W = Float(viewSize.width)
-    let H = Float(viewSize.height)
+    let W = Double(viewSize.width)
+    let H = Double(viewSize.height)
 
     // world pixels -> model NDC (identity)
-    let x0 = (Float(w.x) / W) * 2.0 - 1.0
-    let y0 = -((Float(w.y) / H) * 2.0 - 1.0)
+    let x0 = (Double(w.x) / W) * 2.0 - 1.0
+    let y0 = -((Double(w.y) / H) * 2.0 - 1.0)
 
     // rotate (R(θ)), same as shader
-    let c = cos(rotationAngle), s = sin(rotationAngle)
+    let c = cos(Double(rotationAngle)), s = sin(Double(rotationAngle))
     let rx =  x0 * c + y0 * s
     let ry = -x0 * s + y0 * c
 
     // zoom
-    let zx = rx * zoomScale
-    let zy = ry * zoomScale
+    let zx = rx * Double(zoomScale)
+    let zy = ry * Double(zoomScale)
 
     // pan in NDC (same conversion/signs as shader)
-    let panNDCx = (panOffset.x / W) * 2.0
-    let panNDCy = -(panOffset.y / H) * 2.0
+    let panNDCx = (Double(panOffset.x) / W) * 2.0
+    let panNDCy = -(Double(panOffset.y) / H) * 2.0
     let ndcX = zx + panNDCx
     let ndcY = zy + panNDCy
 
@@ -265,6 +265,31 @@ func screenToNDC(_ p: CGPoint, viewSize: CGSize) -> SIMD2<Float> {
     let x = (Float(p.x) / W) * 2.0 - 1.0
     let y = -((Float(p.y) / H) * 2.0 - 1.0)
     return SIMD2<Float>(x, y)
+}
+
+func cameraCenterModel(viewSize: CGSize,
+                       panOffset: SIMD2<Float>,
+                       zoomScale: Float,
+                       rotationAngle: Float) -> SIMD2<Double> {
+    let W = Double(viewSize.width)
+    let H = Double(viewSize.height)
+
+    guard W > 0.0, H > 0.0 else { return SIMD2<Double>(0.0, 0.0) }
+
+    let panNDCx = (Double(panOffset.x) / W) * 2.0
+    let panNDCy = -(Double(panOffset.y) / H) * 2.0
+
+    let invZoom = 1.0 / Double(zoomScale)
+    let rx = -panNDCx * invZoom
+    let ry = -panNDCy * invZoom
+
+    let c = cos(Double(rotationAngle))
+    let s = sin(Double(rotationAngle))
+
+    let modelX = rx * c - ry * s
+    let modelY = rx * s + ry * c
+
+    return SIMD2<Double>(modelX, modelY)
 }
 
 /// Solve the pixel panOffset that keeps `anchorWorld` under `desiredScreen`
@@ -310,6 +335,7 @@ struct GPUTransform {
     var screenWidth: Float
     var screenHeight: Float
     var rotationAngle: Float
+    var cameraCenterModel: SIMD2<Float>
 }
 
 // MARK: - MetalView
@@ -585,7 +611,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         let startTime = Date()
 
-        var allVertices: [SIMD2<Float>] = []
+        var allVertices: [SIMD2<Double>] = []
 
         // Use cached vertices (tessellated at identity)
         for stroke in allStrokes {
@@ -609,13 +635,20 @@ class Coordinator: NSObject, MTKViewDelegate {
             print("⚠️ Tessellation taking \(tessellationTime * 1000)ms - too slow!")
         }
 
+        let centerModel = cameraCenterModel(viewSize: view.bounds.size,
+                                            panOffset: panOffset,
+                                            zoomScale: zoomScale,
+                                            rotationAngle: rotationAngle)
+        let centerModelFloat = SIMD2<Float>(Float(centerModel.x), Float(centerModel.y))
+
         // Transform buffer with current pan/zoom
         var transform = GPUTransform(
             panOffset: panOffset,
             zoomScale: zoomScale,
             screenWidth: Float(view.bounds.width),
             screenHeight: Float(view.bounds.height),
-            rotationAngle: rotationAngle
+            rotationAngle: rotationAngle,
+            cameraCenterModel: centerModelFloat
         )
         let transformBuffer = device.makeBuffer(
             bytes: &transform,
@@ -640,7 +673,15 @@ class Coordinator: NSObject, MTKViewDelegate {
             return
         }
 
-        updateVertexBuffer(with: allVertices)
+        var offsetVertices: [SIMD2<Float>] = []
+        offsetVertices.reserveCapacity(allVertices.count)
+        for vertex in allVertices {
+            let offsetX = Float(vertex.x - centerModel.x)
+            let offsetY = Float(vertex.y - centerModel.y)
+            offsetVertices.append(SIMD2<Float>(offsetX, offsetY))
+        }
+
+        updateVertexBuffer(with: offsetVertices)
         let commandBuffer = commandQueue.makeCommandBuffer()!
         guard let rpd = view.currentRenderPassDescriptor else { return }
         let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
@@ -650,7 +691,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
 
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVertices.count)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: offsetVertices.count)
         enc.endEncoding()
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()
