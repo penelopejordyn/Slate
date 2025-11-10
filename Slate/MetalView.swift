@@ -4,50 +4,62 @@ import MetalKit
 
 // MARK: - Geometry / Tessellation
 
-/// Tessellate a stroke into world-space triangle vertices.
+struct StrokeMesh {
+    let origin: SIMD2<Float>
+    let localVertices: [SIMD2<Float>]
+}
+
+/// Tessellate a stroke into triangle vertices expressed relative to a local origin.
 func tessellateStroke(centerPoints: [CGPoint],
                       width: CGFloat,
-                      segmentsPerCap: Int = 30) -> [SIMD2<Float>] {
-    guard width > 0 else { return [] }
+                      segmentsPerCap: Int = 30) -> StrokeMesh {
+    guard width > 0, let first = centerPoints.first else {
+        return StrokeMesh(origin: .zero, localVertices: [])
+    }
+
+    let originDouble = SIMD2<Double>(Double(first.x), Double(first.y))
+    let originFloat = SIMD2<Float>(Float(first.x), Float(first.y))
+
+    // Degenerate circle stroke (single tap)
+    if centerPoints.count == 1 {
+        let circle = createCircleOffsets(at: first,
+                                         radius: width / 2.0,
+                                         segments: segmentsPerCap,
+                                         origin: originDouble)
+        return StrokeMesh(origin: originFloat, localVertices: circle)
+    }
 
     var vertices: [SIMD2<Float>] = []
-
-    guard centerPoints.count >= 2 else {
-        if let point = centerPoints.first {
-            return createCircle(at: point,
-                                radius: width / 2.0,
-                                segments: segmentsPerCap)
-        }
-        return vertices
-    }
+    vertices.reserveCapacity(centerPoints.count * segmentsPerCap * 3)
 
     let halfWidth = Double(width) * 0.5
 
     // Start cap
-    vertices.append(contentsOf: createCircle(at: centerPoints[0],
-                                            radius: width / 2.0,
-                                            segments: segmentsPerCap))
+    vertices.append(contentsOf: createCircleOffsets(at: centerPoints[0],
+                                                    radius: width / 2.0,
+                                                    segments: segmentsPerCap,
+                                                    origin: originDouble))
 
     for index in 0..<(centerPoints.count - 1) {
         let current = centerPoints[index]
         let next = centerPoints[index + 1]
 
-        let p1 = SIMD2<Double>(Double(current.x), Double(current.y))
-        let p2 = SIMD2<Double>(Double(next.x), Double(next.y))
+        let worldP1 = SIMD2<Double>(Double(current.x), Double(current.y))
+        let worldP2 = SIMD2<Double>(Double(next.x), Double(next.y))
 
-        let dir = p2 - p1
+        let dir = worldP2 - worldP1
         let lengthSq = dir.x * dir.x + dir.y * dir.y
         guard lengthSq > .ulpOfOne else { continue }
+
         let invLen = 1.0 / sqrt(lengthSq)
         let normal = dir * invLen
         let perp = SIMD2<Double>(-normal.y, normal.x)
-
         let offset = perp * halfWidth
 
-        let t1 = p1 + offset
-        let b1 = p1 - offset
-        let t2 = p2 + offset
-        let b2 = p2 - offset
+        let t1 = worldP1 + offset - originDouble
+        let b1 = worldP1 - offset - originDouble
+        let t2 = worldP2 + offset - originDouble
+        let b2 = worldP2 - offset - originDouble
 
         vertices.append(SIMD2<Float>(Float(t1.x), Float(t1.y)))
         vertices.append(SIMD2<Float>(Float(b1.x), Float(b1.y)))
@@ -58,28 +70,35 @@ func tessellateStroke(centerPoints: [CGPoint],
         vertices.append(SIMD2<Float>(Float(t2.x), Float(t2.y)))
 
         if index < centerPoints.count - 2 {
-            vertices.append(contentsOf: createCircle(at: next,
-                                                    radius: width / 2.0,
-                                                    segments: 16))
+            vertices.append(contentsOf: createCircleOffsets(at: next,
+                                                            radius: width / 2.0,
+                                                            segments: 16,
+                                                            origin: originDouble))
         }
     }
 
-    vertices.append(contentsOf: createCircle(at: centerPoints.last!,
-                                            radius: width / 2.0,
-                                            segments: segmentsPerCap))
+    if let lastPoint = centerPoints.last {
+        vertices.append(contentsOf: createCircleOffsets(at: lastPoint,
+                                                        radius: width / 2.0,
+                                                        segments: segmentsPerCap,
+                                                        origin: originDouble))
+    }
 
-    return vertices
+    return StrokeMesh(origin: originFloat, localVertices: vertices)
 }
 
-/// Triangle fan circle expressed in world coordinates.
-func createCircle(at point: CGPoint,
-                  radius: CGFloat,
-                  segments: Int = 30) -> [SIMD2<Float>] {
+/// Triangle fan circle expressed as offsets from the provided origin.
+func createCircleOffsets(at point: CGPoint,
+                         radius: CGFloat,
+                         segments: Int = 30,
+                         origin: SIMD2<Double>) -> [SIMD2<Float>] {
     guard radius > 0, segments >= 3 else { return [] }
 
     var vertices: [SIMD2<Float>] = []
+    vertices.reserveCapacity(segments * 3)
 
-    let center = SIMD2<Double>(Double(point.x), Double(point.y))
+    let centerWorld = SIMD2<Double>(Double(point.x), Double(point.y))
+    let centerLocal = centerWorld - origin
     let radiusValue = Double(radius)
     let step = 2.0 * Double.pi / Double(segments)
 
@@ -87,12 +106,12 @@ func createCircle(at point: CGPoint,
         let angle0 = Double(i) * step
         let angle1 = Double(i + 1) * step
 
-        let p1 = SIMD2<Double>(center.x + cos(angle0) * radiusValue,
-                               center.y + sin(angle0) * radiusValue)
-        let p2 = SIMD2<Double>(center.x + cos(angle1) * radiusValue,
-                               center.y + sin(angle1) * radiusValue)
+        let p1 = SIMD2<Double>(centerWorld.x + cos(angle0) * radiusValue,
+                               centerWorld.y + sin(angle0) * radiusValue) - origin
+        let p2 = SIMD2<Double>(centerWorld.x + cos(angle1) * radiusValue,
+                               centerWorld.y + sin(angle1) * radiusValue) - origin
 
-        vertices.append(SIMD2<Float>(Float(center.x), Float(center.y)))
+        vertices.append(SIMD2<Float>(Float(centerLocal.x), Float(centerLocal.y)))
         vertices.append(SIMD2<Float>(Float(p1.x), Float(p1.y)))
         vertices.append(SIMD2<Float>(Float(p2.x), Float(p2.y)))
     }
@@ -263,6 +282,12 @@ struct GPUTransform {
     var screenWidth: Float
     var screenHeight: Float
     var rotationAngle: Float
+}
+
+struct StrokeVertex {
+    var localPosition: SIMD2<Float>
+    var strokeIndex: UInt32
+    var padding: UInt32 = 0
 }
 
 // MARK: - MetalView
@@ -517,6 +542,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     var commandQueue: MTLCommandQueue!
     var pipelineState: MTLRenderPipelineState!
     var vertexBuffer: MTLBuffer!
+    var originBuffer: MTLBuffer!
 
     var currentTouchPoints: [CGPoint] = []
     var allStrokes: [Stroke] = []
@@ -533,25 +559,36 @@ class Coordinator: NSObject, MTKViewDelegate {
         commandQueue = device.makeCommandQueue()!
         makePipeLine()
         makeVertexBuffer()
+        makeOriginBuffer()
     }
 
     func draw(in view: MTKView) {
         let startTime = Date()
 
-        var allVertices: [SIMD2<Float>] = []
+        var vertices: [StrokeVertex] = []
+        var origins: [SIMD2<Float>] = []
 
-        // Use cached vertices (tessellated once in world space)
-        for stroke in allStrokes {
-            allVertices.append(contentsOf: stroke.vertices)
+        for (strokeIndex, stroke) in allStrokes.enumerated() {
+            let index = UInt32(strokeIndex)
+            origins.append(stroke.origin)
+            for local in stroke.localVertices {
+                vertices.append(StrokeVertex(localPosition: local, strokeIndex: index))
+            }
         }
 
-        // Current stroke - tessellate in world space each frame for preview
+        // Current stroke preview tessellated relative to its own origin
         if currentTouchPoints.count >= 2 {
-            let currentVertices = tessellateStroke(
+            let mesh = tessellateStroke(
                 centerPoints: currentTouchPoints,
                 width: 10.0 / CGFloat(zoomScale),  // ← Fixed width in world pixels
             )
-            allVertices.append(contentsOf: currentVertices)
+            if !mesh.localVertices.isEmpty {
+                let previewIndex = UInt32(origins.count)
+                origins.append(mesh.origin)
+                for local in mesh.localVertices {
+                    vertices.append(StrokeVertex(localPosition: local, strokeIndex: previewIndex))
+                }
+            }
         }
 
         let tessellationTime = Date().timeIntervalSince(startTime)
@@ -568,17 +605,21 @@ class Coordinator: NSObject, MTKViewDelegate {
             rotationAngle: rotationAngle
         )
 
-        updateVertexBuffer(with: allVertices)
+        updateVertexBuffer(with: vertices)
+        updateOriginBuffer(with: origins)
         let commandBuffer = commandQueue.makeCommandBuffer()!
         guard let rpd = view.currentRenderPassDescriptor else { return }
         let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
         enc.setRenderPipelineState(pipelineState)
         enc.setCullMode(.none)
 
-        if !allVertices.isEmpty {
+        if !vertices.isEmpty,
+           let vertexBuffer = vertexBuffer,
+           let originBuffer = originBuffer {
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            enc.setVertexBytes(&transform, length: MemoryLayout<GPUTransform>.stride, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVertices.count)
+            enc.setVertexBuffer(originBuffer, offset: 0, index: 1)
+            enc.setVertexBytes(&transform, length: MemoryLayout<GPUTransform>.stride, index: 2)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count)
         }
 
         enc.endEncoding()
@@ -598,14 +639,31 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
 
     func makeVertexBuffer() {
-        vertexBuffer = device.makeBuffer(length: MemoryLayout<SIMD2<Float>>.stride,
+        vertexBuffer = device.makeBuffer(length: MemoryLayout<StrokeVertex>.stride,
                                          options: [])
     }
 
-    func updateVertexBuffer(with vertices: [SIMD2<Float>]) {
-        guard !vertices.isEmpty else { return }
-        let bufferSize = vertices.count * MemoryLayout<SIMD2<Float>>.stride
+    func makeOriginBuffer() {
+        originBuffer = device.makeBuffer(length: MemoryLayout<SIMD2<Float>>.stride,
+                                         options: [])
+    }
+
+    func updateVertexBuffer(with vertices: [StrokeVertex]) {
+        guard !vertices.isEmpty else {
+            vertexBuffer = nil
+            return
+        }
+        let bufferSize = vertices.count * MemoryLayout<StrokeVertex>.stride
         vertexBuffer = device.makeBuffer(bytes: vertices, length: bufferSize, options: .storageModeShared)
+    }
+
+    func updateOriginBuffer(with origins: [SIMD2<Float>]) {
+        guard !origins.isEmpty else {
+            originBuffer = nil
+            return
+        }
+        let bufferSize = origins.count * MemoryLayout<SIMD2<Float>>.stride
+        originBuffer = device.makeBuffer(bytes: origins, length: bufferSize, options: .storageModeShared)
     }
 
     // MARK: - Touch Handling

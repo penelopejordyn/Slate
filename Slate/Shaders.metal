@@ -16,28 +16,45 @@ struct Transform {
     float rotationAngle;
 };
 
-vertex float4 vertex_main(uint vertexID [[vertex_id]],
-                         constant float2 *worldPositions [[buffer(0)]],
-                         constant Transform *transform [[buffer(1)]]) {
-    float2 world = worldPositions[vertexID];
+struct StrokeVertexIn {
+    float2 localPosition;
+    uint strokeIndex;
+    uint padding;
+};
 
-    // Convert world pixel coordinates to model-space NDC
-    float modelX = (world.x / transform->screenWidth) * 2.0 - 1.0;
-    float modelY = -((world.y / transform->screenHeight) * 2.0 - 1.0);
+vertex float4 vertex_main(uint vertexID [[vertex_id]],
+                         constant StrokeVertexIn *vertices [[buffer(0)]],
+                         constant float2 *origins [[buffer(1)]],
+                         constant Transform *transform [[buffer(2)]]) {
+    StrokeVertexIn v = vertices[vertexID];
+    float2 originWorld = origins[v.strokeIndex];
+
+    float modelOriginX = (originWorld.x / transform->screenWidth) * 2.0 - 1.0;
+    float modelOriginY = -((originWorld.y / transform->screenHeight) * 2.0 - 1.0);
+
+    float modelOffsetX = (v.localPosition.x / transform->screenWidth) * 2.0;
+    float modelOffsetY = -((v.localPosition.y / transform->screenHeight) * 2.0);
 
     float cosTheta = cos(transform->rotationAngle);
     float sinTheta = sin(transform->rotationAngle);
 
-    float rotatedX = modelX * cosTheta + modelY * sinTheta;
-    float rotatedY = -modelX * sinTheta + modelY * cosTheta;
+    float rotatedOriginX = modelOriginX * cosTheta + modelOriginY * sinTheta;
+    float rotatedOriginY = -modelOriginX * sinTheta + modelOriginY * cosTheta;
 
-    float zoomedX = rotatedX * transform->zoomScale;
-    float zoomedY = rotatedY * transform->zoomScale;
+    float rotatedOffsetX = modelOffsetX * cosTheta + modelOffsetY * sinTheta;
+    float rotatedOffsetY = -modelOffsetX * sinTheta + modelOffsetY * cosTheta;
+
+    float zoomedOriginX = rotatedOriginX * transform->zoomScale;
+    float zoomedOriginY = rotatedOriginY * transform->zoomScale;
+
+    float zoomedOffsetX = rotatedOffsetX * transform->zoomScale;
+    float zoomedOffsetY = rotatedOffsetY * transform->zoomScale;
 
     float panX = (transform->panOffset.x / transform->screenWidth) * 2.0;
     float panY = -(transform->panOffset.y / transform->screenHeight) * 2.0;
 
-    float2 ndc = float2(zoomedX + panX, zoomedY + panY);
+    float2 ndc = float2(zoomedOriginX + zoomedOffsetX + panX,
+                        zoomedOriginY + zoomedOffsetY + panY);
 
     return float4(ndc, 0.0, 1.0);
 }

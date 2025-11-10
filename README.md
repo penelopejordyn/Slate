@@ -108,7 +108,7 @@ World coordinates (stored in stroke)
     ↓
 Tessellate to triangles (at identity transform)
     ↓
-NDC vertices (stored in stroke.vertices)
+Stroke-local vertices (stored as offsets relative to stroke.origin)
     ↓
 GPU vertex shader applies current pan/zoom
     ↓
