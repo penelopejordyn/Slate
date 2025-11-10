@@ -16,10 +16,16 @@ struct Transform {
     float rotationAngle;
 };
 
+struct StrokeVertex {
+    float2 high;
+    float2 low;
+};
+
 vertex float4 vertex_main(uint vertexID [[vertex_id]],
-                         constant float2 *positions [[buffer(0)]],
+                         constant StrokeVertex *positions [[buffer(0)]],
                          constant Transform *transform [[buffer(1)]]) {
-    float2 world = positions[vertexID];
+    StrokeVertex vert = positions[vertexID];
+    float2 world = vert.high + vert.low;
 
     // Convert world pixels → model NDC (identity view transform)
     float modelX = (world.x / transform->screenWidth) * 2.0 - 1.0;

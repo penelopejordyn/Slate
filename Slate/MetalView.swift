@@ -4,10 +4,25 @@ import MetalKit
 
 // MARK: - Geometry / Tessellation
 
+@inline(__always)
+private func splitDoubleToFloatPair(_ value: Double) -> (Float, Float) {
+    let high = Float(value)
+    let low = Float(value - Double(high))
+    return (high, low)
+}
+
+@inline(__always)
+private func makeStrokeVertex(_ point: SIMD2<Double>) -> StrokeVertex {
+    let (hx, lx) = splitDoubleToFloatPair(point.x)
+    let (hy, ly) = splitDoubleToFloatPair(point.y)
+    return StrokeVertex(high: SIMD2<Float>(hx, hy),
+                        low: SIMD2<Float>(lx, ly))
+}
+
 /// Create triangles for a stroke from world (canvas pixel) center points.
 func tessellateStroke(centerPoints: [CGPoint],
-                      width: CGFloat) -> [SIMD2<Float>] {
-    var vertices: [SIMD2<Float>] = []
+                      width: CGFloat) -> [StrokeVertex] {
+    var vertices: [StrokeVertex] = []
 
     guard centerPoints.count >= 2 else {
         if centerPoints.count == 1 {
@@ -47,10 +62,10 @@ func tessellateStroke(centerPoints: [CGPoint],
         let top2 = p2 + offset
         let bottom2 = p2 - offset
 
-        let T1 = SIMD2<Float>(Float(top1.x), Float(top1.y))
-        let B1 = SIMD2<Float>(Float(bottom1.x), Float(bottom1.y))
-        let T2 = SIMD2<Float>(Float(top2.x), Float(top2.y))
-        let B2 = SIMD2<Float>(Float(bottom2.x), Float(bottom2.y))
+        let T1 = makeStrokeVertex(top1)
+        let B1 = makeStrokeVertex(bottom1)
+        let T2 = makeStrokeVertex(top2)
+        let B2 = makeStrokeVertex(bottom2)
 
         vertices.append(T1); vertices.append(B1); vertices.append(T2)
         vertices.append(B1); vertices.append(B2); vertices.append(T2)
@@ -78,8 +93,8 @@ func tessellateStroke(centerPoints: [CGPoint],
 /// Triangle fan circle in world coordinates.
 func createCircle(at point: CGPoint,
                   radius: CGFloat,
-                  segments: Int = 30) -> [SIMD2<Float>] {
-    var vertices: [SIMD2<Float>] = []
+                  segments: Int = 30) -> [StrokeVertex] {
+    var vertices: [StrokeVertex] = []
 
     let center = SIMD2<Double>(Double(point.x), Double(point.y))
     let r = Double(radius)
@@ -93,9 +108,9 @@ func createCircle(at point: CGPoint,
         let p2 = SIMD2<Double>(center.x + cos(a2) * r,
                                center.y + sin(a2) * r)
 
-        vertices.append(SIMD2<Float>(Float(center.x), Float(center.y)))
-        vertices.append(SIMD2<Float>(Float(p1.x), Float(p1.y)))
-        vertices.append(SIMD2<Float>(Float(p2.x), Float(p2.y)))
+        vertices.append(makeStrokeVertex(center))
+        vertices.append(makeStrokeVertex(p1))
+        vertices.append(makeStrokeVertex(p2))
     }
     return vertices
 }
@@ -538,7 +553,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     func draw(in view: MTKView) {
         let startTime = Date()
 
-        var allVertices: [SIMD2<Float>] = []
+        var allVertices: [StrokeVertex] = []
 
         // Use cached vertices (world-space tessellation)
         for stroke in allStrokes {
@@ -549,7 +564,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         if currentTouchPoints.count >= 2 {
             let currentVertices = tessellateStroke(
                 centerPoints: currentTouchPoints,
-                width: 10.0 / CGFloat(zoomScale)  // ← Fixed width in world pixels
+                width: 10.0 / CGFloat(zoomScale)  // Keep stroke roughly 10px on screen
             )
             allVertices.append(contentsOf: currentVertices)
         }
@@ -611,20 +626,19 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
 
     func makeVertexBuffer() {
-        var positions: [SIMD2<Float>] = [
-            SIMD2<Float>(0.0, 0.0),
-            SIMD2<Float>(0.0, 0.0),
-            SIMD2<Float>(0.0, 0.0)
-        ]
-        vertexBuffer = device.makeBuffer(bytes: &positions,
-                                         length: positions.count * MemoryLayout<SIMD2<Float>>.stride,
+        vertexBuffer = device.makeBuffer(length: MemoryLayout<StrokeVertex>.stride * 3,
                                          options: [])
     }
 
-    func updateVertexBuffer(with vertices: [SIMD2<Float>]) {
+    func updateVertexBuffer(with vertices: [StrokeVertex]) {
         guard !vertices.isEmpty else { return }
-        let bufferSize = vertices.count * MemoryLayout<SIMD2<Float>>.stride
-        vertexBuffer = device.makeBuffer(bytes: vertices, length: bufferSize, options: .storageModeShared)
+        let bufferSize = vertices.count * MemoryLayout<StrokeVertex>.stride
+        vertices.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            vertexBuffer = device.makeBuffer(bytes: baseAddress,
+                                             length: bufferSize,
+                                             options: .storageModeShared)
+        }
     }
 
     // MARK: - Touch Handling

@@ -7,12 +7,17 @@
 
 import SwiftUI
 
+struct StrokeVertex {
+    var high: SIMD2<Float>
+    var low: SIMD2<Float>
+}
+
 struct Stroke {
     let id: UUID
     let centerPoints: [CGPoint]
     let width: CGFloat
     let color: SIMD4<Float>
-    let vertices: [SIMD2<Float>]  // ← Pre-tessellated in world space
+    let vertices: [StrokeVertex]  // ← Pre-tessellated in world space
 
     init(centerPoints: [CGPoint], width: CGFloat, color: SIMD4<Float>) {
         self.id = UUID()
