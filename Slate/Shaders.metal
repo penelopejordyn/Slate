@@ -14,29 +14,30 @@ struct Transform {
     float screenWidth;
     float screenHeight;
     float rotationAngle;
+    float2 cameraCenterModel;
 };
 
 vertex float4 vertex_main(uint vertexID [[vertex_id]],
                          constant float2 *positions [[buffer(0)]],
                          constant Transform *transform [[buffer(1)]]) {
-    float2 pos = positions[vertexID];
-    
-    // Vertices are in NDC at identity transform
-    // Apply current view transform
-    //1. Rotate
-    float rotX = pos.x * cos(transform->rotationAngle) + pos.y * sin(transform->rotationAngle); /*x' = x×cos(θ) + y×sin(θ)*/
-    float rotY = -pos.x * sin(transform->rotationAngle) + pos.y * cos(transform->rotationAngle);/*y' = -x×sin(θ) + y×cos(θ)*/
-    
-//2. Zoom
-    float zoomedX = rotX * transform->zoomScale;
-    float zoomedY = rotY * transform->zoomScale;
-    
-//3. Pan
+    float2 offset = positions[vertexID];
+    float2 center = transform->cameraCenterModel;
+
+    float c = cos(transform->rotationAngle);
+    float s = sin(transform->rotationAngle);
+
+    float2 rotOffset = float2(offset.x * c + offset.y * s,
+                              -offset.x * s + offset.y * c);
+    float2 rotCenter = float2(center.x * c + center.y * s,
+                              -center.x * s + center.y * c);
+
+    float2 zoomed = (rotOffset + rotCenter) * transform->zoomScale;
+
     float panX = (transform->panOffset.x / transform->screenWidth) * 2.0;
     float panY = -(transform->panOffset.y / transform->screenHeight) * 2.0;
-    
-    float2 transformed = float2(zoomedX, zoomedY) + float2(panX, panY);
-    
+
+    float2 transformed = zoomed + float2(panX, panY);
+
     return float4(transformed, 0.0, 1.0);
 }
 

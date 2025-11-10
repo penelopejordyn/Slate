@@ -12,7 +12,7 @@ struct Stroke {
     let centerPoints: [CGPoint]
     let width: CGFloat
     let color: SIMD4<Float>
-    let vertices: [SIMD2<Float>]  // ← Pre-tessellated at identity
+    let vertices: [SIMD2<Double>]  // ← Pre-tessellated at identity (double precision)
     
     init(centerPoints: [CGPoint], width: CGFloat, color: SIMD4<Float>, viewSize: CGSize) {
         self.id = UUID()
