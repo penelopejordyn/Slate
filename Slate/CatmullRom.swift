@@ -10,7 +10,10 @@ import CoreGraphics
 
 // MARK: - Main Catmull-Rom Function
 
-func catmullRomPoints(points: [CGPoint], closed: Bool = false, alpha: CGFloat = 0.5, segmentsPerCurve: Int = 20) -> [CGPoint] {
+func catmullRomPoints(points: [CGPoint],
+                     closed: Bool = false,
+                     alpha: CGFloat = 0.5,
+                     segmentsPerCurve: Int = 20) -> [CGPoint] {
     guard points.count >= 4 else { return points }
     
     var result: [CGPoint] = []
@@ -46,7 +49,7 @@ func catmullRomPoints(points: [CGPoint], closed: Bool = false, alpha: CGFloat = 
             result.append(p1)
         }
         
-        // Subdivide the cubic bezier from p1 to p2 with control points b1 and b2
+        // Subdivide the cubic bezier - use the parameter
         for j in 1...segmentsPerCurve {
             let t = CGFloat(j) / CGFloat(segmentsPerCurve)
             let point = cubicBezierPoint(p0: p1, p1: b1, p2: b2, p3: p2, t: t)

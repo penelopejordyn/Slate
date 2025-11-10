@@ -42,7 +42,8 @@ func tessellateStroke(centerPoints: [CGPoint],
                       width: CGFloat,
                       viewSize: CGSize,
                       panOffset: SIMD2<Float> = .zero,
-                      zoomScale: Float = 1.0) -> [SIMD2<Float>] {
+                      zoomScale: Float = 1.0,
+                      segmentsPerCurve: Int = 20) -> [SIMD2<Float>] {  // Add parameter
     var vertices: [SIMD2<Float>] = []
 
     guard centerPoints.count >= 2 else {
@@ -51,20 +52,22 @@ func tessellateStroke(centerPoints: [CGPoint],
                                 radius: width / 2.0,
                                 viewSize: viewSize,
                                 panOffset: panOffset,
-                                zoomScale: zoomScale)
+                                zoomScale: zoomScale,
+                                segments: segmentsPerCurve)  // Use parameter for circles too
         }
         return vertices
     }
 
     let halfWidth = Float(width / 2.0)
 
-    // 1) START CAP
+    // 1) START CAP - use segmentsPerCurve
     let startCapVertices = createCircle(
         at: centerPoints[0],
         radius: width / 2.0,
         viewSize: viewSize,
         panOffset: panOffset,
-        zoomScale: zoomScale
+        zoomScale: zoomScale,
+        segments: segmentsPerCurve
     )
     vertices.append(contentsOf: startCapVertices)
 
@@ -100,19 +103,20 @@ func tessellateStroke(centerPoints: [CGPoint],
                 viewSize: viewSize,
                 panOffset: panOffset,
                 zoomScale: zoomScale,
-                segments: 16
+                segments: segmentsPerCurve  // Use parameter
             )
             vertices.append(contentsOf: jointVertices)
         }
     }
 
-    // 4) END CAP
+    // 4) END CAP - use segmentsPerCurve
     let endCapVertices = createCircle(
         at: centerPoints[centerPoints.count - 1],
         radius: width / 2.0,
         viewSize: viewSize,
         panOffset: panOffset,
-        zoomScale: zoomScale
+        zoomScale: zoomScale,
+        segments: segmentsPerCurve
     )
     vertices.append(contentsOf: endCapVertices)
 
@@ -165,14 +169,14 @@ func createCircle(at point: CGPoint,
 //
 //    let unpannedX = centeredX - panOffset.x
 //    let unpannedY = centeredY - panOffset.y
-//    
+//
 //    let unzoomedX = unpannedX / zoomScale
 //    let unzoomedY = unpannedY / zoomScale
-//    
-//    
+//
+//
 ////    x = x'×cos(-θ) + y'×sin(-θ) = x'×cos(θ) - y'×sin(θ)
 ////    y = -x'×sin(-θ) + y'×cos(θ) = x'×sin(θ) + y'×cos(θ)
-//    
+//
 //    let unrotatedX = unzoomedX * cos(rotationAngle) - unzoomedY * sin(rotationAngle)
 //    let unrotatedY = unzoomedX * sin(rotationAngle) + unzoomedY * cos(rotationAngle)
 //
@@ -443,6 +447,7 @@ struct MetalView: UIViewRepresentable {
 
                 // Normal incremental zoom
                 coord.zoomScale = coord.zoomScale * Float(gesture.scale)
+                print("Zoom scale: \(coord.zoomScale)")
                 gesture.scale = 1.0
 
                 // Keep the shared anchor pinned
@@ -588,18 +593,23 @@ class Coordinator: NSObject, MTKViewDelegate {
         var allVertices: [SIMD2<Float>] = []
 
         // Use cached vertices (tessellated at identity)
-        for stroke in allStrokes {
-            allVertices.append(contentsOf: stroke.vertices)
+        // Iterate via indices so we can call the mutating `vertices(for:)` on
+        // the array element (which is mutable) instead of on the immutable
+        // `let` copy produced by `for stroke in allStrokes`.
+        for i in allStrokes.indices {
+            allVertices.append(contentsOf: allStrokes[i].vertices(for: zoomScale))
         }
 
         // Current stroke - ALSO tessellate at identity!
         if currentTouchPoints.count >= 2 {
+            let segments = segmentsForCurrentZoom()
             let currentVertices = tessellateStroke(
                 centerPoints: currentTouchPoints,
-                width: 10.0,
+                width: 10.0 / CGFloat(zoomScale),
                 viewSize: view.bounds.size,
-                panOffset: .zero,      // ← Identity, not current!
-                zoomScale: 1.0
+                panOffset: .zero,
+                zoomScale: 1.0,
+                segmentsPerCurve: segments
             )
             allVertices.append(contentsOf: currentVertices)
         }
@@ -654,6 +664,13 @@ class Coordinator: NSObject, MTKViewDelegate {
         enc.endEncoding()
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()
+    }
+    
+    private func segmentsForCurrentZoom() -> Int {
+        let baseSegments = 20
+        let doublings = Int(floor(zoomScale / 5000.0))
+        let cappedDoublings = min(doublings, 4)
+        return baseSegments * Int(pow(2.0, Double(cappedDoublings)))
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -725,8 +742,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                                             alpha: 0.5,
                                             segmentsPerCurve: 20)
 
-        let stroke = Stroke(centerPoints: smoothPoints,
-                            width: 10.0,
+        var stroke = Stroke(centerPoints: smoothPoints,
+                            //scales with zoom to keep consistent pixel width
+                            width: 10.0/CGFloat(zoomScale),
                             color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0),
                             viewSize: view.bounds.size)
 
