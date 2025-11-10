@@ -7,26 +7,28 @@
 
 import SwiftUI
 
+struct StrokeVertex {
+    var high: SIMD2<Float>
+    var low: SIMD2<Float>
+}
+
 struct Stroke {
     let id: UUID
     let centerPoints: [CGPoint]
     let width: CGFloat
     let color: SIMD4<Float>
-    let vertices: [SIMD2<Float>]  // ← Pre-tessellated at identity
-    
-    init(centerPoints: [CGPoint], width: CGFloat, color: SIMD4<Float>, viewSize: CGSize) {
+    let vertices: [StrokeVertex]  // ← Pre-tessellated in world space
+
+    init(centerPoints: [CGPoint], width: CGFloat, color: SIMD4<Float>) {
         self.id = UUID()
         self.centerPoints = centerPoints
         self.width = width
         self.color = color
-        
-        // Tessellate ONCE at identity transform
+
+        // Tessellate once in world space
         self.vertices = tessellateStroke(
             centerPoints: centerPoints,
-            width: width,
-            viewSize: viewSize,
-            panOffset: .zero,    // ← Identity
-            zoomScale: 1.0
+            width: width
         )
     }
 }

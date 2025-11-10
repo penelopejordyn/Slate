@@ -16,27 +16,37 @@ struct Transform {
     float rotationAngle;
 };
 
+struct StrokeVertex {
+    float2 high;
+    float2 low;
+};
+
 vertex float4 vertex_main(uint vertexID [[vertex_id]],
-                         constant float2 *positions [[buffer(0)]],
+                         constant StrokeVertex *positions [[buffer(0)]],
                          constant Transform *transform [[buffer(1)]]) {
-    float2 pos = positions[vertexID];
-    
-    // Vertices are in NDC at identity transform
-    // Apply current view transform
-    //1. Rotate
-    float rotX = pos.x * cos(transform->rotationAngle) + pos.y * sin(transform->rotationAngle); /*x' = x×cos(θ) + y×sin(θ)*/
-    float rotY = -pos.x * sin(transform->rotationAngle) + pos.y * cos(transform->rotationAngle);/*y' = -x×sin(θ) + y×cos(θ)*/
-    
-//2. Zoom
+    StrokeVertex vert = positions[vertexID];
+    float2 world = vert.high + vert.low;
+
+    // Convert world pixels → model NDC (identity view transform)
+    float modelX = (world.x / transform->screenWidth) * 2.0 - 1.0;
+    float modelY = -((world.y / transform->screenHeight) * 2.0 - 1.0);
+
+    // Rotate
+    float c = cos(transform->rotationAngle);
+    float s = sin(transform->rotationAngle);
+    float rotX = modelX * c + modelY * s;
+    float rotY = -modelX * s + modelY * c;
+
+    // Zoom
     float zoomedX = rotX * transform->zoomScale;
     float zoomedY = rotY * transform->zoomScale;
-    
-//3. Pan
+
+    // Pan (provided in pixels)
     float panX = (transform->panOffset.x / transform->screenWidth) * 2.0;
     float panY = -(transform->panOffset.y / transform->screenHeight) * 2.0;
-    
-    float2 transformed = float2(zoomedX, zoomedY) + float2(panX, panY);
-    
+
+    float2 transformed = float2(zoomedX + panX, zoomedY + panY);
+
     return float4(transformed, 0.0, 1.0);
 }
 
