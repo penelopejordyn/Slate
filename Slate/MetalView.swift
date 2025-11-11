@@ -52,8 +52,20 @@ func splitZoomScale(_ zoom: Float) -> (Int32, Float) {
     return (level, mantissa)
 }
 
+private let maxTileLevel: Int32 = 60
+private let minTileLevel: Int32 = -60
+
 func tileSize(for level: Int32) -> Double {
-    baseTileSize / pow(2.0, Double(level))
+    let clampedLevel = max(min(level, maxTileLevel), minTileLevel)
+    return baseTileSize / pow(2.0, Double(clampedLevel))
+}
+
+@inline(__always)
+private func clampedInt64(_ value: Double) -> Int64 {
+    guard value.isFinite else { return 0 }
+    if value <= Double(Int64.min) { return Int64.min }
+    if value >= Double(Int64.max) { return Int64.max }
+    return Int64(value)
 }
 
 func tileKeyAndLocal(for world: SIMD2<Double>, tileSize: Double) -> (TileKey, SIMD2<Float>) {
@@ -63,16 +75,29 @@ func tileKeyAndLocal(for world: SIMD2<Double>, tileSize: Double) -> (TileKey, SI
 }
 
 func tileKey(for world: SIMD2<Double>, tileSize: Double) -> TileKey {
-    let tx = Int64(floor(world.x / tileSize))
-    let ty = Int64(floor(world.y / tileSize))
+    guard tileSize.isFinite, tileSize > 0 else {
+        return TileKey(tx: 0, ty: 0)
+    }
+
+    let rawX = floor(world.x / tileSize)
+    let rawY = floor(world.y / tileSize)
+    let tx = clampedInt64(rawX)
+    let ty = clampedInt64(rawY)
     return TileKey(tx: tx, ty: ty)
 }
 
 func localCoordinates(for world: SIMD2<Double>, key: TileKey, tileSize: Double) -> SIMD2<Float> {
+    guard tileSize.isFinite, tileSize > 0 else {
+        return SIMD2<Float>.zero
+    }
+
     let originX = Double(key.tx) * tileSize
     let originY = Double(key.ty) * tileSize
     let localX = Float((world.x - originX) / tileSize)
     let localY = Float((world.y - originY) / tileSize)
+    if !localX.isFinite || !localY.isFinite {
+        return SIMD2<Float>.zero
+    }
     return SIMD2<Float>(localX, localY)
 }
 
@@ -729,9 +754,8 @@ class Coordinator: NSObject, MTKViewDelegate {
         let margin = tileSide * 2.0
 
         func clampedTileIndex(_ value: Double) -> Int64 {
-            if value.isNaN || value.isInfinite { return 0 }
-            let limited = min(max(value, Double(Int64.min)), Double(Int64.max))
-            return Int64(limited)
+            guard value.isFinite else { return 0 }
+            return clampedInt64(value)
         }
 
         let rawMinTileX = floor((minWorldX - margin) / tileSide)
