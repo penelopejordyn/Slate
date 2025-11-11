@@ -8,38 +8,33 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct Transform {
-    float2 panOffset;
-    float zoomScale;
-    float screenWidth;
-    float screenHeight;
-    float rotationAngle;
+struct ViewUniforms {
+    float2 anchorLocal;
+    float2 anchorNDC;
+    float2 tileBaseScale;
+    float zoomMantissa;
+    float cosTheta;
+    float sinTheta;
+    float padding;
+};
+
+struct TileUniforms {
+    float2 tileDelta;
 };
 
 vertex float4 vertex_main(uint vertexID [[vertex_id]],
-                         constant float2 *positions [[buffer(0)]],
-                         constant Transform *transform [[buffer(1)]]) {
-    float2 pos = positions[vertexID];
-    
-    // Vertices are in NDC at identity transform
-    // Apply current view transform
-    //1. Rotate
-    float rotX = pos.x * cos(transform->rotationAngle) + pos.y * sin(transform->rotationAngle); /*x' = x×cos(θ) + y×sin(θ)*/
-    float rotY = -pos.x * sin(transform->rotationAngle) + pos.y * cos(transform->rotationAngle);/*y' = -x×sin(θ) + y×cos(θ)*/
-    
-//2. Zoom
-    float zoomedX = rotX * transform->zoomScale;
-    float zoomedY = rotY * transform->zoomScale;
-    
-//3. Pan
-    float panX = (transform->panOffset.x / transform->screenWidth) * 2.0;
-    float panY = -(transform->panOffset.y / transform->screenHeight) * 2.0;
-    
-    float2 transformed = float2(zoomedX, zoomedY) + float2(panX, panY);
-    
-    return float4(transformed, 0.0, 1.0);
+                         constant float2 *localPositions [[buffer(0)]],
+                         constant TileUniforms &tile [[buffer(1)]],
+                         constant ViewUniforms &view [[buffer(2)]]) {
+    float2 local = localPositions[vertexID];
+    float2 delta = tile.tileDelta + (local - view.anchorLocal);
+    float2 model = delta * view.tileBaseScale;
+    float2 rotated = float2(model.x * view.cosTheta + model.y * view.sinTheta,
+                            -model.x * view.sinTheta + model.y * view.cosTheta);
+    float2 ndc = view.anchorNDC + rotated * view.zoomMantissa;
+    return float4(ndc, 0.0, 1.0);
 }
 
-fragment float4 fragment_main(float4 in [[stage_in]]) {
-    return float4(0.0, 1.0, 0.0, 1.0);
+fragment float4 fragment_main() {
+    return float4(1.0, 0.0, 0.0, 1.0);
 }
