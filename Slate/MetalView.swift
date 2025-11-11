@@ -1,150 +1,214 @@
 import SwiftUI
+import Foundation
 import Metal
 import MetalKit
+import simd
 
 // MARK: - Geometry / Tessellation
 
-/// Convert a world (canvas pixel) point to NDC, applying pan/zoom.
-func worldPixelToNDC(point w: CGPoint,
-                     viewSize: CGSize,
-                     panOffset: SIMD2<Float>,
-                     zoomScale: Float) -> SIMD2<Float> {
-    let cx = Float(viewSize.width)  * 0.5
-    let cy = Float(viewSize.height) * 0.5
+private let baseTileSize: Double = 1024.0
 
-    let wx = Float(w.x), wy = Float(w.y)
-
-    // Remove center (world -> centered)
-    let centeredX = wx - cx
-    let centeredY = wy - cy
-
-    // Apply zoom (centered -> zoomed)
-    let zx = centeredX * zoomScale
-    let zy = centeredY * zoomScale
-
-    // Apply pan (in pixels)
-    let px = zx + panOffset.x
-    let py = zy + panOffset.y
-
-    // Back to screen pixels
-    let sx = px + cx
-    let sy = py + cy
-
-    // Screen pixels -> NDC
-    let ndcX = (sx / Float(viewSize.width)) * 2.0 - 1.0
-    let ndcY = -((sy / Float(viewSize.height)) * 2.0 - 1.0)
-
-    return SIMD2<Float>(ndcX, ndcY)
+struct TileKey: Hashable {
+    let tx: Int64
+    let ty: Int64
 }
 
-/// Create triangles for a stroke from world (canvas pixel) center points.
-func tessellateStroke(centerPoints: [CGPoint],
-                      width: CGFloat,
-                      viewSize: CGSize,
-                      panOffset: SIMD2<Float> = .zero,
-                      zoomScale: Float = 1.0) -> [SIMD2<Float>] {
-    var vertices: [SIMD2<Float>] = []
+struct ViewUniforms {
+    var anchorLocal: SIMD2<Float>
+    var anchorNDC: SIMD2<Float>
+    var tileToNDC: SIMD2<Float>
+    var zoomMantissa: Float
+    var zoomExponent: Int32
+    var cosTheta: Float
+    var sinTheta: Float
+    var padding: Float = 0
+}
 
-    guard centerPoints.count >= 2 else {
-        if centerPoints.count == 1 {
-            return createCircle(at: centerPoints[0],
-                                radius: width / 2.0,
-                                viewSize: viewSize,
-                                panOffset: panOffset,
-                                zoomScale: zoomScale)
-        }
-        return vertices
+struct TileUniforms {
+    var tileDelta: SIMD2<Float>
+}
+
+final class TileGeometry {
+    var vertices: [SIMD2<Float>] = []
+    var buffer: MTLBuffer?
+
+    func append(contentsOf newVertices: [SIMD2<Float>]) {
+        guard !newVertices.isEmpty else { return }
+        vertices.append(contentsOf: newVertices)
+        buffer = nil
     }
 
-    let halfWidth = Float(width / 2.0)
+    func makeBufferIfNeeded(device: MTLDevice) {
+        guard buffer == nil, !vertices.isEmpty else { return }
+        let length = vertices.count * MemoryLayout<SIMD2<Float>>.stride
+        buffer = device.makeBuffer(bytes: vertices, length: length, options: .storageModeShared)
+    }
+}
 
-    // 1) START CAP
-    let startCapVertices = createCircle(
-        at: centerPoints[0],
-        radius: width / 2.0,
-        viewSize: viewSize,
-        panOffset: panOffset,
-        zoomScale: zoomScale
-    )
-    vertices.append(contentsOf: startCapVertices)
+func splitZoomScale(_ zoom: Float) -> (Int32, Float) {
+    let safeZoom = max(zoom, 1e-6)
+    let clampedZoom = clampZoomScale(safeZoom)
 
-    // 2) SEGMENTS + JOINTS
+    let rawLevel = Int32(floor(log2f(clampedZoom)))
+    let clampedLevel = max(min(rawLevel, maxTileLevel), minTileLevel)
+    let levelScale = powf(2.0, Float(clampedLevel))
+    let mantissa = clampedZoom / levelScale
+    let safeMantissa = mantissa.isFinite ? mantissa : 1.0
+    return (clampedLevel, safeMantissa)
+}
+
+private let maxTileLevel: Int32 = 60
+private let minTileLevel: Int32 = -60
+private let maxZoomScale: Float = powf(2.0, Float(maxTileLevel))
+private let minZoomScale: Float = powf(2.0, Float(minTileLevel))
+
+@inline(__always)
+private func clampZoomScale(_ zoom: Float) -> Float {
+    return min(max(zoom, minZoomScale), maxZoomScale)
+}
+
+func tileSize(for level: Int32) -> Double {
+    let clampedLevel = max(min(level, maxTileLevel), minTileLevel)
+    return baseTileSize / pow(2.0, Double(clampedLevel))
+}
+
+@inline(__always)
+private func clampedInt64(_ value: Double) -> Int64 {
+    guard value.isFinite else { return 0 }
+    if value <= Double(Int64.min) { return Int64.min }
+    if value >= Double(Int64.max) { return Int64.max }
+    return Int64(value)
+}
+
+func tileKeyAndLocal(for world: SIMD2<Double>, tileSize: Double) -> (TileKey, SIMD2<Float>) {
+    let key = tileKey(for: world, tileSize: tileSize)
+    let local = localCoordinates(for: world, key: key, tileSize: tileSize)
+    return (key, local)
+}
+
+func tileKey(for world: SIMD2<Double>, tileSize: Double) -> TileKey {
+    guard tileSize.isFinite, tileSize > 0 else {
+        return TileKey(tx: 0, ty: 0)
+    }
+
+    let rawX = floor(world.x / tileSize)
+    let rawY = floor(world.y / tileSize)
+    let tx = clampedInt64(rawX)
+    let ty = clampedInt64(rawY)
+    return TileKey(tx: tx, ty: ty)
+}
+
+func localCoordinates(for world: SIMD2<Double>, key: TileKey, tileSize: Double) -> SIMD2<Float> {
+    guard tileSize.isFinite, tileSize > 0 else {
+        return SIMD2<Float>.zero
+    }
+
+    let originX = Double(key.tx) * tileSize
+    let originY = Double(key.ty) * tileSize
+    let localX = Float((world.x - originX) / tileSize)
+    let localY = Float((world.y - originY) / tileSize)
+    if !localX.isFinite || !localY.isFinite {
+        return SIMD2<Float>.zero
+    }
+    return SIMD2<Float>(localX, localY)
+}
+
+func tessellateStrokeWorld(centerPoints: [CGPoint], width: CGFloat) -> [SIMD2<Double>] {
+    guard !centerPoints.isEmpty else { return [] }
+
+    if centerPoints.count == 1 {
+        return createCircleWorld(at: centerPoints[0], radius: width / 2.0)
+    }
+
+    var vertices: [SIMD2<Double>] = []
+    let halfWidth = Double(width / 2.0)
+
+    let startCap = createCircleWorld(at: centerPoints[0], radius: width / 2.0)
+    vertices.append(contentsOf: startCap)
+
     for i in 0..<(centerPoints.count - 1) {
         let current = centerPoints[i]
         let next = centerPoints[i + 1]
 
-        let p1 = worldPixelToNDC(point: current, viewSize: viewSize, panOffset: panOffset, zoomScale: zoomScale)
-        let p2 = worldPixelToNDC(point: next, viewSize: viewSize, panOffset: panOffset, zoomScale: zoomScale)
+        let p0 = SIMD2<Double>(Double(current.x), Double(current.y))
+        let p1 = SIMD2<Double>(Double(next.x), Double(next.y))
+        let segment = p1 - p0
+        let length = simd_length(segment)
+        guard length > 0 else { continue }
+        let dir = segment / length
+        let perp = SIMD2<Double>(-dir.y, dir.x) * halfWidth
 
-        let dir = p2 - p1
-        let len = sqrt(dir.x * dir.x + dir.y * dir.y)
-        guard len > 0 else { continue }
-        let n = dir / len
+        let t0 = p0 + perp
+        let b0 = p0 - perp
+        let t1 = p1 + perp
+        let b1 = p1 - perp
 
-        let perp = SIMD2<Float>(-n.y, n.x)
+        vertices.append(t0)
+        vertices.append(b0)
+        vertices.append(t1)
 
-        let widthInNDC = (halfWidth / Float(viewSize.width)) * 2.0 * zoomScale
-
-        let T1 = p1 + perp * widthInNDC
-        let B1 = p1 - perp * widthInNDC
-        let T2 = p2 + perp * widthInNDC
-        let B2 = p2 - perp * widthInNDC
-
-        vertices.append(T1); vertices.append(B1); vertices.append(T2)
-        vertices.append(B1); vertices.append(B2); vertices.append(T2)
+        vertices.append(b0)
+        vertices.append(b1)
+        vertices.append(t1)
 
         if i < centerPoints.count - 2 {
-            let jointVertices = createCircle(
-                at: next,
-                radius: width / 2.0,
-                viewSize: viewSize,
-                panOffset: panOffset,
-                zoomScale: zoomScale,
-                segments: 16
-            )
-            vertices.append(contentsOf: jointVertices)
+            let joint = createCircleWorld(at: next, radius: width / 2.0, segments: 16)
+            vertices.append(contentsOf: joint)
         }
     }
 
-    // 4) END CAP
-    let endCapVertices = createCircle(
-        at: centerPoints[centerPoints.count - 1],
-        radius: width / 2.0,
-        viewSize: viewSize,
-        panOffset: panOffset,
-        zoomScale: zoomScale
-    )
-    vertices.append(contentsOf: endCapVertices)
+    let endCap = createCircleWorld(at: centerPoints.last!, radius: width / 2.0)
+    vertices.append(contentsOf: endCap)
 
     return vertices
 }
 
-/// Triangle fan circle in NDC.
-func createCircle(at point: CGPoint,
-                  radius: CGFloat,
-                  viewSize: CGSize,
-                  panOffset: SIMD2<Float> = .zero,
-                  zoomScale: Float = 1.0,
-                  segments: Int = 30) -> [SIMD2<Float>] {
-    var vertices: [SIMD2<Float>] = []
-
-    let center = worldPixelToNDC(point: point, viewSize: viewSize, panOffset: panOffset, zoomScale: zoomScale)
-    let radiusInNDC = (Float(radius) / Float(viewSize.width)) * 2.0 * zoomScale
+func createCircleWorld(at point: CGPoint, radius: CGFloat, segments: Int = 30) -> [SIMD2<Double>] {
+    guard segments >= 2 else { return [] }
+    var vertices: [SIMD2<Double>] = []
+    let center = SIMD2<Double>(Double(point.x), Double(point.y))
+    let r = Double(radius)
 
     for i in 0..<segments {
-        let a1 = Float(i) * (2.0 * .pi / Float(segments))
-        let a2 = Float(i + 1) * (2.0 * .pi / Float(segments))
+        let angle1 = Double(i) * (2.0 * .pi / Double(segments))
+        let angle2 = Double(i + 1) * (2.0 * .pi / Double(segments))
 
-        let p1 = SIMD2<Float>(center.x + cos(a1) * radiusInNDC,
-                              center.y + sin(a1) * radiusInNDC)
-        let p2 = SIMD2<Float>(center.x + cos(a2) * radiusInNDC,
-                              center.y + sin(a2) * radiusInNDC)
+        let p1 = SIMD2<Double>(center.x + cos(angle1) * r,
+                               center.y + sin(angle1) * r)
+        let p2 = SIMD2<Double>(center.x + cos(angle2) * r,
+                               center.y + sin(angle2) * r)
 
         vertices.append(center)
         vertices.append(p1)
         vertices.append(p2)
     }
+
     return vertices
+}
+
+func tessellateStrokeIntoTiles(centerPoints: [CGPoint],
+                               width: CGFloat,
+                               tileSize: Double) -> [TileKey: [SIMD2<Float>]] {
+    let worldVertices = tessellateStrokeWorld(centerPoints: centerPoints, width: width)
+    guard !worldVertices.isEmpty else { return [:] }
+
+    var result: [TileKey: [SIMD2<Float>]] = [:]
+
+    for i in stride(from: 0, to: worldVertices.count, by: 3) {
+        let v0 = worldVertices[i]
+        let v1 = worldVertices[i + 1]
+        let v2 = worldVertices[i + 2]
+        let centroid = (v0 + v1 + v2) / 3.0
+        let key = tileKey(for: centroid, tileSize: tileSize)
+
+        let local0 = localCoordinates(for: v0, key: key, tileSize: tileSize)
+        let local1 = localCoordinates(for: v1, key: key, tileSize: tileSize)
+        let local2 = localCoordinates(for: v2, key: key, tileSize: tileSize)
+
+        result[key, default: []].append(contentsOf: [local0, local1, local2])
+    }
+
+    return result
 }
 
 // MARK: - Coordinate Conversion Helpers
@@ -304,14 +368,6 @@ func solvePanOffsetForAnchor(anchorWorld: SIMD2<Float>,
 
 // MARK: - GPU Transform Struct
 
-struct GPUTransform {
-    var panOffset: SIMD2<Float>
-    var zoomScale: Float
-    var screenWidth: Float
-    var screenHeight: Float
-    var rotationAngle: Float
-}
-
 // MARK: - MetalView
 
 struct MetalView: UIViewRepresentable {
@@ -442,7 +498,7 @@ struct MetalView: UIViewRepresentable {
                 }
 
                 // Normal incremental zoom
-                coord.zoomScale = coord.zoomScale * Float(gesture.scale)
+                coord.zoomScale = clampZoomScale(coord.zoomScale * Float(gesture.scale))
                 gesture.scale = 1.0
 
                 // Keep the shared anchor pinned
@@ -563,10 +619,14 @@ class Coordinator: NSObject, MTKViewDelegate {
     var device: MTLDevice!
     var commandQueue: MTLCommandQueue!
     var pipelineState: MTLRenderPipelineState!
-    var vertexBuffer: MTLBuffer!
 
     var currentTouchPoints: [CGPoint] = []
     var allStrokes: [Stroke] = []
+
+    private var committedTileGeometry: [TileKey: TileGeometry] = [:]
+    private var geometryCacheLevel: Int32?
+    private var needsFullGeometryRebuild: Bool = true
+    private var pendingStrokeIndices: [Int] = []
 
     weak var metalView: MTKView?
 
@@ -579,80 +639,214 @@ class Coordinator: NSObject, MTKViewDelegate {
         device = MTLCreateSystemDefaultDevice()!
         commandQueue = device.makeCommandQueue()!
         makePipeLine()
-        makeVertexBuffer()
+        needsFullGeometryRebuild = true
+    }
+
+    private func rebuildCommittedTileGeometry(level: Int32, tileSide: Double) {
+        var newGeometry: [TileKey: TileGeometry] = [:]
+
+        for index in allStrokes.indices {
+            var stroke = allStrokes[index]
+            let tiles = stroke.tiles(for: level, tileSize: tileSide)
+            allStrokes[index] = stroke
+
+            for (key, verts) in tiles {
+                let geometry = newGeometry[key] ?? TileGeometry()
+                geometry.append(contentsOf: verts)
+                newGeometry[key] = geometry
+            }
+        }
+
+        committedTileGeometry = newGeometry
+        geometryCacheLevel = level
+        needsFullGeometryRebuild = false
+        pendingStrokeIndices.removeAll()
+    }
+
+    private func appendPendingStrokes(level: Int32, tileSide: Double) {
+        guard !pendingStrokeIndices.isEmpty else { return }
+
+        for index in pendingStrokeIndices {
+            guard index < allStrokes.count else { continue }
+            var stroke = allStrokes[index]
+            let tiles = stroke.tiles(for: level, tileSize: tileSide)
+            allStrokes[index] = stroke
+
+            for (key, verts) in tiles {
+                let geometry = committedTileGeometry[key] ?? TileGeometry()
+                geometry.append(contentsOf: verts)
+                committedTileGeometry[key] = geometry
+            }
+        }
+
+        pendingStrokeIndices.removeAll()
     }
 
     func draw(in view: MTKView) {
-        let startTime = Date()
-
-        var allVertices: [SIMD2<Float>] = []
-
-        // Use cached vertices (tessellated at identity)
-        for stroke in allStrokes {
-            allVertices.append(contentsOf: stroke.vertices)
-        }
-
-        // Current stroke - ALSO tessellate at identity!
-        if currentTouchPoints.count >= 2 {
-            let currentVertices = tessellateStroke(
-                centerPoints: currentTouchPoints,
-                width: 10.0 / CGFloat(zoomScale),  // ← Fixed width in world pixels
-                viewSize: view.bounds.size,
-                panOffset: .zero,      // ← Identity, not current!
-                zoomScale: 1.0
-            )
-            allVertices.append(contentsOf: currentVertices)
-        }
-
-        let tessellationTime = Date().timeIntervalSince(startTime)
-        if tessellationTime > 0.016 {
-            print("⚠️ Tessellation taking \(tessellationTime * 1000)ms - too slow!")
-        }
-
-        // Transform buffer with current pan/zoom
-        var transform = GPUTransform(
-            panOffset: panOffset,
-            zoomScale: zoomScale,
-            screenWidth: Float(view.bounds.width),
-            screenHeight: Float(view.bounds.height),
-            rotationAngle: rotationAngle
-        )
-        let transformBuffer = device.makeBuffer(
-            bytes: &transform,
-            length: MemoryLayout<GPUTransform>.stride,
-            options: .storageModeShared
-        )
-
-        if allVertices.isEmpty {
-            let commandBuffer = commandQueue.makeCommandBuffer()!
-            guard let rpd = view.currentRenderPassDescriptor else { return }
-            let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
-            enc.setRenderPipelineState(pipelineState)
-            enc.setCullMode(.none)
-
-            enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
-
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-            enc.endEncoding()
-            commandBuffer.present(view.currentDrawable!)
-            commandBuffer.commit()
+        guard let renderPassDescriptor = view.currentRenderPassDescriptor,
+              let drawable = view.currentDrawable,
+              let touchView = metalView as? MetalView.TouchableMTKView else {
             return
         }
 
-        updateVertexBuffer(with: allVertices)
+        let (rawLevel, zoomMantissa) = splitZoomScale(zoomScale)
+        let level = max(min(rawLevel, maxTileLevel), minTileLevel)
+        let tileSide = tileSize(for: level)
+        let viewSize = view.bounds.size
+
+        let anchorScreen: CGPoint
+        let anchorWorld: SIMD2<Float>
+        if touchView.activeOwner == .none {
+            let center = CGPoint(x: viewSize.width * 0.5, y: viewSize.height * 0.5)
+            anchorScreen = center
+            let worldPoint = screenToWorldPixels(center,
+                                                viewSize: viewSize,
+                                                panOffset: panOffset,
+                                                zoomScale: zoomScale,
+                                                rotationAngle: rotationAngle)
+            anchorWorld = SIMD2<Float>(Float(worldPoint.x), Float(worldPoint.y))
+        } else {
+            anchorScreen = touchView.anchorScreen
+            anchorWorld = touchView.anchorWorld
+        }
+
+        let anchorWorldD = SIMD2<Double>(Double(anchorWorld.x), Double(anchorWorld.y))
+        let (anchorTileKey, anchorLocal) = tileKeyAndLocal(for: anchorWorldD, tileSize: tileSide)
+        let anchorNDC = screenToNDC(anchorScreen, viewSize: viewSize)
+
+        let tileToNDC = SIMD2<Float>(
+            Float(tileSide / Double(viewSize.width) * 2.0),
+            Float(-tileSide / Double(viewSize.height) * 2.0)
+        )
+
+        let cosTheta = Float(cos(Double(rotationAngle)))
+        let sinTheta = Float(sin(Double(rotationAngle)))
+
+        var viewUniforms = ViewUniforms(
+            anchorLocal: anchorLocal,
+            anchorNDC: anchorNDC,
+            tileToNDC: tileToNDC,
+            zoomMantissa: zoomMantissa,
+            zoomExponent: level,
+            cosTheta: cosTheta,
+            sinTheta: sinTheta,
+            padding: 0
+        )
+
+        let screenWorldCorners = [
+            screenToWorldPixels(.zero,
+                                 viewSize: viewSize,
+                                 panOffset: panOffset,
+                                 zoomScale: zoomScale,
+                                 rotationAngle: rotationAngle),
+            screenToWorldPixels(CGPoint(x: viewSize.width, y: 0),
+                                 viewSize: viewSize,
+                                 panOffset: panOffset,
+                                 zoomScale: zoomScale,
+                                 rotationAngle: rotationAngle),
+            screenToWorldPixels(CGPoint(x: 0, y: viewSize.height),
+                                 viewSize: viewSize,
+                                 panOffset: panOffset,
+                                 zoomScale: zoomScale,
+                                 rotationAngle: rotationAngle),
+            screenToWorldPixels(CGPoint(x: viewSize.width, y: viewSize.height),
+                                 viewSize: viewSize,
+                                 panOffset: panOffset,
+                                 zoomScale: zoomScale,
+                                 rotationAngle: rotationAngle)
+        ]
+
+        let xs = screenWorldCorners.map { Double($0.x) }
+        let ys = screenWorldCorners.map { Double($0.y) }
+        let anchorFallbackX = Double(anchorWorld.x)
+        let anchorFallbackY = Double(anchorWorld.y)
+        let minWorldX = xs.min() ?? anchorFallbackX
+        let maxWorldX = xs.max() ?? anchorFallbackX
+        let minWorldY = ys.min() ?? anchorFallbackY
+        let maxWorldY = ys.max() ?? anchorFallbackY
+
+        let margin = tileSide * 2.0
+
+        func clampedTileIndex(_ value: Double) -> Int64 {
+            guard value.isFinite else { return 0 }
+            return clampedInt64(value)
+        }
+
+        let rawMinTileX = floor((minWorldX - margin) / tileSide)
+        let rawMaxTileX = floor((maxWorldX + margin) / tileSide)
+        let rawMinTileY = floor((minWorldY - margin) / tileSide)
+        let rawMaxTileY = floor((maxWorldY + margin) / tileSide)
+
+        let minTileX = clampedTileIndex(rawMinTileX)
+        let maxTileX = clampedTileIndex(rawMaxTileX)
+        let minTileY = clampedTileIndex(rawMinTileY)
+        let maxTileY = clampedTileIndex(rawMaxTileY)
+
+        let visibleTileXRange = min(minTileX, maxTileX)...max(minTileX, maxTileX)
+        let visibleTileYRange = min(minTileY, maxTileY)...max(minTileY, maxTileY)
+
+        if geometryCacheLevel != level || needsFullGeometryRebuild {
+            rebuildCommittedTileGeometry(level: level, tileSide: tileSide)
+        } else {
+            appendPendingStrokes(level: level, tileSide: tileSide)
+        }
+
+        var dynamicTiles: [TileKey: [SIMD2<Float>]] = [:]
+
+        if currentTouchPoints.count >= 2 {
+            let strokePoints: [CGPoint]
+            if currentTouchPoints.count >= 4 {
+                strokePoints = catmullRomPoints(points: currentTouchPoints,
+                                                closed: false,
+                                                alpha: 0.5,
+                                                segmentsPerCurve: 20)
+            } else {
+                strokePoints = currentTouchPoints
+            }
+
+            let inProgress = tessellateStrokeIntoTiles(centerPoints: strokePoints,
+                                                       width: 10.0 / CGFloat(zoomScale),
+                                                       tileSize: tileSide)
+            for (key, verts) in inProgress {
+                guard !verts.isEmpty else { continue }
+                dynamicTiles[key, default: []].append(contentsOf: verts)
+            }
+        }
+
         let commandBuffer = commandQueue.makeCommandBuffer()!
-        guard let rpd = view.currentRenderPassDescriptor else { return }
-        let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
-        enc.setRenderPipelineState(pipelineState)
-        enc.setCullMode(.none)
+        let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor)!
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setCullMode(.none)
+        encoder.setVertexBytes(&viewUniforms, length: MemoryLayout<ViewUniforms>.stride, index: 2)
 
-        enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-        enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+        for (key, geometry) in committedTileGeometry {
+            guard visibleTileXRange.contains(key.tx), visibleTileYRange.contains(key.ty) else { continue }
+            guard !geometry.vertices.isEmpty else { continue }
+            geometry.makeBufferIfNeeded(device: device)
+            guard let buffer = geometry.buffer else { continue }
+            var tileUniforms = TileUniforms(tileDelta: SIMD2<Float>(Float(key.tx - anchorTileKey.tx),
+                                                                    Float(key.ty - anchorTileKey.ty)))
+            encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&tileUniforms, length: MemoryLayout<TileUniforms>.stride, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: geometry.vertices.count)
+        }
 
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVertices.count)
-        enc.endEncoding()
-        commandBuffer.present(view.currentDrawable!)
+        for (key, vertices) in dynamicTiles {
+            guard visibleTileXRange.contains(key.tx), visibleTileYRange.contains(key.ty) else { continue }
+            guard !vertices.isEmpty else { continue }
+            let bufferLength = vertices.count * MemoryLayout<SIMD2<Float>>.stride
+            guard let vertexBuffer = device.makeBuffer(bytes: vertices, length: bufferLength, options: .storageModeShared) else {
+                continue
+            }
+            var tileUniforms = TileUniforms(tileDelta: SIMD2<Float>(Float(key.tx - anchorTileKey.tx),
+                                                                    Float(key.ty - anchorTileKey.ty)))
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&tileUniforms, length: MemoryLayout<TileUniforms>.stride, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertices.count)
+        }
+
+        encoder.endEncoding()
+        commandBuffer.present(drawable)
         commandBuffer.commit()
     }
 
@@ -665,26 +859,6 @@ class Coordinator: NSObject, MTKViewDelegate {
         desc.fragmentFunction = library.makeFunction(name: "fragment_main")
         desc.colorAttachments[0].pixelFormat = .bgra8Unorm
         pipelineState = try? device.makeRenderPipelineState(descriptor: desc)
-    }
-
-    func makeVertexBuffer() {
-        var positions: [SIMD2<Float>] = [
-            SIMD2<Float>(-0.8,  0.5),
-            SIMD2<Float>(-0.3, -0.5),
-            SIMD2<Float>(-0.8, -0.5),
-            SIMD2<Float>(-0.3, -0.5),
-            SIMD2<Float>(-0.3,  0.5),
-            SIMD2<Float>(-0.8,  0.5),
-        ]
-        vertexBuffer = device.makeBuffer(bytes: &positions,
-                                         length: positions.count * MemoryLayout<SIMD2<Float>>.stride,
-                                         options: [])
-    }
-
-    func updateVertexBuffer(with vertices: [SIMD2<Float>]) {
-        guard !vertices.isEmpty else { return }
-        let bufferSize = vertices.count * MemoryLayout<SIMD2<Float>>.stride
-        vertexBuffer = device.makeBuffer(bytes: vertices, length: bufferSize, options: .storageModeShared)
     }
 
     // MARK: - Touch Handling
@@ -727,10 +901,10 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         let stroke = Stroke(centerPoints: smoothPoints,
                             width: 10.0 / CGFloat(zoomScale),
-                            color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0),
-                            viewSize: view.bounds.size)
+                            color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0))
 
         allStrokes.append(stroke)
+        pendingStrokeIndices.append(allStrokes.count - 1)
         currentTouchPoints = []
     }
 
