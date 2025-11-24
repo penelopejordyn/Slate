@@ -1034,11 +1034,16 @@ struct MetalView: UIViewRepresentable {
 
             } else {
                 // ✨ CREATE NEW FRAME
-                let cameraCenterWorld = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+
+                // 🟢 FIX: Center the new frame exactly on the PINCH POINT (Finger).
+                // This prevents exponential coordinate growth (Off-Center Accumulation).
+                // OLD: Centered on screen center → 500px offset compounds to 500,000 → 500M → 10^18 → CRASH
+                // NEW: Centered on finger → offset resets to 0 at each depth → stays bounded forever
+                let newFrameOrigin = pinchPointWorld
 
                 let newFrame = Frame(
                     parent: coord.activeFrame,
-                    origin: cameraCenterWorld,
+                    origin: newFrameOrigin,
                     scale: currentZoom // Use captured high zoom
                 )
                 coord.activeFrame.children.append(newFrame)
@@ -1046,23 +1051,20 @@ struct MetalView: UIViewRepresentable {
                 coord.activeFrame = newFrame
                 coord.zoomScale = 1.0
 
-                // Calculate pan to keep finger stable
-                let diffX = pinchPointWorld.x - cameraCenterWorld.x
-                let diffY = pinchPointWorld.y - cameraCenterWorld.y
-
-                // In new frame space (scale = currentZoom):
-                let localPinchX = diffX * currentZoom
-                let localPinchY = diffY * currentZoom
+                // 🟢 RESULT: The pinch point is now the origin (0,0)
+                // diffX = pinchPointWorld - newFrameOrigin = 0
+                // diffY = pinchPointWorld - newFrameOrigin = 0
+                // localPinch = (0, 0)
 
                 coord.panOffset = solvePanOffsetForAnchor_Double(
-                    anchorWorld: SIMD2<Double>(localPinchX, localPinchY),
-                    desiredScreen: currentCentroid,
+                    anchorWorld: SIMD2<Double>(0, 0), // Finger is at Local (0,0)
+                    desiredScreen: currentCentroid,   // Keep Finger at Screen Point
                     viewSize: bounds.size,
                     zoomScale: 1.0,
                     rotationAngle: coord.rotationAngle
                 )
 
-                print("✨ Created NEW frame.")
+                print("✨ Created NEW frame. Origin centered on pinch. Depth: \(frameDepth(coord.activeFrame))")
             }
 
             // 7. RE-ANCHOR GESTURES (update with new coordinate system)
@@ -1466,7 +1468,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                      viewSize: CGSize,
                      currentZoom: Double,
                      currentRotation: Float,
-                     encoder: MTLRenderCommandEncoder) {
+                     encoder: MTLRenderCommandEncoder,
+                     excludedChild: Frame? = nil) { // 🟢 NEW: Prevent double-rendering
 
         // LAYER 1: RENDER PARENT (Background - Depth -1) -------------------------------
         if let parent = frame.parent {
@@ -1480,14 +1483,18 @@ class Coordinator: NSObject, MTKViewDelegate {
             // Zoom in parent frame is reduced (parent is "bigger")
             let parentZoom = currentZoom * frame.scaleRelativeToParent
 
-            // Optimization: Stop rendering parents if they are too huge/blown out
-            if parentZoom > 0.0001 {
+            // 🟢 FIX: Event Horizon Culling - Lowered to 1e9 (1 Billion)
+            // Stop rendering the parent if it's magnified beyond Double precision safe zone.
+            // At 1e9+, precision errors cause jittery/shakey panning across vast distances.
+            // The background becomes mathematically unstable and visually meaningless.
+            if parentZoom > 0.0001 && parentZoom < 1e9 {
                 renderFrame(parent,
                            cameraCenterInThisFrame: cameraCenterInParent,
                            viewSize: viewSize,
                            currentZoom: parentZoom,
                            currentRotation: currentRotation,
-                           encoder: encoder)
+                           encoder: encoder,
+                           excludedChild: frame) // 🟢 TELL PARENT TO SKIP US
             }
         }
 
@@ -1515,6 +1522,13 @@ class Coordinator: NSObject, MTKViewDelegate {
         // LAYER 3: RENDER CHILDREN (Foreground Details - Depth +1) ---------------------
         // 🟢 FIX: Look down into child frames so they don't disappear when zooming out
         for child in frame.children {
+            // 🟢 FIX 1: Skip the excluded child (The one we came from)
+            // This prevents "double vision" where the active frame renders itself twice:
+            // once as a child of its parent, and once as the foreground layer.
+            if let excluded = excludedChild, child === excluded {
+                continue
+            }
+
             // 1. Calculate effective zoom for the child
             // Child is smaller, so we zoom out (divide by scale)
             let childZoom = currentZoom / child.scaleRelativeToParent
@@ -1603,7 +1617,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                    viewSize: view.bounds.size,
                    currentZoom: zoomScale,
                    currentRotation: rotationAngle,
-                   encoder: enc)
+                   encoder: enc,
+                   excludedChild: nil) // Start with no exclusion
 
         // 🟢 COMMIT 2: LIVE STROKE RENDERING
         // Live strokes are rendered on top of all committed strokes (foreground)
@@ -1633,9 +1648,11 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             // Tessellate in LOCAL space
+            // 🟢 FIX: Match actual stroke width calculation (10px screen / zoom)
+            let worldWidth = 10.0 / zoom
             let localVertices = tessellateStrokeLocal(
                 centerPoints: localPoints,
-                width: 10.0  // Constant 10px width in world units
+                width: Float(worldWidth)
             )
 
             guard !localVertices.isEmpty else {
@@ -1798,23 +1815,26 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         // PHASE 5: Establish temporary origin for live stroke
         // The first touch point becomes the origin (in world coordinates, Double precision)
-        let worldPoint = screenToWorldPixels(point,
-                                            viewSize: view.bounds.size,
-                                            panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
-                                            zoomScale: Float(zoomScale),
-                                            rotationAngle: rotationAngle)
-        liveStrokeOrigin = SIMD2<Double>(Double(worldPoint.x), Double(worldPoint.y))
+        // 🟢 FIX: Use PureDouble version to match actual stroke creation
+        liveStrokeOrigin = screenToWorldPixels_PureDouble(
+            point,
+            viewSize: view.bounds.size,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
 
         // Keep points in SCREEN space during drawing
         currentTouchPoints = [point]
 
         // Debug tiling system (only when debug mode enabled)
-        if tileManager.debugMode {
-            let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
-            let debugOutput = tileManager.debugInfo(worldPoint: worldPoint,
+        if tileManager.debugMode, let origin = liveStrokeOrigin {
+            let worldPointCG = CGPoint(x: origin.x, y: origin.y)
+            let tileKey = tileManager.getTileKey(worldPoint: worldPointCG)
+            let debugOutput = tileManager.debugInfo(worldPoint: worldPointCG,
                                                     screenPoint: point,
                                                     tileKey: tileKey)
-            print("\n📍 TOUCH BEGAN - Temporary Origin: \(liveStrokeOrigin!)")
+            print("\n📍 TOUCH BEGAN - Temporary Origin: \(origin)")
             print(debugOutput)
         }
     }
