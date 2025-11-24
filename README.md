@@ -6,52 +6,100 @@ An infinite canvas note-taking application for iOS built with Metal and SwiftUI,
 ![Swift](https://img.shields.io/badge/Swift-5.5+-orange.svg)
 ![Metal](https://img.shields.io/badge/Metal-3-red.svg)
 
+
 ## Overview
 
-Slate demonstrates how to build a performant drawing app using Metal's GPU acceleration. The app achieves 60fps rendering with responsive 240Hz touch input and accurate coordinate handling at any zoom level.
+Slate demonstrates how to build a high-performance drawing app that breaks the traditional limits of floating-point arithmetic. By utilizing a custom "Telescoping" frame architecture, the app achieves 60fps rendering with 240Hz touch input at zoom levels exceeding $10^{1000}$ and beyond.
 
 ## Features
 
-- ✅ **Smooth Stroke Rendering** - Catmull-Rom spline interpolation for high-quality curves
-- ✅ **Two-Finger Pan Navigation** - Intuitive canvas navigation without interfering with drawing
-- ✅ **Pinch-to-Zoom and Rotation** - Smooth scaling with maintained stroke accuracy
-- ✅ **GPU-Accelerated Transforms** - Pan and zoom operations handled entirely on GPU
-- ✅ **Accurate Touch Positioning** - Precise coordinate space management across all zoom levels
-- ✅ **High Performance** - 60fps rendering with 240Hz touch input capture
+  - ✅ **True Infinite Zoom** - Zoom seamlessly from the macro to the micro (and back) without jitter or limits.
+  - ✅ **Smooth Stroke Rendering** - Catmull-Rom spline interpolation for high-quality curves.
+  - ✅ **Two-Finger Pan Navigation** - Intuitive canvas navigation without interfering with drawing.
+  - ✅ **Recursive Rendering** - Visual continuity across depth levels (seeing parent drawings in the background).
+  - ✅ **High Performance** - 60fps Metal rendering with precision-managed coordinate systems.
 
 ## Architecture Highlights
 
 ### Core Components
 
-- **TouchableMTKView**: Custom `MTKView` subclass that captures raw touch events and handles gesture recognition
-- **Coordinator Pattern**: Bridges SwiftUI and UIKit, managing Metal state and the render loop
-- **GPU Transform System**: View transformations (pan/zoom) applied in vertex shader for optimal performance
-- **Tessellation Engine**: Converts smooth Catmull-Rom curves into GPU-renderable triangle strips
-- **Coordinate Space Management**: Precise conversions between screen space, world space, and normalized device coordinates
+  - **Telescoping Coordinate System**: A recursive architecture where the "universe" resets every time you zoom in past a threshold. Instead of one global coordinate space, the app uses a linked list of nested `Frame` objects.
+  - **Floating Origin & Local Realism**: Strokes are "locally aware" only. They store coordinates relative to their specific Frame, ensuring numbers stay small and precise regardless of the global zoom level.
+  - **Recursive Compositor**: A rendering engine that traverses the Frame hierarchy, drawing the "Parent" frames (background) and "Child" frames (details) relative to the active camera view.
+  - **TouchableMTKView**: Custom `MTKView` subclass that captures raw touch events and manages the complex "handoff" logic between coordinate systems.
 
 ### Key Technical Decisions
 
-**GPU-Side Transforms**: Strokes are stored in world coordinates and tessellated once. The current pan/zoom transform is passed to the GPU via a uniform buffer and applied in the vertex shader. This reduced frame time from ~37ms to <1ms when transforming multiple strokes.
+**Recursive Reference Frames (The "Engine"):**
+Standard 64-bit `Double` precision fails around $10^{15}$ zoom (the "Double Precision Horizon"). To solve this, Slate uses a telescoping approach:
 
-**Touch Event Separation**: Raw touch capture happens in the `UIView` layer, while touch processing logic lives in the `Coordinator` with access to Metal state. This separation provides clean architecture and proper state management.
+1.  When `zoomScale` exceeds 1,000x, the app "freezes" the current frame.
+2.  It creates a new Child Frame centered on the user's gesture.
+3.  It enters the new frame and resets `zoomScale` to 1.0.
+    This ensures the math only ever processes values between 0.5 and 1,000, sidestepping overflow issues entirely.
 
-**Hybrid Stroke Rendering**: Round end caps with flat middle segments and round joints prevent visual gaps while maintaining rendering efficiency.
+**Local-Space Storage:**
+Strokes are stored in **Local Coordinates** relative to their Frame's origin. They are ignorant of the "global" position. This "Local Realism" means a stroke at depth 50 ($10^{150}$ zoom) is mathematically identical to a stroke at depth 0, guaranteeing zero jitter.
+
+**Anchor-Based Transitions:**
+To make the "teleportation" between frames invisible to the user, the transition logic uses a shared **World Anchor** system. This locks the pixel under the user's finger to the exact same screen position during the coordinate swap, creating a seamless visual experience.
 
 ## Challenges & Learning
 
-This project involved navigating largely undocumented territory at the intersection of Metal, SwiftUI, and touch handling. Key challenges included:
+This project evolved from a standard infinite canvas into a research project on overcoming floating-point limitations.
 
-### Coordinate Space Management
-Managing three coordinate systems (screen space with UIKit's Y-down origin, world space for stroke storage, and NDC with Y-up for GPU rendering) required careful mathematical transforms. The critical insight was ensuring the CPU's `screenToWorld()` inverse transform exactly mirrors the GPU's forward transform operations.
+### The "Large Coordinate" Problem
 
-### Transform Order Dependencies
-Getting pan and zoom to work correctly required understanding that transform order matters: zoom must be applied before pan in the vertex shader, and the inverse operations must happen in reverse order (unpan before unzoom) when converting touch coordinates.
+Initially, the app used a single global coordinate system. At zooms around $10^6$, strokes became jagged. At $10^{15}$, the camera shook violently due to precision loss (the "Event Horizon"). The solution was to abandon absolute space in favor of relative, nested spaces.
 
-### Performance Optimization
-Initial attempts at CPU-side transform application re-tessellated all strokes every frame, creating a performance bottleneck. Moving transforms to the GPU was essential for maintaining 60fps with multiple strokes.
 
-### Touch Event Handling
-Capturing raw touch events at 240Hz while preventing gesture recognizers from interfering with single-finger drawing required careful configuration of gesture recognizer delegates and touch filtering logic.
+### Recursive Rendering Logic
+
+Drawing a stroke that exists in a parent frame (1,000x larger) or a child frame (1,000x smaller) required deriving complex relative transforms. The renderer must "look up" to scale parent frames by multiplication, and "look down" to scale child frames by division, all while maintaining the illusion of a single continuous world.
+
+## Technical Details
+
+### The Telescoping Pipeline
+
+```
+Touch Input (Screen Pixels)
+    ↓
+[Coordinator] Check Zoom Threshold (> 1000x or < 0.5x)
+    ↓
+    IF Threshold Crossed:
+    1. Create/Find Target Frame (Child or Parent)
+    2. Calculate Finger Position in Target Frame
+    3. RESET Zoom to 1.0 (relative to new frame)
+    4. Solve Pan to lock Finger Position
+    ↓
+[Stroke Creation]
+Convert Screen → Local Frame Coordinates (Double Precision)
+    ↓
+[Recursive Render Loop]
+1. Render Parent (Background) → Scale UP (Zoom * 1000)
+2. Render Active Frame (Foreground) → Scale Normal (Zoom * 1.0)
+3. Render Children (Details) → Scale DOWN (Zoom / 1000)
+    ↓
+[Metal Shader]
+Apply Relative Offset (Small Float) -> Final NDC Projection
+```
+## Getting Started
+
+### Requirements
+
+  - iOS 15.0+
+  - Xcode 13.0+
+  - A device with Metal support (all iOS devices since 2013)
+
+### Building
+
+1.  Clone the repository
+2.  Open `Slate.xcodeproj` in Xcode
+3.  Build and run on a physical device (Metal rendering performs best on hardware)
+
+-----
+
+**Note**: This project explores advanced coordinate system architectures. It prioritizes mathematical robustness and infinite scale over standard UI conventions.
 
 ### Lack of Documentation
 There are very few resources covering the intersection of Metal rendering, SwiftUI integration, and complex touch handling. Most of the solutions required experimentation and deep understanding of coordinate systems. I learned heavily from the [30 Days of Metal](https://github.com/warren-bank/fork-30-days-of-metal) repository for Metal fundamentals, but much of the architecture had to be designed from first principles.
@@ -95,32 +143,6 @@ Some potential directions for further development:
 2. Open `Slate.xcodeproj` in Xcode
 3. Build and run on a physical device (Metal rendering performs best on hardware)
 
-## Technical Details
-
-### Coordinate Transform Pipeline
-
-```
-Touch Input (screen pixels, Y-down)
-    ↓
-screenToWorld() inverse transform
-    ↓
-World coordinates (stored in stroke)
-    ↓
-Tessellate to triangles (at identity transform)
-    ↓
-Stroke-local vertices (stored as offsets relative to stroke.origin)
-    ↓
-GPU vertex shader applies current pan/zoom
-    ↓
-Screen display (correct position at any transform)
-```
-
-### Performance Characteristics
-
-- Touch input: 240Hz (raw UITouch events)
-- Rendering: 60fps (Metal display refresh)
-- Tessellation: One-time per completed stroke + per-frame for current in-progress stroke
-- Transform application: GPU parallel processing
 
 
 ## Acknowledgments
