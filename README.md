@@ -1,4 +1,4 @@
-# Slate
+# Labyrinth
 
 An infinite canvas note-taking application for iOS built with Metal and SwiftUI, featuring smooth stroke rendering and high-performance pan/zoom/rotation navigation.
 
