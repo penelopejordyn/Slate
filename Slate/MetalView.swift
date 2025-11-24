@@ -5,34 +5,41 @@ import MetalKit
 // MARK: - Geometry / Tessellation
 
 /// Convert a world (canvas pixel) point to NDC, applying pan/zoom.
+///
+/// CRITICAL: Uses Double-precision arithmetic throughout to maintain precision
+/// for large world coordinates. Only converts to Float at the final NDC step.
+/// This prevents precision loss when working with coordinates like 5,000,000.3
 func worldPixelToNDC(point w: CGPoint,
                      viewSize: CGSize,
                      panOffset: SIMD2<Float>,
                      zoomScale: Float) -> SIMD2<Float> {
-    let cx = Float(viewSize.width)  * 0.5
-    let cy = Float(viewSize.height) * 0.5
+    // Keep everything as Double for precision!
+    let cx = viewSize.width * 0.5
+    let cy = viewSize.height * 0.5
 
-    let wx = Float(w.x), wy = Float(w.y)
+    // w.x and w.y are already Double (CGFloat is Double on 64-bit)
+    let wx = w.x
+    let wy = w.y
 
-    // Remove center (world -> centered)
+    // Remove center (world -> centered) - still Double
     let centeredX = wx - cx
     let centeredY = wy - cy
 
-    // Apply zoom (centered -> zoomed)
-    let zx = centeredX * zoomScale
-    let zy = centeredY * zoomScale
+    // Apply zoom (centered -> zoomed) - still Double
+    let zx = centeredX * Double(zoomScale)
+    let zy = centeredY * Double(zoomScale)
 
-    // Apply pan (in pixels)
-    let px = zx + panOffset.x
-    let py = zy + panOffset.y
+    // Apply pan (in pixels) - still Double
+    let px = zx + Double(panOffset.x)
+    let py = zy + Double(panOffset.y)
 
-    // Back to screen pixels
+    // Back to screen pixels - still Double
     let sx = px + cx
     let sy = py + cy
 
-    // Screen pixels -> NDC
-    let ndcX = (sx / Float(viewSize.width)) * 2.0 - 1.0
-    let ndcY = -((sy / Float(viewSize.height)) * 2.0 - 1.0)
+    // Screen pixels -> NDC - ONLY NOW convert to Float
+    let ndcX = Float((sx / viewSize.width) * 2.0 - 1.0)
+    let ndcY = Float(-((sy / viewSize.height) * 2.0 - 1.0))
 
     return SIMD2<Float>(ndcX, ndcY)
 }
@@ -144,6 +151,438 @@ func createCircle(at point: CGPoint,
         vertices.append(p1)
         vertices.append(p2)
     }
+    return vertices
+}
+
+// MARK: - Tile-Local Tessellation (Phase 2)
+
+/// Create triangles for a stroke in tile-local space [0, 1024].
+/// This works with tile-local coordinates and widths, avoiding float precision issues.
+///
+/// - Parameters:
+///   - centerPoints: Points in tile-local space [0, 1024]
+///   - width: Width in tile-local units (NOT world pixels!)
+///   - tileSize: Size of tile in tile-local units (default 1024)
+/// - Returns: Vertices in tile-local space ready for GPU transform
+func tessellateStrokeLocal(centerPoints: [CGPoint],
+                           width: CGFloat,
+                           tileSize: CGFloat = 1024.0) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
+
+    guard centerPoints.count >= 2 else {
+        if centerPoints.count == 1 {
+            return createCircleLocal(at: centerPoints[0],
+                                    radius: width / 2.0,
+                                    tileSize: tileSize)
+        }
+        return vertices
+    }
+
+    let halfWidth = Float(width / 2.0)
+
+    // 1) START CAP
+    let startCapVertices = createCircleLocal(
+        at: centerPoints[0],
+        radius: width / 2.0,
+        tileSize: tileSize
+    )
+    vertices.append(contentsOf: startCapVertices)
+
+    // 2) SEGMENTS + JOINTS
+    for i in 0..<(centerPoints.count - 1) {
+        let current = centerPoints[i]
+        let next = centerPoints[i + 1]
+
+        // Points are already in tile-local space - use directly!
+        let p1 = SIMD2<Float>(Float(current.x), Float(current.y))
+        let p2 = SIMD2<Float>(Float(next.x), Float(next.y))
+
+        let dir = p2 - p1
+        let len = sqrt(dir.x * dir.x + dir.y * dir.y)
+        guard len > 0 else { continue }
+        let n = dir / len
+
+        let perp = SIMD2<Float>(-n.y, n.x)
+
+        // Width is already in tile-local units - use directly!
+        let T1 = p1 + perp * halfWidth
+        let B1 = p1 - perp * halfWidth
+        let T2 = p2 + perp * halfWidth
+        let B2 = p2 - perp * halfWidth
+
+        vertices.append(T1); vertices.append(B1); vertices.append(T2)
+        vertices.append(B1); vertices.append(B2); vertices.append(T2)
+
+        if i < centerPoints.count - 2 {
+            let jointVertices = createCircleLocal(
+                at: next,
+                radius: width / 2.0,
+                tileSize: tileSize,
+                segments: 16
+            )
+            vertices.append(contentsOf: jointVertices)
+        }
+    }
+
+    // 3) END CAP
+    let endCapVertices = createCircleLocal(
+        at: centerPoints[centerPoints.count - 1],
+        radius: width / 2.0,
+        tileSize: tileSize
+    )
+    vertices.append(contentsOf: endCapVertices)
+
+    return vertices
+}
+
+/// Triangle fan circle in tile-local space.
+/// Returns vertices in tile-local coordinates [0, 1024].
+///
+/// - Parameters:
+///   - point: Center point in tile-local space
+///   - radius: Radius in tile-local units
+///   - tileSize: Size of tile (default 1024)
+///   - segments: Number of segments in circle (default 30)
+/// - Returns: Triangle vertices in tile-local space
+func createCircleLocal(at point: CGPoint,
+                       radius: CGFloat,
+                       tileSize: CGFloat = 1024.0,
+                       segments: Int = 30) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
+
+    // Point and radius are already in tile-local space
+    let center = SIMD2<Float>(Float(point.x), Float(point.y))
+    let r = Float(radius)
+
+    for i in 0..<segments {
+        let a1 = Float(i) * (2.0 * .pi / Float(segments))
+        let a2 = Float(i + 1) * (2.0 * .pi / Float(segments))
+
+        let p1 = SIMD2<Float>(center.x + cos(a1) * r,
+                              center.y + sin(a1) * r)
+        let p2 = SIMD2<Float>(center.x + cos(a2) * r,
+                              center.y + sin(a2) * r)
+
+        vertices.append(center)
+        vertices.append(p1)
+        vertices.append(p2)
+    }
+    return vertices
+}
+
+// MARK: - Local-Space Tessellation (Floating Origin Architecture)
+
+/// Tessellate stroke in LOCAL space (relative to stroke origin).
+/// This is view-agnostic: no NDC conversion, no zoom, no pan.
+/// Just pure geometry: "offset these points by this width".
+///
+/// **Key Principle:** All inputs and outputs are in the same unit system
+/// (world pixels), just centered around (0,0) instead of absolute world coords.
+func tessellateStrokeLocal(centerPoints: [SIMD2<Float>],
+                           width: Float) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
+
+    guard centerPoints.count >= 2 else {
+        if centerPoints.count == 1 {
+            return createCircleLocal(at: centerPoints[0], radius: width / 2.0)
+        }
+        return vertices
+    }
+
+    let halfWidth = width / 2.0
+
+    // 1) START CAP
+    let startCapVertices = createCircleLocal(at: centerPoints[0], radius: halfWidth)
+    vertices.append(contentsOf: startCapVertices)
+
+    // 2) SEGMENTS + JOINTS
+    for i in 0..<(centerPoints.count - 1) {
+        let p0 = centerPoints[i]
+        let p1 = centerPoints[i + 1]
+
+        // Direction vector
+        let dir = p1 - p0
+        let len = sqrt(dir.x * dir.x + dir.y * dir.y)
+        guard len > 0 else { continue }
+
+        let normalized = dir / len
+        let perpendicular = SIMD2<Float>(-normalized.y, normalized.x)
+
+        // Offset vertices by half-width
+        let offset = perpendicular * halfWidth
+
+        let top0 = p0 + offset
+        let bot0 = p0 - offset
+        let top1 = p1 + offset
+        let bot1 = p1 - offset
+
+        // Two triangles forming a quad
+        vertices.append(top0)
+        vertices.append(bot0)
+        vertices.append(top1)
+
+        vertices.append(bot0)
+        vertices.append(bot1)
+        vertices.append(top1)
+
+        // Add joint circle at segment connections
+        if i < centerPoints.count - 2 {
+            let jointVertices = createCircleLocal(at: p1, radius: halfWidth, segments: 16)
+            vertices.append(contentsOf: jointVertices)
+        }
+    }
+
+    // 3) END CAP
+    let endCapVertices = createCircleLocal(at: centerPoints[centerPoints.count - 1], radius: halfWidth)
+    vertices.append(contentsOf: endCapVertices)
+
+    return vertices
+}
+
+/// Create circle cap in local space.
+/// Returns vertices relative to (0,0), not in NDC or screen space.
+func createCircleLocal(at center: SIMD2<Float>,
+                      radius: Float,
+                      segments: Int = 30) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
+
+    for i in 0..<segments {
+        let a1 = Float(i) * (2.0 * .pi / Float(segments))
+        let a2 = Float(i + 1) * (2.0 * .pi / Float(segments))
+
+        let p1 = SIMD2<Float>(center.x + cos(a1) * radius,
+                              center.y + sin(a1) * radius)
+        let p2 = SIMD2<Float>(center.x + cos(a2) * radius,
+                              center.y + sin(a2) * radius)
+
+        vertices.append(center)
+        vertices.append(p1)
+        vertices.append(p2)
+    }
+
+    return vertices
+}
+
+// MARK: - World-Space Tessellation (Double Precision - DEPRECATED)
+
+/// Tessellate stroke in WORLD space using Double precision throughout.
+/// This avoids float32 precision loss even with tiny world widths at extreme zoom.
+/// Returns vertices in NDC at identity transform (ready for GPU transform).
+func tessellateStrokeWorldDouble(centerPoints: [SIMD2<Double>],
+                                 width: Double,
+                                 viewSize: CGSize) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
+
+    guard centerPoints.count >= 2 else {
+        if centerPoints.count == 1 {
+            return createCircleWorldDouble(at: centerPoints[0],
+                                          radius: width / 2.0,
+                                          viewSize: viewSize)
+        }
+        return vertices
+    }
+
+    let halfWidth = width / 2.0
+
+    // 1) START CAP
+    let startCapVertices = createCircleWorldDouble(at: centerPoints[0],
+                                                   radius: halfWidth,
+                                                   viewSize: viewSize)
+    vertices.append(contentsOf: startCapVertices)
+
+    // 2) SEGMENTS + JOINTS
+    for i in 0..<(centerPoints.count - 1) {
+        let p0 = centerPoints[i]
+        let p1 = centerPoints[i + 1]
+
+        // Direction vector (Double precision)
+        let dir = p1 - p0
+        let len = sqrt(dir.x * dir.x + dir.y * dir.y)
+        guard len > 0 else { continue }
+
+        let normalized = dir / len
+        let perpendicular = SIMD2<Double>(-normalized.y, normalized.x)
+
+        // Offset vertices (Double precision)
+        let offset = perpendicular * halfWidth
+
+        let top0 = p0 + offset
+        let bot0 = p0 - offset
+        let top1 = p1 + offset
+        let bot1 = p1 - offset
+
+        // Convert to NDC (Double → Float only at the end)
+        let T0 = worldToNDC_Double(top0, viewSize: viewSize)
+        let B0 = worldToNDC_Double(bot0, viewSize: viewSize)
+        let T1 = worldToNDC_Double(top1, viewSize: viewSize)
+        let B1 = worldToNDC_Double(bot1, viewSize: viewSize)
+
+        // Two triangles forming a quad
+        vertices.append(T0)
+        vertices.append(B0)
+        vertices.append(T1)
+
+        vertices.append(B0)
+        vertices.append(B1)
+        vertices.append(T1)
+
+        // Add joint circle at segment connections
+        if i < centerPoints.count - 2 {
+            let jointVertices = createCircleWorldDouble(at: p1,
+                                                       radius: halfWidth,
+                                                       viewSize: viewSize,
+                                                       segments: 16)
+            vertices.append(contentsOf: jointVertices)
+        }
+    }
+
+    // 3) END CAP
+    let endCapVertices = createCircleWorldDouble(at: centerPoints[centerPoints.count - 1],
+                                                 radius: halfWidth,
+                                                 viewSize: viewSize)
+    vertices.append(contentsOf: endCapVertices)
+
+    return vertices
+}
+
+/// Create circle cap in world space using Double precision.
+/// Returns vertices in NDC at identity transform.
+func createCircleWorldDouble(at center: SIMD2<Double>,
+                            radius: Double,
+                            viewSize: CGSize,
+                            segments: Int = 30) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
+
+    let centerNDC = worldToNDC_Double(center, viewSize: viewSize)
+
+    // Radius in world units → NDC units (using Double)
+    let W = Double(viewSize.width)
+    let radiusNDC = Float((radius / W) * 2.0)
+
+    for i in 0..<segments {
+        let a1 = Double(i) * (2.0 * .pi / Double(segments))
+        let a2 = Double(i + 1) * (2.0 * .pi / Double(segments))
+
+        let p1 = SIMD2<Float>(centerNDC.x + Float(cos(a1)) * radiusNDC,
+                              centerNDC.y + Float(sin(a1)) * radiusNDC)
+        let p2 = SIMD2<Float>(centerNDC.x + Float(cos(a2)) * radiusNDC,
+                              centerNDC.y + Float(sin(a2)) * radiusNDC)
+
+        vertices.append(centerNDC)
+        vertices.append(p1)
+        vertices.append(p2)
+    }
+
+    return vertices
+}
+
+/// Convert world pixels to NDC using Double precision (at identity transform).
+func worldToNDC_Double(_ world: SIMD2<Double>, viewSize: CGSize) -> SIMD2<Float> {
+    let W = Double(viewSize.width)
+    let H = Double(viewSize.height)
+
+    // World pixels → NDC (using Double throughout)
+    let x = (world.x / W) * 2.0 - 1.0
+    let y = -((world.y / H) * 2.0 - 1.0)
+
+    // Only convert to Float at the very end
+    return SIMD2<Float>(Float(x), Float(y))
+}
+
+// MARK: - Screen-Space Tessellation (High Precision)
+
+/// Create a circle in screen pixel coordinates (not NDC).
+/// All geometry math happens in screen pixels to avoid precision loss.
+func createCircleInScreenSpace(center: SIMD2<Float>,
+                               radiusPixels: Float,
+                               segments: Int = 30) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
+
+    for i in 0..<segments {
+        let a1 = Float(i) * (2.0 * .pi / Float(segments))
+        let a2 = Float(i + 1) * (2.0 * .pi / Float(segments))
+
+        let p1 = SIMD2<Float>(center.x + cos(a1) * radiusPixels,
+                              center.y + sin(a1) * radiusPixels)
+        let p2 = SIMD2<Float>(center.x + cos(a2) * radiusPixels,
+                              center.y + sin(a2) * radiusPixels)
+
+        // Triangle fan
+        vertices.append(center)
+        vertices.append(p1)
+        vertices.append(p2)
+    }
+
+    return vertices
+}
+
+/// Tessellate stroke in screen pixel coordinates.
+/// All geometry calculations happen at screen-pixel scale to avoid precision issues.
+/// Returns vertices in screen space - caller must convert to world space using double precision.
+func tessellateStrokeInScreenSpace(screenPoints: [SIMD2<Float>],
+                                   widthPixels: Float) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
+
+    guard screenPoints.count >= 2 else {
+        if screenPoints.count == 1 {
+            // Single point -> just a circle
+            return createCircleInScreenSpace(center: screenPoints[0],
+                                            radiusPixels: widthPixels * 0.5)
+        }
+        return vertices
+    }
+
+    let halfWidth = widthPixels * 0.5
+
+    // 1) START CAP
+    let startCapVertices = createCircleInScreenSpace(center: screenPoints[0],
+                                                     radiusPixels: halfWidth)
+    vertices.append(contentsOf: startCapVertices)
+
+    // 2) SEGMENTS + JOINTS
+    for i in 0..<(screenPoints.count - 1) {
+        let p0 = screenPoints[i]
+        let p1 = screenPoints[i + 1]
+
+        // Calculate direction vector
+        let dir = p1 - p0
+        let len = sqrt(dir.x * dir.x + dir.y * dir.y)
+        guard len > 0 else { continue }
+
+        let normalized = dir / len
+        let perpendicular = SIMD2<Float>(-normalized.y, normalized.x)
+
+        // Offset vertices by half-width perpendicular to direction
+        let offset = perpendicular * halfWidth
+
+        let top0 = p0 + offset
+        let bot0 = p0 - offset
+        let top1 = p1 + offset
+        let bot1 = p1 - offset
+
+        // Two triangles forming a quad
+        vertices.append(top0)
+        vertices.append(bot0)
+        vertices.append(top1)
+
+        vertices.append(bot0)
+        vertices.append(bot1)
+        vertices.append(top1)
+
+        // Add joint circle at segment connections (except at the last point)
+        if i < screenPoints.count - 2 {
+            let jointVertices = createCircleInScreenSpace(center: p1,
+                                                         radiusPixels: halfWidth,
+                                                         segments: 16)
+            vertices.append(contentsOf: jointVertices)
+        }
+    }
+
+    // 3) END CAP
+    let endCapVertices = createCircleInScreenSpace(center: screenPoints[screenPoints.count - 1],
+                                                   radiusPixels: halfWidth)
+    vertices.append(contentsOf: endCapVertices)
+
     return vertices
 }
 
@@ -267,6 +706,80 @@ func screenToNDC(_ p: CGPoint, viewSize: CGSize) -> SIMD2<Float> {
     return SIMD2<Float>(x, y)
 }
 
+/// Convert screen pixels to world pixels using double precision.
+/// This is used for high-precision conversion of tessellated geometry.
+/// All intermediate calculations use Double to maintain precision even at extreme zoom levels.
+func screenToWorldPixels_Double(_ p: SIMD2<Float>,
+                                viewSize: CGSize,
+                                panOffset: SIMD2<Float>,
+                                zoomScale: Float,
+                                rotationAngle: Float) -> SIMD2<Float> {
+    // Use double precision for all intermediate calculations
+    let W = Double(viewSize.width)
+    let H = Double(viewSize.height)
+
+    // Screen pixels -> NDC (using double)
+    let ndcX = (Double(p.x) / W) * 2.0 - 1.0
+    let ndcY = -((Double(p.y) / H) * 2.0 - 1.0)
+
+    // Unpan in NDC (inverse of shader pan operation)
+    let panNDCx = (Double(panOffset.x) / W) * 2.0
+    let panNDCy = -(Double(panOffset.y) / H) * 2.0
+    let upX = ndcX - panNDCx
+    let upY = ndcY - panNDCy
+
+    // Unzoom
+    let zoom = Double(zoomScale)
+    let uzX = upX / zoom
+    let uzY = upY / zoom
+
+    // Unrotate (R(-θ))
+    let angle = Double(rotationAngle)
+    let c = cos(angle)
+    let s = sin(angle)
+    let posX =  uzX * c - uzY * s
+    let posY =  uzX * s + uzY * c
+
+    // NDC -> world pixels
+    let wx = ((posX + 1.0) * 0.5) * W
+    let wy = ((1.0 - posY) * 0.5) * H
+
+    return SIMD2<Float>(Float(wx), Float(wy))
+}
+
+/// 🟢 PURE DOUBLE PRECISION (Pixel Space Rotation)
+/// Converts Screen Pixels -> World Pixels avoiding NDC distortion.
+/// Rotates in PIXEL SPACE to match the shader's pixel-space rotation.
+func screenToWorldPixels_PureDouble(_ p: CGPoint,
+                                    viewSize: CGSize,
+                                    panOffset: SIMD2<Double>,
+                                    zoomScale: Double,
+                                    rotationAngle: Float) -> SIMD2<Double> {
+
+    let center = SIMD2<Double>(Double(viewSize.width) / 2.0, Double(viewSize.height) / 2.0)
+    let screenPt = SIMD2<Double>(Double(p.x), Double(p.y))
+
+    // 1. Screen offset from center
+    let offsetX = screenPt.x - center.x - panOffset.x
+    let offsetY = screenPt.y - center.y - panOffset.y
+
+    // 2. Unrotate (Inverse of Shader's CW Matrix)
+    // Shader uses: [c, -s; s, c]
+    // Inverse:     [c,  s; -s, c]
+    let angle = Double(rotationAngle)
+    let c = cos(angle)
+    let s = sin(angle)
+
+    let unrotatedX = offsetX * c + offsetY * s
+    let unrotatedY = -offsetX * s + offsetY * c
+
+    // 3. Unzoom
+    let worldX = unrotatedX / zoomScale
+    let worldY = unrotatedY / zoomScale
+
+    return SIMD2<Double>(worldX, worldY)
+}
+
 /// Solve the pixel panOffset that keeps `anchorWorld` under `desiredScreen`
 /// for the current zoom/rotation (matches shader math exactly).
 func solvePanOffsetForAnchor(anchorWorld: SIMD2<Float>,
@@ -300,10 +813,53 @@ func solvePanOffsetForAnchor(anchorWorld: SIMD2<Float>,
     return SIMD2<Float>(panPx, panPy)
 }
 
+/// 🟢 HIGH-PRECISION VERSION: Solve for Pan Offset using pure Double precision
+/// This prevents stepping/stuttering at extreme zoom levels (1,000,000x+)
+/// where Float precision (7 digits) is insufficient for smooth camera motion.
+/// Works in PIXEL SPACE to match the new rotation logic.
+func solvePanOffsetForAnchor_Double(anchorWorld: SIMD2<Double>,
+                                    desiredScreen: CGPoint,
+                                    viewSize: CGSize,
+                                    zoomScale: Double,
+                                    rotationAngle: Float) -> SIMD2<Double> {
+    let center = SIMD2<Double>(Double(viewSize.width) / 2.0, Double(viewSize.height) / 2.0)
+
+    // Forward transform: screen = (world * rot * zoom) + pan + center
+    // Solve for pan: pan = screen - center - (world * rot * zoom)
+
+    // 1. Rotate world point using CW matrix [c, -s; s, c]
+    let angle = Double(rotationAngle)
+    let c = cos(angle)
+    let s = sin(angle)
+    let rotatedX = anchorWorld.x * c - anchorWorld.y * s
+    let rotatedY = anchorWorld.x * s + anchorWorld.y * c
+
+    // 2. Zoom
+    let zoomedX = rotatedX * zoomScale
+    let zoomedY = rotatedY * zoomScale
+
+    // 3. Solve for pan
+    let panX = Double(desiredScreen.x) - center.x - zoomedX
+    let panY = Double(desiredScreen.y) - center.y - zoomedY
+
+    return SIMD2<Double>(panX, panY)
+}
 
 
-// MARK: - GPU Transform Struct
 
+// MARK: - GPU Transform Struct (Floating Origin Architecture)
+
+/// Per-stroke transform using relative coordinates.
+/// The GPU never sees absolute world coordinates - only small relative offsets.
+struct StrokeTransform {
+    var relativeOffset: SIMD2<Float>  // Stroke origin - Camera center (in world units)
+    var zoomScale: Float              // Current zoom level
+    var screenWidth: Float            // Screen dimensions
+    var screenHeight: Float
+    var rotationAngle: Float          // Camera rotation
+}
+
+/// Legacy global transform (for reference, not used in floating origin system)
 struct GPUTransform {
     var panOffset: SIMD2<Float>
     var zoomScale: Float
@@ -339,21 +895,25 @@ struct MetalView: UIViewRepresentable {
         var panGesture: UIPanGestureRecognizer!
         var pinchGesture: UIPinchGestureRecognizer!
         var rotationGesture: UIRotationGestureRecognizer!
+        var longPressGesture: UILongPressGestureRecognizer!
 
-        // Pinch anchor (persist between .began and subsequent states)
+        // 🟢 COMMIT 4: Debug HUD
+        var debugLabel: UILabel!
+
+        // 🟢 UPGRADED: Anchors now use Double for infinite precision at extreme zoom
         var pinchAnchorScreen: CGPoint = .zero
-        var pinchAnchorWorld: SIMD2<Float> = .zero
-        var panOffsetAtPinchStart: SIMD2<Float> = .zero
-        
-        //roation anchor
+        var pinchAnchorWorld: SIMD2<Double> = .zero
+        var panOffsetAtPinchStart: SIMD2<Double> = .zero
+
+        //rotation anchor
         var rotationAnchorScreen: CGPoint = .zero
-        var rotationAnchorWorld: SIMD2<Float> = .zero
-        var panOffsetAtRotationStart: SIMD2<Float> = .zero
-        
+        var rotationAnchorWorld: SIMD2<Double> = .zero
+        var panOffsetAtRotationStart: SIMD2<Double> = .zero
+
         enum AnchorOwner { case none, pinch, rotation }
 
         var activeOwner: AnchorOwner = .none
-        var anchorWorld: SIMD2<Float> = .zero
+        var anchorWorld: SIMD2<Double> = .zero
         var anchorScreen: CGPoint = .zero
         
         var lastPinchTouchCount: Int = 0
@@ -365,25 +925,28 @@ struct MetalView: UIViewRepresentable {
         func lockAnchor(owner: AnchorOwner, at screenPt: CGPoint, coord: Coordinator) {
             activeOwner = owner
             anchorScreen = screenPt
-            let w = screenToWorldPixels(screenPt,
-                                        viewSize: bounds.size,
-                                        panOffset: coord.panOffset,
-                                        zoomScale: coord.zoomScale,
-                                        rotationAngle: coord.rotationAngle)
-            anchorWorld = SIMD2<Float>(Float(w.x), Float(w.y))
+
+            // 🟢 FIX: Use Pure Double precision.
+            // Previously this was using the Float version, causing the "Jump" on rotation.
+            anchorWorld = screenToWorldPixels_PureDouble(screenPt,
+                                                         viewSize: bounds.size,
+                                                         panOffset: coord.panOffset, // SIMD2<Double>
+                                                         zoomScale: coord.zoomScale, // Double
+                                                         rotationAngle: coord.rotationAngle)
         }
 
         // Re-lock anchor to a new screen point *without changing the transform*
         func relockAnchorAtCurrentCentroid(owner: AnchorOwner, screenPt: CGPoint, coord: Coordinator) {
             activeOwner = owner
             anchorScreen = screenPt
-            // IMPORTANT: recompute world under the *new* centroid using current pan/zoom/rotation.
-            let w = screenToWorldPixels(screenPt,
-                                        viewSize: bounds.size,
-                                        panOffset: coord.panOffset,
-                                        zoomScale: coord.zoomScale,
-                                        rotationAngle: coord.rotationAngle)
-            anchorWorld = SIMD2<Float>(Float(w.x), Float(w.y))
+
+            // 🟢 FIX: Use Pure Double precision here too.
+            // This prevents jumps when you add/remove a finger (changing the centroid).
+            anchorWorld = screenToWorldPixels_PureDouble(screenPt,
+                                                         viewSize: bounds.size,
+                                                         panOffset: coord.panOffset,
+                                                         zoomScale: coord.zoomScale,
+                                                         rotationAngle: coord.rotationAngle)
         }
 
         func handoffAnchor(to newOwner: AnchorOwner, screenPt: CGPoint, coord: Coordinator) {
@@ -392,8 +955,202 @@ struct MetalView: UIViewRepresentable {
 
         func clearAnchorIfUnused() { activeOwner = .none }
 
+        // MARK: - 🟢 COMMIT 3: Telescoping Transitions
 
-        
+        /// Check if zoom has exceeded thresholds and perform frame transitions if needed.
+        /// Returns TRUE if a transition occurred (caller should return early).
+        func checkTelescopingTransitions(coord: Coordinator, currentCentroid: CGPoint) -> Bool {
+            // DRILL DOWN: Zoom exceeded upper limit → Create child frame
+            if coord.zoomScale > 1000.0 {
+                // 🟢 Pass the shared anchor instead of recomputing
+                drillDownToNewFrame(coord: coord,
+                                   anchorWorld: anchorWorld,
+                                   anchorScreen: anchorScreen)
+                return true // 🟢 Transition happened
+            }
+            // POP UP: Zoom fell below lower limit → Return to parent frame
+            else if coord.zoomScale < 0.5, coord.activeFrame.parent != nil {
+                // 🟢 Pass the shared anchor instead of recomputing
+                popUpToParentFrame(coord: coord,
+                                  anchorWorld: anchorWorld,
+                                  anchorScreen: anchorScreen)
+                return true // 🟢 Transition happened
+            }
+
+            return false // No change
+        }
+
+        /// "The Silent Teleport" - Drill down into a child frame.
+        /// 🟢 FIX: Uses the shared anchor instead of recomputing to prevent micro-jumps.
+        func drillDownToNewFrame(coord: Coordinator,
+                                 anchorWorld: SIMD2<Double>,
+                                 anchorScreen: CGPoint) {
+            // 1. CAPTURE STATE (CRITICAL: Do this BEFORE resetting zoom)
+            let currentZoom = coord.zoomScale // This should be ~1000.0
+
+            // 2. USE THE EXACT ANCHOR (Don't recompute from screen!)
+            // This is the key fix - we use the exact same world point that the gesture handler
+            // has been tracking, preventing floating point discrepancies.
+            let pinchPointWorld = anchorWorld // EXACT same world point as gesture anchor
+            let currentCentroid = anchorScreen // Reuse for solving pan
+
+            // 3. Search radius: Keep it reasonable to avoid snapping to far-away frames
+            let searchRadius: Double = 50.0
+
+            var targetFrame: Frame? = nil
+            for child in coord.activeFrame.children {
+                if distance(child.originInParent, pinchPointWorld) < searchRadius {
+                    targetFrame = child
+                    break
+                }
+            }
+
+            if let existing = targetFrame {
+                // ♻️ RE-ENTER EXISTING FRAME
+                coord.activeFrame = existing
+
+                // 4. Calculate where the FINGER is inside this frame
+                // LocalPinch = (ParentPinch - Origin) * Scale
+                let diffX = pinchPointWorld.x - existing.originInParent.x
+                let diffY = pinchPointWorld.y - existing.originInParent.y
+
+                let localPinchX = diffX * existing.scaleRelativeToParent
+                let localPinchY = diffY * existing.scaleRelativeToParent
+
+                // 5. RESET ZOOM
+                // We do this AFTER calculating positions
+                coord.zoomScale = currentZoom / existing.scaleRelativeToParent
+
+                // 6. SOLVE PAN
+                coord.panOffset = solvePanOffsetForAnchor_Double(
+                    anchorWorld: SIMD2<Double>(localPinchX, localPinchY),
+                    desiredScreen: currentCentroid,
+                    viewSize: bounds.size,
+                    zoomScale: coord.zoomScale, // Now ~1.0
+                    rotationAngle: coord.rotationAngle
+                )
+
+                print("♻️ Re-entered frame. Strokes: \(existing.strokes.count)")
+
+            } else {
+                // ✨ CREATE NEW FRAME
+
+                // 🟢 FIX: Center the new frame exactly on the PINCH POINT (Finger).
+                // This prevents exponential coordinate growth (Off-Center Accumulation).
+                // OLD: Centered on screen center → 500px offset compounds to 500,000 → 500M → 10^18 → CRASH
+                // NEW: Centered on finger → offset resets to 0 at each depth → stays bounded forever
+                let newFrameOrigin = pinchPointWorld
+
+                let newFrame = Frame(
+                    parent: coord.activeFrame,
+                    origin: newFrameOrigin,
+                    scale: currentZoom // Use captured high zoom
+                )
+                coord.activeFrame.children.append(newFrame)
+
+                coord.activeFrame = newFrame
+                coord.zoomScale = 1.0
+
+                // 🟢 RESULT: The pinch point is now the origin (0,0)
+                // diffX = pinchPointWorld - newFrameOrigin = 0
+                // diffY = pinchPointWorld - newFrameOrigin = 0
+                // localPinch = (0, 0)
+
+                coord.panOffset = solvePanOffsetForAnchor_Double(
+                    anchorWorld: SIMD2<Double>(0, 0), // Finger is at Local (0,0)
+                    desiredScreen: currentCentroid,   // Keep Finger at Screen Point
+                    viewSize: bounds.size,
+                    zoomScale: 1.0,
+                    rotationAngle: coord.rotationAngle
+                )
+
+                print("✨ Created NEW frame. Origin centered on pinch. Depth: \(frameDepth(coord.activeFrame))")
+            }
+
+            // 7. RE-ANCHOR GESTURES (update with new coordinate system)
+            if activeOwner != .none {
+                self.anchorWorld = screenToWorldPixels_PureDouble(
+                    currentCentroid,
+                    viewSize: bounds.size,
+                    panOffset: coord.panOffset,
+                    zoomScale: coord.zoomScale,
+                    rotationAngle: coord.rotationAngle
+                )
+                self.anchorScreen = currentCentroid
+            }
+        }
+
+        /// Helper: Calculate Euclidean distance between two points
+        func distance(_ a: SIMD2<Double>, _ b: SIMD2<Double>) -> Double {
+            let dx = b.x - a.x
+            let dy = b.y - a.y
+            return sqrt(dx * dx + dy * dy)
+        }
+
+        /// "The Reverse Teleport" - Pop up to the parent frame.
+        /// 🟢 FIX: Uses the shared anchor instead of recomputing to prevent micro-jumps.
+        func popUpToParentFrame(coord: Coordinator,
+                                anchorWorld: SIMD2<Double>,
+                                anchorScreen: CGPoint) {
+            guard let parent = coord.activeFrame.parent else { return }
+
+            let currentFrame = coord.activeFrame
+
+            // 1. Calculate new zoom in parent space
+            let newZoom = coord.zoomScale * currentFrame.scaleRelativeToParent
+
+            // 2. USE THE EXACT ANCHOR (Don't recompute from screen!)
+            // This is in the active (child) frame's coordinates
+            let pinchPosInChild = anchorWorld
+            let currentCentroid = anchorScreen
+
+            // 3. Convert Child Pinch Position -> Parent Pinch Position
+            // Parent = Origin + (Child / Scale)
+            let pinchPosInParentX = currentFrame.originInParent.x + (pinchPosInChild.x / currentFrame.scaleRelativeToParent)
+            let pinchPosInParentY = currentFrame.originInParent.y + (pinchPosInChild.y / currentFrame.scaleRelativeToParent)
+
+            // 4. Solve Pan to lock FINGER position
+            let newPanOffset = solvePanOffsetForAnchor_Double(
+                anchorWorld: SIMD2<Double>(pinchPosInParentX, pinchPosInParentY),
+                desiredScreen: currentCentroid,
+                viewSize: bounds.size,
+                zoomScale: newZoom,
+                rotationAngle: coord.rotationAngle
+            )
+
+            // 5. THE HANDOFF - Switch to parent
+            coord.activeFrame = parent
+            coord.zoomScale = newZoom
+            coord.panOffset = newPanOffset
+
+            // 6. RE-ANCHOR GESTURES (update with new coordinate system)
+            if activeOwner != .none {
+                self.anchorWorld = screenToWorldPixels_PureDouble(
+                    currentCentroid,
+                    viewSize: bounds.size,
+                    panOffset: coord.panOffset,
+                    zoomScale: coord.zoomScale,
+                    rotationAngle: coord.rotationAngle
+                )
+                self.anchorScreen = currentCentroid
+            }
+
+            print("⬆️ Popped up to parent frame. Depth: \(frameDepth(coord.activeFrame))")
+        }
+
+        /// Helper: Calculate the depth of a frame (how many parents it has)
+        func frameDepth(_ frame: Frame) -> Int {
+            var depth = 0
+            var current: Frame? = frame
+            while current?.parent != nil {
+                depth += 1
+                current = current?.parent
+            }
+            return depth
+        }
+
+
+
 
         override init(frame: CGRect, device: MTLDevice?) {
             super.init(frame: frame, device: device)
@@ -412,13 +1169,47 @@ struct MetalView: UIViewRepresentable {
 
             pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
             addGestureRecognizer(pinchGesture)
-            
+
             rotationGesture = UIRotationGestureRecognizer(target: self, action: #selector(handleRotation(_:)))
             addGestureRecognizer(rotationGesture)
+
+            longPressGesture = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
+            longPressGesture.minimumPressDuration = 0.5
+            longPressGesture.numberOfTouchesRequired = 2
+            addGestureRecognizer(longPressGesture)
 
             panGesture.delegate = self
             pinchGesture.delegate = self
             rotationGesture.delegate = self
+            longPressGesture.delegate = self
+
+            // 🟢 COMMIT 4: Setup Debug HUD
+            setupDebugHUD()
+        }
+
+        func setupDebugHUD() {
+            debugLabel = UILabel()
+            debugLabel.translatesAutoresizingMaskIntoConstraints = false
+            debugLabel.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .medium)
+            debugLabel.textColor = .white
+            debugLabel.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+            debugLabel.numberOfLines = 0
+            debugLabel.textAlignment = .left
+            debugLabel.layer.cornerRadius = 8
+            debugLabel.layer.masksToBounds = true
+            debugLabel.text = "Frame: 0 | Zoom: 1.0×"
+            debugLabel.isUserInteractionEnabled = false
+
+            // Add padding to the label
+            debugLabel.layoutMargins = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+
+            addSubview(debugLabel)
+
+            // Position in top-left corner with padding
+            NSLayoutConstraint.activate([
+                debugLabel.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 16),
+                debugLabel.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 16)
+            ])
         }
 
         @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
@@ -441,17 +1232,28 @@ struct MetalView: UIViewRepresentable {
                     return
                 }
 
-                // Normal incremental zoom
-                coord.zoomScale = coord.zoomScale * Float(gesture.scale)
+                // 🟢 Normal incremental zoom - multiply using Double precision
+                coord.zoomScale = coord.zoomScale * Double(gesture.scale)
                 gesture.scale = 1.0
 
-                // Keep the shared anchor pinned
+                // 🟢 COMMIT 3: TELESCOPING TRANSITIONS
+                // Check if we need to drill down (zoom in) or pop up (zoom out)
+                // Pass the current touch centroid to anchor transitions to finger position
+                // 🟢 FIX: If we switched frames, STOP here.
+                // The transition logic has already calculated the perfect panOffset
+                // to keep the finger pinned. Running the standard solver below
+                // would overwrite it with a "glitched" value.
+                if checkTelescopingTransitions(coord: coord, currentCentroid: loc) {
+                    return
+                }
+
+                // Standard Solver (Only runs if we did NOT switch frames)
                 let target = (activeOwner == .pinch) ? loc : anchorScreen
-                coord.panOffset = solvePanOffsetForAnchor(anchorWorld: anchorWorld,
-                                                          desiredScreen: target,
-                                                          viewSize: bounds.size,
-                                                          zoomScale: coord.zoomScale,
-                                                          rotationAngle: coord.rotationAngle)
+                coord.panOffset = solvePanOffsetForAnchor_Double(anchorWorld: anchorWorld,
+                                                                 desiredScreen: target,
+                                                                 viewSize: bounds.size,
+                                                                 zoomScale: coord.zoomScale,
+                                                                 rotationAngle: coord.rotationAngle)
                 if activeOwner == .pinch { anchorScreen = target }
 
             case .ended, .cancelled, .failed:
@@ -474,8 +1276,9 @@ struct MetalView: UIViewRepresentable {
 
         @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
             let t = gesture.translation(in: self)
-            coordinator?.panOffset.x += Float(t.x)
-            coordinator?.panOffset.y += Float(t.y)
+            // 🟢 Add pan translation as Double for infinite precision
+            coordinator?.panOffset.x += Double(t.x)
+            coordinator?.panOffset.y += Double(t.y)
             gesture.setTranslation(.zero, in: self)
 
             if activeOwner != .none {
@@ -508,13 +1311,13 @@ struct MetalView: UIViewRepresentable {
                 coord.rotationAngle += Float(gesture.rotation)
                 gesture.rotation = 0.0
 
-                // Keep shared anchor pinned
+                // 🟢 Keep shared anchor pinned - use Double-precision solver
                 let target = (activeOwner == .rotation) ? loc : anchorScreen
-                coord.panOffset = solvePanOffsetForAnchor(anchorWorld: anchorWorld,
-                                                          desiredScreen: target,
-                                                          viewSize: bounds.size,
-                                                          zoomScale: coord.zoomScale,
-                                                          rotationAngle: coord.rotationAngle)
+                coord.panOffset = solvePanOffsetForAnchor_Double(anchorWorld: anchorWorld,
+                                                                 desiredScreen: target,
+                                                                 viewSize: bounds.size,
+                                                                 zoomScale: coord.zoomScale,
+                                                                 rotationAngle: coord.rotationAngle)
                 if activeOwner == .rotation { anchorScreen = target }
 
             case .ended, .cancelled, .failed:
@@ -529,6 +1332,37 @@ struct MetalView: UIViewRepresentable {
                 lastRotationTouchCount = 0
 
             default: break
+            }
+        }
+
+        @objc func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
+            guard let coord = coordinator else { return }
+
+            if gesture.state == .began {
+                coord.tileManager.debugMode.toggle()
+                let status = coord.tileManager.debugMode ? "ON" : "OFF"
+                print("\n🔧 TILE DEBUG MODE: \(status)")
+                print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+                if coord.tileManager.debugMode {
+                    let loc = gesture.location(in: self)
+                    let worldPoint = screenToWorldPixels(loc,
+                                                         viewSize: bounds.size,
+                                                         panOffset: SIMD2<Float>(Float(coord.panOffset.x), Float(coord.panOffset.y)),
+                                                         zoomScale: Float(coord.zoomScale),
+                                                         rotationAngle: coord.rotationAngle)
+                    let tileKey = coord.tileManager.getTileKey(worldPoint: worldPoint)
+                    let debugOutput = coord.tileManager.debugInfo(worldPoint: worldPoint,
+                                                                  screenPoint: loc,
+                                                                  tileKey: tileKey)
+                    print(debugOutput)
+
+                    // PHASE 2 TEST: Tile-local tessellation
+                    coord.testTileLocalTessellation()
+
+                    // PHASE 3 DIAGNOSIS: Check for gaps issue
+                    coord.diagnoseGapsIssue()
+                }
             }
         }
 
@@ -565,14 +1399,33 @@ class Coordinator: NSObject, MTKViewDelegate {
     var pipelineState: MTLRenderPipelineState!
     var vertexBuffer: MTLBuffer!
 
-    var currentTouchPoints: [CGPoint] = []
-    var allStrokes: [Stroke] = []
+    var currentTouchPoints: [CGPoint] = []  // Stored in SCREEN space during drawing
+    var liveStrokeOrigin: SIMD2<Double>?    // Temporary origin for live stroke (Double precision)
+
+    // 🟢 COMMIT 1: Telescoping Reference Frames
+    // Instead of a flat array, we use a linked list of Frames for infinite zoom
+    let rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
+    lazy var activeFrame: Frame = rootFrame  // The current "Local Universe" we are viewing/editing
 
     weak var metalView: MTKView?
 
-    var panOffset: SIMD2<Float> = .zero
-    var zoomScale: Float = 1.0
+    // 🟢 UPGRADED: Store camera state as Double for infinite precision
+    var panOffset: SIMD2<Double> = .zero {
+        didSet {
+            // Cast to Float only when updating tile manager
+            tileManager.currentPanOffset = SIMD2<Float>(Float(panOffset.x), Float(panOffset.y))
+        }
+    }
+    var zoomScale: Double = 1.0 {
+        didSet {
+            // Cast to Float only when updating tile manager
+            tileManager.currentZoomScale = Float(zoomScale)
+        }
+    }
     var rotationAngle: Float = 0.0
+
+    // MARK: - Tiling System (Phase 1: Debug Only)
+    let tileManager = TileManager()
 
     override init() {
         super.init()
@@ -580,80 +1433,330 @@ class Coordinator: NSObject, MTKViewDelegate {
         commandQueue = device.makeCommandQueue()!
         makePipeLine()
         makeVertexBuffer()
+
+        // Initialize tile manager state (cast Double to Float)
+        tileManager.currentZoomScale = Float(zoomScale)
+        tileManager.currentPanOffset = SIMD2<Float>(Float(panOffset.x), Float(panOffset.y))
     }
 
-    func draw(in view: MTKView) {
-        let startTime = Date()
+    /// Update tile manager with current view size (call when view size changes)
+    func updateTileManagerViewSize(_ size: CGSize) {
+        tileManager.viewSize = size
+    }
 
-        var allVertices: [SIMD2<Float>] = []
+    // MARK: - Commit 2: Recursive Renderer
 
-        // Use cached vertices (tessellated at identity)
-        for stroke in allStrokes {
-            allVertices.append(contentsOf: stroke.vertices)
-        }
+    /// Recursively render a frame and adjacent depth levels (depth ±1).
+    ///
+    /// **🟢 BIDIRECTIONAL RENDERING:**
+    /// We now render in three layers:
+    /// 1. Parent frame (background - depth -1)
+    /// 2. Current frame (middle layer - depth 0)
+    /// 3. Child frames (foreground details - depth +1)
+    ///
+    /// This ensures strokes remain visible when transitioning between depths.
+    ///
+    /// - Parameters:
+    ///   - frame: The frame to render
+    ///   - cameraCenterInThisFrame: Where the camera is positioned in this frame's coordinate system
+    ///   - viewSize: The view dimensions
+    ///   - currentZoom: The current zoom level (adjusted for each frame level)
+    ///   - currentRotation: The rotation angle
+    ///   - encoder: The Metal render encoder
+    func renderFrame(_ frame: Frame,
+                     cameraCenterInThisFrame: SIMD2<Double>,
+                     viewSize: CGSize,
+                     currentZoom: Double,
+                     currentRotation: Float,
+                     encoder: MTLRenderCommandEncoder,
+                     excludedChild: Frame? = nil) { // 🟢 NEW: Prevent double-rendering
 
-        // Current stroke - ALSO tessellate at identity!
-        if currentTouchPoints.count >= 2 {
-            let currentVertices = tessellateStroke(
-                centerPoints: currentTouchPoints,
-                width: 10.0 / CGFloat(zoomScale),  // ← Fixed width in world pixels
-                viewSize: view.bounds.size,
-                panOffset: .zero,      // ← Identity, not current!
-                zoomScale: 1.0
+        // LAYER 1: RENDER PARENT (Background - Depth -1) -------------------------------
+        if let parent = frame.parent {
+            // Convert camera position from child coordinates to parent coordinates
+            // Formula: parent_pos = originInParent + (child_pos / scale)
+            let cameraCenterInParent = SIMD2<Double>(
+                frame.originInParent.x + (cameraCenterInThisFrame.x / frame.scaleRelativeToParent),
+                frame.originInParent.y + (cameraCenterInThisFrame.y / frame.scaleRelativeToParent)
             )
-            allVertices.append(contentsOf: currentVertices)
+
+            // Zoom in parent frame is reduced (parent is "bigger")
+            let parentZoom = currentZoom * frame.scaleRelativeToParent
+
+            // 🟢 FIX: Event Horizon Culling - Lowered to 1e9 (1 Billion)
+            // Stop rendering the parent if it's magnified beyond Double precision safe zone.
+            // At 1e9+, precision errors cause jittery/shakey panning across vast distances.
+            // The background becomes mathematically unstable and visually meaningless.
+            if parentZoom > 0.0001 && parentZoom < 1e9 {
+                renderFrame(parent,
+                           cameraCenterInThisFrame: cameraCenterInParent,
+                           viewSize: viewSize,
+                           currentZoom: parentZoom,
+                           currentRotation: currentRotation,
+                           encoder: encoder,
+                           excludedChild: frame) // 🟢 TELL PARENT TO SKIP US
+            }
         }
 
-        let tessellationTime = Date().timeIntervalSince(startTime)
-        if tessellationTime > 0.016 {
-            print("⚠️ Tessellation taking \(tessellationTime * 1000)ms - too slow!")
+        // LAYER 2: RENDER THIS FRAME (Middle Layer - Depth 0) --------------------------
+        for stroke in frame.strokes {
+            guard !stroke.localVertices.isEmpty else { continue }
+
+            let relativeOffsetDouble = stroke.origin - cameraCenterInThisFrame
+            let relativeOffset = SIMD2<Float>(
+                Float(relativeOffsetDouble.x),
+                Float(relativeOffsetDouble.y)
+            )
+
+            var transform = StrokeTransform(
+                relativeOffset: relativeOffset,
+                zoomScale: Float(currentZoom),
+                screenWidth: Float(viewSize.width),
+                screenHeight: Float(viewSize.height),
+                rotationAngle: currentRotation
+            )
+
+            drawStroke(stroke, with: &transform, encoder: encoder)
         }
 
-        // Transform buffer with current pan/zoom
-        var transform = GPUTransform(
-            panOffset: panOffset,
-            zoomScale: zoomScale,
-            screenWidth: Float(view.bounds.width),
-            screenHeight: Float(view.bounds.height),
-            rotationAngle: rotationAngle
-        )
-        let transformBuffer = device.makeBuffer(
-            bytes: &transform,
-            length: MemoryLayout<GPUTransform>.stride,
+        // LAYER 3: RENDER CHILDREN (Foreground Details - Depth +1) ---------------------
+        // 🟢 FIX: Look down into child frames so they don't disappear when zooming out
+        for child in frame.children {
+            // 🟢 FIX 1: Skip the excluded child (The one we came from)
+            // This prevents "double vision" where the active frame renders itself twice:
+            // once as a child of its parent, and once as the foreground layer.
+            if let excluded = excludedChild, child === excluded {
+                continue
+            }
+
+            // 1. Calculate effective zoom for the child
+            // Child is smaller, so we zoom out (divide by scale)
+            let childZoom = currentZoom / child.scaleRelativeToParent
+
+            // Optimization: Culling
+            // If child is too small to see (< 1 pixel equivalent), skip it
+            if childZoom < 0.001 { continue }
+
+            // 2. Calculate the Frame's offset relative to the camera (in Parent Units)
+            let frameOffsetInParentUnits = child.originInParent - cameraCenterInThisFrame
+
+            // 3. Convert that offset into Child Units
+            // (Because the shader multiplies everything by childZoom, we must pre-scale the offset up)
+            let frameOffsetInChildUnits = frameOffsetInParentUnits * child.scaleRelativeToParent
+
+            // 4. Render each stroke individually
+            for stroke in child.strokes {
+                guard !stroke.localVertices.isEmpty else { continue }
+
+                // 🟢 FIX: Add the Stroke's own origin to the Frame's offset
+                // Before, this was missing 'stroke.origin', collapsing everything to (0,0)
+                let totalRelativeOffset = stroke.origin + frameOffsetInChildUnits
+
+                var childTransform = StrokeTransform(
+                    relativeOffset: SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y)),
+                    zoomScale: Float(childZoom),
+                    screenWidth: Float(viewSize.width),
+                    screenHeight: Float(viewSize.height),
+                    rotationAngle: currentRotation
+                )
+
+                drawStroke(stroke, with: &childTransform, encoder: encoder)
+            }
+
+            // Note: We do NOT recurse into grandchildren to avoid rendering depth ±2, ±3, etc.
+            // Just immediate children (depth +1) is enough for visual continuity
+        }
+    }
+
+    /// Helper to draw a stroke with a given transform.
+    /// Reduces code duplication across parent/current/child rendering.
+    func drawStroke(_ stroke: Stroke, with transform: inout StrokeTransform, encoder: MTLRenderCommandEncoder) {
+        guard !stroke.localVertices.isEmpty else { return }
+
+        let vertexBuffer = device.makeBuffer(
+            bytes: stroke.localVertices,
+            length: stroke.localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
             options: .storageModeShared
         )
 
-        if allVertices.isEmpty {
-            let commandBuffer = commandQueue.makeCommandBuffer()!
-            guard let rpd = view.currentRenderPassDescriptor else { return }
-            let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
-            enc.setRenderPipelineState(pipelineState)
-            enc.setCullMode(.none)
+        let transformBuffer = device.makeBuffer(
+            bytes: &transform,
+            length: MemoryLayout<StrokeTransform>.stride,
+            options: .storageModeShared
+        )
 
-            enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+        encoder.drawPrimitives(type: .triangle,
+                             vertexStart: 0,
+                             vertexCount: stroke.localVertices.count)
+    }
 
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-            enc.endEncoding()
-            commandBuffer.present(view.currentDrawable!)
-            commandBuffer.commit()
-            return
+    func draw(in view: MTKView) {
+        // Update tile manager view size (only changes when view resizes)
+        if tileManager.viewSize != view.bounds.size {
+            tileManager.viewSize = view.bounds.size
         }
 
-        updateVertexBuffer(with: allVertices)
+        // PHASE 2: Calculate Camera Center in World Space (Double precision)
+        // This is the "View Center" - where the center of the screen is in the infinite world.
+        let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
+
+        // 🟢 COMMIT 2: Start rendering pipeline
         let commandBuffer = commandQueue.makeCommandBuffer()!
         guard let rpd = view.currentRenderPassDescriptor else { return }
         let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
         enc.setRenderPipelineState(pipelineState)
         enc.setCullMode(.none)
 
-        enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-        enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+        // 🟢 COMMIT 2: RECURSIVE RENDERING
+        // Render all committed strokes using the recursive renderer
+        // This will automatically render parent frames (background) before the active frame (foreground)
+        renderFrame(activeFrame,
+                   cameraCenterInThisFrame: cameraCenterWorld,
+                   viewSize: view.bounds.size,
+                   currentZoom: zoomScale,
+                   currentRotation: rotationAngle,
+                   encoder: enc,
+                   excludedChild: nil) // Start with no exclusion
 
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVertices.count)
+        // 🟢 COMMIT 2: LIVE STROKE RENDERING
+        // Live strokes are rendered on top of all committed strokes (foreground)
+        if currentTouchPoints.count >= 2, let tempOrigin = liveStrokeOrigin {
+            // Calculate geometry using screen-space deltas (infinite precision)
+            // Formula: (ScreenPoint - FirstScreenPoint) / Zoom
+            let firstScreenPt = currentTouchPoints[0]
+            let zoom = Double(zoomScale)
+            let angle = Double(rotationAngle)
+            let c = cos(angle)
+            let s = sin(angle)
+
+            let localPoints = currentTouchPoints.map { pt in
+                let dx = Double(pt.x) - Double(firstScreenPt.x)
+                let dy = Double(pt.y) - Double(firstScreenPt.y)
+
+                // Match the CPU Inverse Rotation (Screen -> World)
+                // Inverse of Shader's CW matrix: [c, s; -s, c]
+                let unrotatedX = dx * c + dy * s
+                let unrotatedY = -dx * s + dy * c
+
+                // Convert to world units
+                let worldDx = unrotatedX / zoom
+                let worldDy = unrotatedY / zoom
+
+                return SIMD2<Float>(Float(worldDx), Float(worldDy))
+            }
+
+            // Tessellate in LOCAL space
+            // 🟢 FIX: Match actual stroke width calculation (10px screen / zoom)
+            let worldWidth = 10.0 / zoom
+            let localVertices = tessellateStrokeLocal(
+                centerPoints: localPoints,
+                width: Float(worldWidth)
+            )
+
+            guard !localVertices.isEmpty else {
+                enc.endEncoding()
+                commandBuffer.present(view.currentDrawable!)
+                commandBuffer.commit()
+                return
+            }
+
+            // Calculate relative offset for live stroke
+            let relativeOffsetDouble = tempOrigin - cameraCenterWorld
+            let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x),
+                                             Float(relativeOffsetDouble.y))
+
+            // Create transform for live stroke
+            var liveTransform = StrokeTransform(
+                relativeOffset: relativeOffset,
+                zoomScale: Float(zoomScale),
+                screenWidth: Float(view.bounds.width),
+                screenHeight: Float(view.bounds.height),
+                rotationAngle: rotationAngle
+            )
+
+            // Create buffers and render
+            let vertexBuffer = device.makeBuffer(
+                bytes: localVertices,
+                length: localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
+                options: .storageModeShared
+            )
+
+            let transformBuffer = device.makeBuffer(
+                bytes: &liveTransform,
+                length: MemoryLayout<StrokeTransform>.stride,
+                options: .storageModeShared
+            )
+
+            enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: localVertices.count)
+        }
+
         enc.endEncoding()
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()
+
+        // 🟢 COMMIT 4: Update Debug HUD
+        updateDebugHUD(view: view)
+    }
+
+    /// Update the debug HUD with current frame depth and zoom level
+    func updateDebugHUD(view: MTKView) {
+        // Access debugLabel through the stored metalView reference
+        guard let mtkView = metalView else { return }
+
+        // Find the debug label subview
+        guard let debugLabel = mtkView.subviews.compactMap({ $0 as? UILabel }).first else { return }
+
+        // Calculate frame depth
+        var depth = 0
+        var current: Frame? = activeFrame
+        while current?.parent != nil {
+            depth += 1
+            current = current?.parent
+        }
+
+        // Format zoom scale nicely
+        let zoomText: String
+        if zoomScale >= 1000.0 {
+            zoomText = String(format: "%.1fk×", zoomScale / 1000.0)
+        } else if zoomScale >= 1.0 {
+            zoomText = String(format: "%.1f×", zoomScale)
+        } else {
+            zoomText = String(format: "%.3f×", zoomScale)
+        }
+
+        // Calculate effective zoom (depth multiplier)
+        let effectiveZoom = pow(1000.0, Double(depth)) * zoomScale
+        let effectiveText: String
+        if effectiveZoom >= 1e12 {
+            let exponent = Int(log10(effectiveZoom))
+            effectiveText = String(format: "10^%d", exponent)
+        } else if effectiveZoom >= 1e9 {
+            effectiveText = String(format: "%.1fB×", effectiveZoom / 1e9)
+        } else if effectiveZoom >= 1e6 {
+            effectiveText = String(format: "%.1fM×", effectiveZoom / 1e6)
+        } else if effectiveZoom >= 1e3 {
+            effectiveText = String(format: "%.1fk×", effectiveZoom / 1e3)
+        } else {
+            effectiveText = String(format: "%.1f×", effectiveZoom)
+        }
+
+        // Calculate camera position in current frame
+        let cameraPos = calculateCameraCenterWorld(viewSize: view.bounds.size)
+        let cameraPosText = String(format: "(%.1f, %.1f)", cameraPos.x, cameraPos.y)
+
+        // Update label on main thread
+        DispatchQueue.main.async {
+            debugLabel.text = """
+            Depth: \(depth) | Zoom: \(zoomText)
+            Effective: \(effectiveText)
+            Strokes: \(self.activeFrame.strokes.count)
+            Camera: \(cameraPosText)
+            """
+        }
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -687,55 +1790,394 @@ class Coordinator: NSObject, MTKViewDelegate {
         vertexBuffer = device.makeBuffer(bytes: vertices, length: bufferSize, options: .storageModeShared)
     }
 
+    // MARK: - Camera Center Calculation
+
+    /// Calculate the camera center in world coordinates using Double precision.
+    /// This is the inverse of the pan/zoom/rotate transform applied to strokes.
+    func calculateCameraCenterWorld(viewSize: CGSize) -> SIMD2<Double> {
+        // The center of the screen in screen coordinates
+        let screenCenter = CGPoint(x: viewSize.width / 2.0, y: viewSize.height / 2.0)
+
+        // 🟢 USE PURE DOUBLE HELPER
+        // Pass Double panOffset and zoomScale directly without casting to Float
+        // This prevents precision loss at extreme zoom levels (1,000,000x+)
+        return screenToWorldPixels_PureDouble(screenCenter,
+                                              viewSize: viewSize,
+                                              panOffset: panOffset,       // Now passing SIMD2<Double>
+                                              zoomScale: zoomScale,       // Now passing Double
+                                              rotationAngle: rotationAngle)
+    }
+
     // MARK: - Touch Handling
 
     func handleTouchBegan(at point: CGPoint) {
         guard let view = metalView else { return }
-        let worldPoint = screenToWorldPixels(point,
-                                             viewSize: view.bounds.size,
-                                             panOffset: panOffset,
-                                             zoomScale: zoomScale, rotationAngle: rotationAngle)
-        currentTouchPoints = [worldPoint]
+
+        // PHASE 5: Establish temporary origin for live stroke
+        // The first touch point becomes the origin (in world coordinates, Double precision)
+        // 🟢 FIX: Use PureDouble version to match actual stroke creation
+        liveStrokeOrigin = screenToWorldPixels_PureDouble(
+            point,
+            viewSize: view.bounds.size,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
+
+        // Keep points in SCREEN space during drawing
+        currentTouchPoints = [point]
+
+        // Debug tiling system (only when debug mode enabled)
+        if tileManager.debugMode, let origin = liveStrokeOrigin {
+            let worldPointCG = CGPoint(x: origin.x, y: origin.y)
+            let tileKey = tileManager.getTileKey(worldPoint: worldPointCG)
+            let debugOutput = tileManager.debugInfo(worldPoint: worldPointCG,
+                                                    screenPoint: point,
+                                                    tileKey: tileKey)
+            print("\n📍 TOUCH BEGAN - Temporary Origin: \(origin)")
+            print(debugOutput)
+        }
     }
 
     func handleTouchMoved(at point: CGPoint) {
-        guard let view = metalView else { return }
-        let worldPoint = screenToWorldPixels(point,
-                                             viewSize: view.bounds.size,
-                                             panOffset: panOffset,
-                                             zoomScale: zoomScale, rotationAngle: rotationAngle)
-        currentTouchPoints.append(worldPoint)
+        // Keep points in SCREEN space during drawing (key for precision!)
+        currentTouchPoints.append(point)
+
+        // Debug tiling system (only when debug mode enabled, every 10th point)
+        if tileManager.debugMode && currentTouchPoints.count % 10 == 0 {
+            guard let view = metalView else { return }
+            let worldPoint = screenToWorldPixels(point,
+                                               viewSize: view.bounds.size,
+                                               panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
+                                               zoomScale: Float(zoomScale),
+                                               rotationAngle: rotationAngle)
+            let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
+            let debugOutput = tileManager.debugInfo(worldPoint: worldPoint,
+                                                    screenPoint: point,
+                                                    tileKey: tileKey)
+            print("\n✏️ TOUCH MOVED (point \(currentTouchPoints.count))")
+            print(debugOutput)
+        }
     }
 
     func handleTouchEnded(at point: CGPoint) {
         guard let view = metalView else { return }
-        let worldPoint = screenToWorldPixels(point,
-                                             viewSize: view.bounds.size,
-                                             panOffset: panOffset,
-                                             zoomScale: zoomScale, rotationAngle: rotationAngle)
-        currentTouchPoints.append(worldPoint)
+
+        // Keep final point in SCREEN space
+        currentTouchPoints.append(point)
+
+        // Debug tiling system (only when debug mode enabled)
+        if tileManager.debugMode {
+            let worldPoint = screenToWorldPixels(point,
+                                               viewSize: view.bounds.size,
+                                               panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
+                                               zoomScale: Float(zoomScale),
+                                               rotationAngle: rotationAngle)
+            let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
+            let debugOutput = tileManager.debugInfo(worldPoint: worldPoint,
+                                                    screenPoint: point,
+                                                    tileKey: tileKey)
+            print("\n🏁 TOUCH ENDED")
+            print(debugOutput)
+        }
 
         guard currentTouchPoints.count >= 4 else {
             currentTouchPoints = []
+            liveStrokeOrigin = nil
             return
         }
 
-        let smoothPoints = catmullRomPoints(points: currentTouchPoints,
-                                            closed: false,
-                                            alpha: 0.5,
-                                            segmentsPerCurve: 20)
+        // Smooth the screen-space points
+        let smoothScreenPoints = catmullRomPoints(points: currentTouchPoints,
+                                                  closed: false,
+                                                  alpha: 0.5,
+                                                  segmentsPerCurve: 20)
 
-        let stroke = Stroke(centerPoints: smoothPoints,
-                            width: 10.0 / CGFloat(zoomScale),
-                            color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0),
-                            viewSize: view.bounds.size)
+        // 🟢 NEW: Pass SCREEN points directly to avoid Double precision loss
+        // The stroke will calculate geometry using screen-space deltas: (pt - firstPt) / zoom
+        // This preserves perfect smoothness at any zoom level
+        let stroke = Stroke(screenPoints: smoothScreenPoints,
+                            zoomAtCreation: zoomScale,
+                            panAtCreation: panOffset,
+                            viewSize: view.bounds.size,
+                            rotationAngle: rotationAngle,
+                            color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0))
 
-        allStrokes.append(stroke)
+        activeFrame.strokes.append(stroke)
         currentTouchPoints = []
+        liveStrokeOrigin = nil  // Clear temporary origin
     }
 
     func handleTouchCancelled() {
         currentTouchPoints = []
+        liveStrokeOrigin = nil  // Clear temporary origin
+    }
+
+    // MARK: - Phase 3: Tile-Local Current Stroke Rendering
+
+    /// Render current stroke using tile-local tessellation to avoid precision issues.
+    /// This is the critical function that enables gap-free drawing at any zoom level!
+    func renderCurrentStrokeTileLocal(view: MTKView) -> [SIMD2<Float>] {
+        guard currentTouchPoints.count >= 2 else { return [] }
+
+        // 1. Calculate width in tile-local space
+        let widthTile = tileManager.calculateTileLocalWidth(baseWidth: 10.0)
+
+        // 2. Group touch points by tile AND track which tiles each point belongs to
+        var pointsByTile: [TileKey: [CGPoint]] = [:]
+        var pointToTile: [Int: TileKey] = [:]  // Index → TileKey mapping
+
+        for (index, worldPoint) in currentTouchPoints.enumerated() {
+            let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
+            let localPoint = tileManager.worldToTileLocal(worldPoint: worldPoint, tileKey: tileKey)
+            pointsByTile[tileKey, default: []].append(localPoint)
+            pointToTile[index] = tileKey
+        }
+
+        // DEBUG: Check for tile boundary crossings
+        if tileManager.debugMode {
+            var crossings = 0
+            for i in 0..<(currentTouchPoints.count - 1) {
+                if pointToTile[i] != pointToTile[i + 1] {
+                    crossings += 1
+                    print("⚠️ TILE BOUNDARY CROSSING at segment \(i)→\(i+1)")
+                    print("   Point \(i): tile \(pointToTile[i]?.description ?? "?")")
+                    print("   Point \(i+1): tile \(pointToTile[i+1]?.description ?? "?")")
+                }
+            }
+
+            if pointsByTile.count > 1 {
+                print("📦 Stroke spans \(pointsByTile.count) tiles, \(crossings) boundary crossings")
+                print("   Points per tile: \(pointsByTile.mapValues { $0.count })")
+            }
+        }
+
+        // 3. Tessellate each tile's segment in tile-local space
+        var allLocalVertices: [(tileKey: TileKey, vertices: [SIMD2<Float>])] = []
+
+        for (tileKey, localPoints) in pointsByTile {
+            guard localPoints.count >= 2 else { continue }
+
+            let vertices = tessellateStrokeLocal(
+                centerPoints: localPoints,
+                width: CGFloat(widthTile)
+            )
+            allLocalVertices.append((tileKey: tileKey, vertices: vertices))
+        }
+
+        // 4. Convert tile-local vertices to world space, then to NDC
+        var finalVertices: [SIMD2<Float>] = []
+
+        for (tileKey, vertices) in allLocalVertices {
+            for vertex in vertices {
+                // Convert tile-local vertex to world coordinates
+                let localPoint = CGPoint(x: Double(vertex.x), y: Double(vertex.y))
+                let worldPoint = tileManager.tileLocalToWorld(localPoint: localPoint, tileKey: tileKey)
+
+                // Convert world to NDC (existing pipeline)
+                let ndcVertex = worldPixelToNDC(
+                    point: worldPoint,
+                    viewSize: view.bounds.size,
+                    panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
+                    zoomScale: Float(zoomScale)
+                )
+
+                finalVertices.append(ndcVertex)
+            }
+        }
+
+        // Debug output for Phase 3
+        if tileManager.debugMode && currentTouchPoints.count >= 2 {
+            print("\n🎨 PHASE 3: TILE-LOCAL STROKE RENDERING")
+            print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            print("Zoom: \(zoomScale)x (level \(tileManager.referenceLevel))")
+            print("Tile Size (world): \(String(format: "%.9f", tileManager.tileSizeAtReferenceLevel)) px")
+            print("Width (world): \(String(format: "%.9f", 10.0 / Double(zoomScale))) px")
+            print("Width (tile-local): \(String(format: "%.6f", widthTile)) units")
+            print("Touch Points: \(currentTouchPoints.count)")
+            print("Tiles Spanned: \(pointsByTile.count)")
+            print("Total Vertices: \(finalVertices.count)")
+
+            // Detailed point analysis
+            print("\nPoint Analysis:")
+            for (index, worldPoint) in currentTouchPoints.prefix(3).enumerated() {
+                let tileKey = pointToTile[index]!
+                let localPoint = tileManager.worldToTileLocal(worldPoint: worldPoint, tileKey: tileKey)
+
+                print("  Point \(index):")
+                print("    World: (\(String(format: "%.3f", worldPoint.x)), \(String(format: "%.3f", worldPoint.y)))")
+                print("    Tile: Level \(tileKey.level), Grid (\(tileKey.tx), \(tileKey.ty))")
+                print("    Local [0,1024]: (\(String(format: "%.3f", localPoint.x)), \(String(format: "%.3f", localPoint.y)))")
+
+                // Check if local coords are in valid range
+                if localPoint.x < 0 || localPoint.x > 1024 || localPoint.y < 0 || localPoint.y > 1024 {
+                    print("    ⚠️ OUT OF RANGE!")
+                } else {
+                    print("    ✅ Valid")
+                }
+            }
+
+            // Tessellation check
+            print("\nTessellation Results:")
+            for (tileKey, localPoints) in pointsByTile.prefix(3) {
+                print("  Tile Level \(tileKey.level), Grid (\(tileKey.tx), \(tileKey.ty)): \(localPoints.count) points")
+                if localPoints.count < 2 {
+                    print("    ⚠️ INSUFFICIENT POINTS (need 2+)")
+                }
+            }
+
+            // Coordinate magnitude check
+            if let firstTile = allLocalVertices.first, let firstVertex = firstTile.vertices.first {
+                print("\nCoordinate Magnitude Check:")
+                print("  Tile-local vertex: (\(String(format: "%.3f", firstVertex.x)), \(String(format: "%.3f", firstVertex.y)))")
+                let magnitude = max(abs(firstVertex.x), abs(firstVertex.y))
+                print("  Max magnitude: \(String(format: "%.1f", magnitude))")
+
+                if magnitude < 2000 {
+                    print("  ✅ SMALL NUMBERS - Float precision preserved!")
+                } else {
+                    print("  ⚠️ LARGE NUMBERS - Float precision at risk!")
+                }
+            }
+            print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        }
+
+        return finalVertices
+    }
+
+    // MARK: - Phase 3 Diagnostics
+
+    /// Diagnose gaps issue - test simple 2-point stroke
+    func diagnoseGapsIssue() {
+        print("\n🔬 GAP DIAGNOSIS")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        guard let view = metalView else { return }
+
+        // Simulate a simple 2-point stroke at current zoom
+        let screenP1 = CGPoint(x: 100, y: 100)
+        let screenP2 = CGPoint(x: 200, y: 100)  // Horizontal line
+
+        let worldP1 = screenToWorldPixels(screenP1, viewSize: view.bounds.size,
+                                         panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
+                                         zoomScale: Float(zoomScale),
+                                         rotationAngle: rotationAngle)
+        let worldP2 = screenToWorldPixels(screenP2, viewSize: view.bounds.size,
+                                         panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
+                                         zoomScale: Float(zoomScale),
+                                         rotationAngle: rotationAngle)
+
+        print("Test Stroke: Horizontal line, 100px on screen")
+        print("  Screen P1: \(screenP1)")
+        print("  Screen P2: \(screenP2)")
+        print("  World P1: (\(String(format: "%.3f", worldP1.x)), \(String(format: "%.3f", worldP1.y)))")
+        print("  World P2: (\(String(format: "%.3f", worldP2.x)), \(String(format: "%.3f", worldP2.y)))")
+        print("  World distance: \(String(format: "%.3f", hypot(worldP2.x - worldP1.x, worldP2.y - worldP1.y))) px")
+
+        // Check tile assignment
+        let tile1 = tileManager.getTileKey(worldPoint: worldP1)
+        let tile2 = tileManager.getTileKey(worldPoint: worldP2)
+        let sameTile = (tile1 == tile2)
+
+        print("\nTile Assignment:")
+        print("  P1 tile: \(tile1.description)")
+        print("  P2 tile: \(tile2.description)")
+        print("  Same tile: \(sameTile ? "✅ YES" : "⚠️ NO - CROSSES BOUNDARY!")")
+
+        // Test tile-local conversion
+        let local1 = tileManager.worldToTileLocal(worldPoint: worldP1, tileKey: tile1)
+        let local2 = tileManager.worldToTileLocal(worldPoint: worldP2, tileKey: tile2)
+
+        print("\nTile-Local Coordinates:")
+        print("  P1 local: (\(String(format: "%.3f", local1.x)), \(String(format: "%.3f", local1.y)))")
+        print("  P2 local: (\(String(format: "%.3f", local2.x)), \(String(format: "%.3f", local2.y)))")
+
+        if sameTile {
+            let localDist = hypot(local2.x - local1.x, local2.y - local1.y)
+            print("  Local distance: \(String(format: "%.3f", localDist))")
+
+            // Test tessellation
+            let widthTile = tileManager.calculateTileLocalWidth(baseWidth: 10.0)
+            print("\nTessellation Test:")
+            print("  Width (tile-local): \(String(format: "%.6f", widthTile))")
+
+            let vertices = tessellateStrokeLocal(
+                centerPoints: [local1, local2],
+                width: CGFloat(widthTile)
+            )
+            print("  Generated vertices: \(vertices.count)")
+
+            if vertices.isEmpty {
+                print("  ⚠️ NO VERTICES GENERATED!")
+            }
+        } else {
+            print("  ⚠️ Points in different tiles - segment will be LOST!")
+        }
+
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    }
+
+    // MARK: - Phase 2 Testing
+
+    /// Test tile-local tessellation with known inputs
+    func testTileLocalTessellation() {
+        print("\n🧪 TESTING TILE-LOCAL TESSELLATION")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        // Test case: Simple stroke in tile-local space
+        let localPoints = [
+            CGPoint(x: 100, y: 100),
+            CGPoint(x: 200, y: 200),
+            CGPoint(x: 300, y: 200)
+        ]
+
+        // Calculate tile-local width at current zoom
+        let tileLocalWidth = tileManager.calculateTileLocalWidth(baseWidth: 10.0)
+
+        print("Width Calculation:")
+        print("  Zoom Scale: \(tileManager.currentZoomScale)")
+        print("  Reference Level: \(tileManager.referenceLevel)")
+        print("  Tile Size (world): \(String(format: "%.6f", tileManager.tileSizeAtReferenceLevel)) px")
+        print("  World Width: \(String(format: "%.6f", 10.0 / Double(tileManager.currentZoomScale))) px")
+        print("  Tile-Local Width: \(String(format: "%.6f", tileLocalWidth)) units")
+
+        // Tessellate
+        let vertices = tessellateStrokeLocal(
+            centerPoints: localPoints,
+            width: CGFloat(tileLocalWidth)
+        )
+
+        print("\nTessellation Results:")
+        print("  Input Points: \(localPoints.count)")
+        print("  Output Vertices: \(vertices.count)")
+
+        if !vertices.isEmpty {
+            let minX = vertices.map { $0.x }.min() ?? 0
+            let maxX = vertices.map { $0.x }.max() ?? 0
+            let minY = vertices.map { $0.y }.min() ?? 0
+            let maxY = vertices.map { $0.y }.max() ?? 0
+
+            print("  Vertex Range:")
+            print("    X: [\(String(format: "%.2f", minX)), \(String(format: "%.2f", maxX))]")
+            print("    Y: [\(String(format: "%.2f", minY)), \(String(format: "%.2f", maxY))]")
+
+            // Check width offset from centerline
+            let halfWidth = Float(tileLocalWidth / 2.0)
+            print("  Expected Half-Width: \(String(format: "%.6f", halfWidth))")
+
+            // Sample first quad (should be offset by halfWidth from p1)
+            if vertices.count >= 6 {
+                let p1 = SIMD2<Float>(Float(localPoints[0].x), Float(localPoints[0].y))
+                let T1 = vertices[0]  // Top vertex of first segment
+                let offset = distance(T1, p1)
+                print("  Actual Offset from Center: \(String(format: "%.6f", offset))")
+
+                let isCorrect = abs(offset - halfWidth) < 0.001
+                print("  ✅ Width Correct: \(isCorrect)")
+            }
+        }
+
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
     }
 }
 
