@@ -1424,7 +1424,7 @@ class Coordinator: NSObject, MTKViewDelegate {
 
 // MARK: - Gesture Delegate
 
-extension MetalView.TouchableMTKView: UIGestureRecognizerDelegate {
+extension TouchableMTKView: UIGestureRecognizerDelegate {
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         true
