@@ -2,6 +2,14 @@ import SwiftUI
 import Metal
 import MetalKit
 
+// MARK: - Vertex Structures
+
+/// Vertex structure with position and UV coordinates for textured rendering
+struct StrokeVertex {
+    var position: SIMD2<Float>  // Position in local space
+    var uv: SIMD2<Float>         // Texture coordinate (U = along stroke, V = across width)
+}
+
 // MARK: - Geometry / Tessellation
 
 /// Convert a world (canvas pixel) point to NDC, applying pan/zoom.
@@ -871,22 +879,52 @@ struct GPUTransform {
 // MARK: - MetalView
 
 struct MetalView: UIViewRepresentable {
+    @Binding var coordinator: Coordinator?
+
     func makeUIView(context: Context) -> MTKView {
+        print("🏗️ makeUIView called")
         let mtkView = TouchableMTKView()
         mtkView.device = MTLCreateSystemDefaultDevice()
         mtkView.clearColor = MTLClearColor(red: 0.1, green: 1.0, blue: 1.0, alpha: 1.0)
+
+        // 🟢 Enable Stencil Buffer for card clipping
+        mtkView.depthStencilPixelFormat = .stencil8
+
         mtkView.delegate = context.coordinator
         mtkView.isUserInteractionEnabled = true
 
         mtkView.coordinator = context.coordinator
         context.coordinator.metalView = mtkView
 
+        // Assign coordinator back to parent view via Binding
+        print("🔔 Setting coordinator via Binding")
+        DispatchQueue.main.async {
+            coordinator = context.coordinator
+            print("✅ Coordinator set via Binding")
+        }
+
         return mtkView
     }
 
-    func updateUIView(_ uiView: MTKView, context: Context) {}
+    func updateUIView(_ uiView: MTKView, context: Context) {
+        // Update coordinator binding if it hasn't been set yet
+        if coordinator == nil {
+            print("🔄 updateUIView: Setting coordinator")
+            DispatchQueue.main.async {
+                coordinator = context.coordinator
+            }
+        }
+    }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator {
+        print("👥 makeCoordinator called")
+        return Coordinator()
+    }
+
+    // MARK: - Associated Object Keys for gesture state storage
+    private struct AssociatedKeys {
+        static var draggedCard: UInt8 = 0
+    }
 
     // MARK: - TouchableMTKView
     class TouchableMTKView: MTKView {
@@ -1162,10 +1200,18 @@ struct MetalView: UIViewRepresentable {
         }
 
         func setupGestures() {
+            // 🟢 MODAL INPUT: PAN (Finger Only - 1 finger for card drag/canvas pan)
             panGesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
-            panGesture.minimumNumberOfTouches = 2
-            panGesture.maximumNumberOfTouches = 2
+            panGesture.minimumNumberOfTouches = 1
+            panGesture.maximumNumberOfTouches = 1
+            // Crucial: Ignore Apple Pencil for panning/dragging
+            panGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
             addGestureRecognizer(panGesture)
+
+            // 🟢 MODAL INPUT: TAP (Finger Only - Select/Edit Cards)
+            let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+            tapGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+            addGestureRecognizer(tapGesture)
 
             pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
             addGestureRecognizer(pinchGesture)
@@ -1210,6 +1256,126 @@ struct MetalView: UIViewRepresentable {
                 debugLabel.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 16),
                 debugLabel.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 16)
             ])
+        }
+
+        // MARK: - Gesture Handlers
+
+        /// 🟢 MODAL INPUT: TAP (Finger Only - Select/Deselect Cards)
+        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+            let loc = gesture.location(in: self)
+            guard let coord = coordinator else { return }
+
+            // 1. Calculate World Point
+            let worldPoint = screenToWorldPixels_PureDouble(
+                loc,
+                viewSize: bounds.size,
+                panOffset: coord.panOffset,
+                zoomScale: coord.zoomScale,
+                rotationAngle: coord.rotationAngle
+            )
+
+            // 2. Hit Test Cards (Reverse order = Top first)
+            for card in coord.activeFrame.cards.reversed() {
+                if card.hitTest(pointInFrame: worldPoint) {
+                    // Toggle Edit Mode
+                    card.isEditing.toggle()
+                    print("📌 Card \(card.id) Editing: \(card.isEditing)")
+                    return
+                }
+            }
+
+            // If we tapped nothing, deselect all cards
+            for card in coord.activeFrame.cards {
+                card.isEditing = false
+            }
+            print("🔓 All cards deselected")
+        }
+
+        /// 🟢 MODAL INPUT: PAN (Finger Only - Drag Card or Pan Canvas)
+        @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
+            let loc = gesture.location(in: self)
+            guard let coord = coordinator else { return }
+
+            // Track which card we are dragging (stored in TouchableMTKView)
+            var draggedCard: Card? {
+                get { objc_getAssociatedObject(self, &AssociatedKeys.draggedCard) as? Card }
+                set { objc_setAssociatedObject(self, &AssociatedKeys.draggedCard, newValue, .OBJC_ASSOCIATION_RETAIN) }
+            }
+
+            switch gesture.state {
+            case .began:
+                // 1. Check if we hit an EDITING card
+                let worldPoint = screenToWorldPixels_PureDouble(
+                    loc,
+                    viewSize: bounds.size,
+                    panOffset: coord.panOffset,
+                    zoomScale: coord.zoomScale,
+                    rotationAngle: coord.rotationAngle
+                )
+
+                for card in coord.activeFrame.cards.reversed() {
+                    if card.hitTest(pointInFrame: worldPoint) {
+                        if card.isEditing {
+                            draggedCard = card
+                            print("🎯 Started dragging card \(card.id)")
+                            return // Stop processing; we are dragging a card
+                        }
+                        // If card is NOT editing, we ignore it (Pass through to Canvas Pan)
+                    }
+                }
+                draggedCard = nil // We are panning the canvas
+
+            case .changed:
+                let translation = gesture.translation(in: self)
+
+                if let card = draggedCard {
+                    // 🟢 DRAG CARD
+                    // Convert screen translation to World translation
+                    // dxWorld = dxScreen / zoom
+                    let dx = Double(translation.x) / coord.zoomScale
+                    let dy = Double(translation.y) / coord.zoomScale
+
+                    // Handle rotation of the drag vector if camera is rotated
+                    let ang = Double(coord.rotationAngle)
+                    let c = cos(ang), s = sin(ang)
+                    let dxRot = dx * c + dy * s
+                    let dyRot = -dx * s + dy * c
+
+                    // Update Card Position
+                    card.origin.x += dxRot
+                    card.origin.y += dyRot
+
+                    // Reset gesture so we get incremental updates
+                    gesture.setTranslation(.zero, in: self)
+
+                } else {
+                    // 🟢 PAN CANVAS
+                    // Convert screen translation to world translation (accounting for zoom)
+                    let dx = Double(translation.x) / coord.zoomScale
+                    let dy = Double(translation.y) / coord.zoomScale
+
+                    // Handle rotation
+                    let ang = Double(coord.rotationAngle)
+                    let c = cos(ang), s = sin(ang)
+                    let dxRot = dx * c + dy * s
+                    let dyRot = -dx * s + dy * c
+
+                    // Update pan offset
+                    coord.panOffset.x += dxRot
+                    coord.panOffset.y += dyRot
+
+                    gesture.setTranslation(.zero, in: self)
+                }
+
+            case .ended, .cancelled, .failed:
+                if let card = draggedCard {
+                    print("✅ Finished dragging card \(card.id)")
+                }
+                draggedCard = nil
+
+            default:
+                break
+            }
         }
 
         @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
@@ -1271,23 +1437,6 @@ struct MetalView: UIViewRepresentable {
             default: break
             }
         }
-
-
-
-        @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
-            let t = gesture.translation(in: self)
-            // 🟢 Add pan translation as Double for infinite precision
-            coordinator?.panOffset.x += Double(t.x)
-            coordinator?.panOffset.y += Double(t.y)
-            gesture.setTranslation(.zero, in: self)
-
-            if activeOwner != .none {
-                anchorScreen.x += t.x
-                anchorScreen.y += t.y
-            }
-        }
-
-        
         @objc func handleRotation(_ gesture: UIRotationGestureRecognizer) {
             guard let coord = coordinator else { return }
             let loc = gesture.location(in: self)
@@ -1372,21 +1521,21 @@ struct MetalView: UIViewRepresentable {
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
             guard event?.allTouches?.count == 1, let touch = touches.first else { return }
             let location = touch.location(in: self)
-            coordinator?.handleTouchBegan(at: location)
+            coordinator?.handleTouchBegan(at: location, touchType: touch.type)
         }
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
             guard event?.allTouches?.count == 1, let touch = touches.first else { return }
             let location = touch.location(in: self)
-            coordinator?.handleTouchMoved(at: location)
+            coordinator?.handleTouchMoved(at: location, touchType: touch.type)
         }
         override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
             guard event?.allTouches?.count == 1, let touch = touches.first else { return }
             let location = touch.location(in: self)
-            coordinator?.handleTouchEnded(at: location)
+            coordinator?.handleTouchEnded(at: location, touchType: touch.type)
         }
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-            guard event?.allTouches?.count == 1 else { return }
-            coordinator?.handleTouchCancelled()
+            guard event?.allTouches?.count == 1, let touch = touches.first else { return }
+            coordinator?.handleTouchCancelled(touchType: touch.type)
         }
     }
 }
@@ -1397,7 +1546,25 @@ class Coordinator: NSObject, MTKViewDelegate {
     var device: MTLDevice!
     var commandQueue: MTLCommandQueue!
     var pipelineState: MTLRenderPipelineState!
+    var cardPipelineState: MTLRenderPipelineState!      // Pipeline for textured cards
+    var cardSolidPipelineState: MTLRenderPipelineState! // Pipeline for solid color cards
+    var samplerState: MTLSamplerState!                  // Sampler for card textures
     var vertexBuffer: MTLBuffer!
+
+    // 🟢 Stencil States for Card Clipping
+    var stencilStateDefault: MTLDepthStencilState! // Default passthrough (no testing)
+    var stencilStateWrite: MTLDepthStencilState!   // Writes 1s to stencil (card background)
+    var stencilStateRead: MTLDepthStencilState!    // Only draws where stencil == 1 (card strokes)
+    var stencilStateClear: MTLDepthStencilState!   // Writes 0s to stencil (cleanup)
+
+    // MARK: - Modal Input: Pencil vs. Finger
+
+    /// Tracks what object we are currently drawing on with the pencil
+    enum DrawingTarget {
+        case canvas(Frame)
+        case card(Card)
+    }
+    var currentDrawingTarget: DrawingTarget?
 
     var currentTouchPoints: [CGPoint] = []  // Stored in SCREEN space during drawing
     var liveStrokeOrigin: SIMD2<Double>?    // Temporary origin for live stroke (Double precision)
@@ -1499,6 +1666,9 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
 
         // LAYER 2: RENDER THIS FRAME (Middle Layer - Depth 0) --------------------------
+
+        // 2.1: RENDER CANVAS STROKES (Background layer - below cards) 🟢
+        encoder.setRenderPipelineState(pipelineState)
         for stroke in frame.strokes {
             guard !stroke.localVertices.isEmpty else { continue }
 
@@ -1518,6 +1688,119 @@ class Coordinator: NSObject, MTKViewDelegate {
 
             drawStroke(stroke, with: &transform, encoder: encoder)
         }
+
+        // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes) 🟢
+        for card in frame.cards {
+            // A. Calculate Position
+            // Card lives in the Frame, so it moves with the Frame
+            let relativeOffsetDouble = card.origin - cameraCenterInThisFrame
+            let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x), Float(relativeOffsetDouble.y))
+
+            // B. Handle Rotation
+            // Cards have their own rotation property
+            // Total Rotation = Camera Rotation + Card Rotation
+            let finalRotation = currentRotation + card.rotation
+
+            var transform = StrokeTransform(
+                relativeOffset: relativeOffset,
+                zoomScale: Float(currentZoom),
+                screenWidth: Float(viewSize.width),
+                screenHeight: Float(viewSize.height),
+                rotationAngle: finalRotation
+            )
+
+            // 🟢 STEP 1: DRAW CARD BACKGROUND + WRITE STENCIL
+            // Write '1' into the stencil buffer where the card pixels are
+            encoder.setDepthStencilState(stencilStateWrite)
+            encoder.setStencilReferenceValue(1)
+
+            // C. Set Pipeline & Bind Content Based on Card Type
+            switch card.type {
+            case .solidColor(let color):
+                // Use solid color pipeline (no texture required)
+                encoder.setRenderPipelineState(cardSolidPipelineState)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                var c = color
+                encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+            case .image(let texture):
+                // Use textured pipeline (requires texture binding)
+                encoder.setRenderPipelineState(cardPipelineState)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                encoder.setFragmentTexture(texture, index: 0)
+                encoder.setFragmentSamplerState(samplerState, index: 0)
+
+            case .drawing:
+                continue // Future: Render nested strokes
+            }
+
+            // D. Draw the Card Quad (writes to both color buffer and stencil)
+            let vertexBuffer = device.makeBuffer(
+                bytes: card.localVertices,
+                length: card.localVertices.count * MemoryLayout<StrokeVertex>.stride,
+                options: .storageModeShared
+            )
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+            // 🟢 STEP 2: DRAW CARD STROKES (CLIPPED TO CARD)
+            // Only draw where stencil == 1
+            if !card.strokes.isEmpty {
+                encoder.setRenderPipelineState(pipelineState)
+                encoder.setDepthStencilState(stencilStateRead) // <--- READ MODE
+                encoder.setStencilReferenceValue(1)
+
+                // Calculate "magic offset" for card-local coordinates
+                let totalRotation = currentRotation + card.rotation
+                let distX = card.origin.x - cameraCenterInThisFrame.x
+                let distY = card.origin.y - cameraCenterInThisFrame.y
+                let c = cos(Double(-card.rotation))
+                let s = sin(Double(-card.rotation))
+                let magicOffsetX = distX * c - distY * s
+                let magicOffsetY = distX * s + distY * c
+                let offset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
+
+                for stroke in card.strokes {
+                    guard !stroke.localVertices.isEmpty else { continue }
+                    let strokeOffset = stroke.origin
+                    var strokeTransform = StrokeTransform(
+                        relativeOffset: offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y)),
+                        zoomScale: Float(currentZoom),
+                        screenWidth: Float(viewSize.width),
+                        screenHeight: Float(viewSize.height),
+                        rotationAngle: totalRotation
+                    )
+                    drawStroke(stroke, with: &strokeTransform, encoder: encoder)
+                }
+            }
+
+            // 🟢 STEP 3: CLEANUP STENCIL (Reset to 0 for next card)
+            // Draw the card quad again with stencil clear mode
+            encoder.setRenderPipelineState(cardSolidPipelineState)
+            encoder.setDepthStencilState(stencilStateClear)
+            encoder.setStencilReferenceValue(0)
+            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            var clearColor = SIMD4<Float>(0, 0, 0, 0)
+            encoder.setFragmentBytes(&clearColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+            // E. Draw Resize Handles (If Selected) 🟢
+            // Handles should not be affected by stencil
+            if card.isEditing {
+                encoder.setDepthStencilState(stencilStateDefault) // Disable stencil for handles
+                drawCardHandles(card: card,
+                                cameraCenter: cameraCenterInThisFrame,
+                                viewSize: viewSize,
+                                zoom: currentZoom,
+                                rotation: finalRotation,
+                                encoder: encoder)
+            }
+        }
+
+        // Reset pipeline and stencil state for subsequent rendering (live stroke, child frames, etc.)
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setDepthStencilState(stencilStateDefault)
 
         // LAYER 3: RENDER CHILDREN (Foreground Details - Depth +1) ---------------------
         // 🟢 FIX: Look down into child frames so they don't disappear when zooming out
@@ -1592,6 +1875,95 @@ class Coordinator: NSObject, MTKViewDelegate {
                              vertexCount: stroke.localVertices.count)
     }
 
+    /// 🟢 CONSTANT SCREEN SIZE HANDLES
+    /// Draws resize handles at card corners that maintain 12pt screen size regardless of zoom
+    /// This provides consistent UX across all zoom levels (infinite canvas requirement)
+    ///
+    /// - Parameters:
+    ///   - card: The card to draw handles for
+    ///   - cameraCenter: Camera position in frame coordinates
+    ///   - viewSize: Screen dimensions
+    ///   - zoom: Current zoom level
+    ///   - rotation: Total rotation (camera + card)
+    ///   - encoder: Metal render encoder
+    func drawCardHandles(card: Card,
+                         cameraCenter: SIMD2<Double>,
+                         viewSize: CGSize,
+                         zoom: Double,
+                         rotation: Float,
+                         encoder: MTLRenderCommandEncoder) {
+
+        // 1. Calculate Constant Screen Size
+        // We want handles to be ~12pt on screen regardless of zoom
+        // In World Space, that is: 12.0 / Zoom
+        let handleSizeScreen: Float = 12.0
+        let handleSizeWorld = handleSizeScreen / Float(zoom)
+
+        // 2. Generate Handle Geometry (A small quad centered at 0,0)
+        // We generate this on the fly because the size changes every frame (based on zoom)
+        let halfS = handleSizeWorld / 2.0
+        let handleVertices: [StrokeVertex] = [
+            StrokeVertex(position: SIMD2<Float>(-halfS, -halfS), uv: .zero),
+            StrokeVertex(position: SIMD2<Float>(-halfS,  halfS), uv: .zero),
+            StrokeVertex(position: SIMD2<Float>( halfS, -halfS), uv: .zero),
+            StrokeVertex(position: SIMD2<Float>(-halfS,  halfS), uv: .zero),
+            StrokeVertex(position: SIMD2<Float>( halfS, -halfS), uv: .zero),
+            StrokeVertex(position: SIMD2<Float>( halfS,  halfS), uv: .zero)
+        ]
+
+        // 3. Calculate Corner Positions
+        // We need to place these squares at the card's corners
+        // IMPORTANT: The handles must rotate WITH the card
+        let corners = card.getLocalCorners() // TL, TR, BL, BR
+
+        // Setup Blue Color for Handles
+        var color = SIMD4<Float>(0.0, 0.47, 1.0, 1.0) // iOS Blue
+        var mode: Int = 1 // Solid Color
+        encoder.setFragmentBytes(&color, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+        encoder.setFragmentBytes(&mode, length: MemoryLayout<Int>.stride, index: 1)
+
+        // Reuse a buffer for the geometry (since all 4 handles are same size)
+        let vertexBuffer = device.makeBuffer(bytes: handleVertices,
+                                             length: handleVertices.count * MemoryLayout<StrokeVertex>.stride,
+                                             options: [])
+        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+
+        // 4. Draw Loop - One handle at each corner
+        for cornerLocal in corners {
+            // Position Logic:
+            // 1. Start at Card Origin (World Space)
+            // 2. Add Corner Offset (Rotated by Card Rotation)
+
+            // Calculate the Handle's World Origin on CPU
+            let cardRot = card.rotation
+            let c = cos(cardRot)
+            let s = sin(cardRot)
+
+            // Rotate the corner offset (e.g., -50, -50) by card rotation
+            let rotatedCornerX = Double(cornerLocal.x) * Double(c) - Double(cornerLocal.y) * Double(s)
+            let rotatedCornerY = Double(cornerLocal.x) * Double(s) + Double(cornerLocal.y) * Double(c)
+
+            // Absolute World Position of this handle
+            let handleOriginX = card.origin.x + rotatedCornerX
+            let handleOriginY = card.origin.y + rotatedCornerY
+
+            // Calculate Relative Offset for Shader
+            let relX = handleOriginX - cameraCenter.x
+            let relY = handleOriginY - cameraCenter.y
+
+            var transform = StrokeTransform(
+                relativeOffset: SIMD2<Float>(Float(relX), Float(relY)),
+                zoomScale: Float(zoom),
+                screenWidth: Float(viewSize.width),
+                screenHeight: Float(viewSize.height),
+                rotationAngle: rotation // Rotates the little square itself so it aligns with card
+            )
+
+            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+        }
+    }
+
     func draw(in view: MTKView) {
         // Update tile manager view size (only changes when view resizes)
         if tileManager.viewSize != view.bounds.size {
@@ -1623,33 +1995,107 @@ class Coordinator: NSObject, MTKViewDelegate {
         // 🟢 COMMIT 2: LIVE STROKE RENDERING
         // Live strokes are rendered on top of all committed strokes (foreground)
         if currentTouchPoints.count >= 2, let tempOrigin = liveStrokeOrigin {
-            // Calculate geometry using screen-space deltas (infinite precision)
-            // Formula: (ScreenPoint - FirstScreenPoint) / Zoom
-            let firstScreenPt = currentTouchPoints[0]
             let zoom = Double(zoomScale)
-            let angle = Double(rotationAngle)
-            let c = cos(angle)
-            let s = sin(angle)
+            let worldWidth = 10.0 / zoom
 
-            let localPoints = currentTouchPoints.map { pt in
-                let dx = Double(pt.x) - Double(firstScreenPt.x)
-                let dy = Double(pt.y) - Double(firstScreenPt.y)
+            var localPoints: [SIMD2<Float>]
+            var liveTransform: StrokeTransform
 
-                // Match the CPU Inverse Rotation (Screen -> World)
-                // Inverse of Shader's CW matrix: [c, s; -s, c]
-                let unrotatedX = dx * c + dy * s
-                let unrotatedY = -dx * s + dy * c
+            // 🟢 Handle card vs canvas drawing differently
+            if case .card(let card) = currentDrawingTarget {
+                // CARD DRAWING: Transform to card-local coordinates
+                let firstScreenPt = currentTouchPoints[0]
+                let cardOrigin = card.origin
+                let cardRot = Double(card.rotation)
+                let cameraRot = Double(rotationAngle)
 
-                // Convert to world units
-                let worldDx = unrotatedX / zoom
-                let worldDy = unrotatedY / zoom
+                // Pre-calculate card inverse rotation
+                let cc = cos(-cardRot)
+                let ss = sin(-cardRot)
 
-                return SIMD2<Float>(Float(worldDx), Float(worldDy))
+                // Pre-calculate camera inverse rotation
+                let cCam = cos(cameraRot)
+                let sCam = sin(cameraRot)
+
+                localPoints = currentTouchPoints.map { pt in
+                    // A. Screen → World (un-rotate by camera, apply zoom)
+                    let dx = Double(pt.x) - Double(firstScreenPt.x)
+                    let dy = Double(pt.y) - Double(firstScreenPt.y)
+
+                    let unrotatedX = dx * cCam + dy * sCam
+                    let unrotatedY = -dx * sCam + dy * cCam
+
+                    let worldDx = unrotatedX / zoom
+                    let worldDy = unrotatedY / zoom
+
+                    // B. Add to first touch world position
+                    let firstWorldPt = screenToWorldPixels_PureDouble(
+                        firstScreenPt,
+                        viewSize: view.bounds.size,
+                        panOffset: panOffset,
+                        zoomScale: zoomScale,
+                        rotationAngle: rotationAngle
+                    )
+                    let worldX = firstWorldPt.x + worldDx
+                    let worldY = firstWorldPt.y + worldDy
+
+                    // C. World → Card Local (subtract card origin, un-rotate by card)
+                    let cardDx = worldX - cardOrigin.x
+                    let cardDy = worldY - cardOrigin.y
+
+                    let localX = cardDx * cc - cardDy * ss
+                    let localY = cardDx * ss + cardDy * cc
+
+                    return SIMD2<Float>(Float(localX), Float(localY))
+                }
+
+                // Use "magic offset" approach for card strokes
+                let distX = card.origin.x - cameraCenterWorld.x
+                let distY = card.origin.y - cameraCenterWorld.y
+                let c = cos(Double(-card.rotation))
+                let s = sin(Double(-card.rotation))
+                let magicOffsetX = distX * c - distY * s
+                let magicOffsetY = distX * s + distY * c
+
+                liveTransform = StrokeTransform(
+                    relativeOffset: SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY)),
+                    zoomScale: Float(zoomScale),
+                    screenWidth: Float(view.bounds.width),
+                    screenHeight: Float(view.bounds.height),
+                    rotationAngle: rotationAngle + card.rotation // Total rotation
+                )
+            } else {
+                // CANVAS DRAWING: Use original approach
+                let firstScreenPt = currentTouchPoints[0]
+                let angle = Double(rotationAngle)
+                let c = cos(angle)
+                let s = sin(angle)
+
+                localPoints = currentTouchPoints.map { pt in
+                    let dx = Double(pt.x) - Double(firstScreenPt.x)
+                    let dy = Double(pt.y) - Double(firstScreenPt.y)
+
+                    let unrotatedX = dx * c + dy * s
+                    let unrotatedY = -dx * s + dy * c
+
+                    let worldDx = unrotatedX / zoom
+                    let worldDy = unrotatedY / zoom
+
+                    return SIMD2<Float>(Float(worldDx), Float(worldDy))
+                }
+
+                let relativeOffsetDouble = tempOrigin - cameraCenterWorld
+                liveTransform = StrokeTransform(
+                    relativeOffset: SIMD2<Float>(Float(relativeOffsetDouble.x),
+                                                 Float(relativeOffsetDouble.y)),
+                    zoomScale: Float(zoomScale),
+                    screenWidth: Float(view.bounds.width),
+                    screenHeight: Float(view.bounds.height),
+                    rotationAngle: rotationAngle
+                )
             }
 
             // Tessellate in LOCAL space
-            // 🟢 FIX: Match actual stroke width calculation (10px screen / zoom)
-            let worldWidth = 10.0 / zoom
             let localVertices = tessellateStrokeLocal(
                 centerPoints: localPoints,
                 width: Float(worldWidth)
@@ -1662,21 +2108,47 @@ class Coordinator: NSObject, MTKViewDelegate {
                 return
             }
 
-            // Calculate relative offset for live stroke
-            let relativeOffsetDouble = tempOrigin - cameraCenterWorld
-            let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x),
-                                             Float(relativeOffsetDouble.y))
+            // 🟢 If drawing on a card, set up stencil clipping for the live preview
+            if case .card(let card) = currentDrawingTarget {
+                // STEP 1: Write card's stencil mask
+                enc.setDepthStencilState(stencilStateWrite)
+                enc.setStencilReferenceValue(1)
+                enc.setRenderPipelineState(cardSolidPipelineState)
 
-            // Create transform for live stroke
-            var liveTransform = StrokeTransform(
-                relativeOffset: relativeOffset,
-                zoomScale: Float(zoomScale),
-                screenWidth: Float(view.bounds.width),
-                screenHeight: Float(view.bounds.height),
-                rotationAngle: rotationAngle
-            )
+                // Calculate card transform
+                let cardRelativeOffset = card.origin - cameraCenterWorld
+                let cardRotation = rotationAngle + card.rotation
+                var cardTransform = StrokeTransform(
+                    relativeOffset: SIMD2<Float>(Float(cardRelativeOffset.x), Float(cardRelativeOffset.y)),
+                    zoomScale: Float(zoomScale),
+                    screenWidth: Float(view.bounds.width),
+                    screenHeight: Float(view.bounds.height),
+                    rotationAngle: cardRotation
+                )
 
-            // Create buffers and render
+                // Draw card quad to stencil buffer
+                enc.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                var clearColor = SIMD4<Float>(0, 0, 0, 0) // Transparent (won't affect color buffer)
+                enc.setFragmentBytes(&clearColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+                let cardVertexBuffer = device.makeBuffer(
+                    bytes: card.localVertices,
+                    length: card.localVertices.count * MemoryLayout<StrokeVertex>.stride,
+                    options: .storageModeShared
+                )
+                enc.setVertexBuffer(cardVertexBuffer, offset: 0, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+                // STEP 2: Set stencil read mode for live stroke (clip to card)
+                enc.setDepthStencilState(stencilStateRead)
+                enc.setStencilReferenceValue(1)
+                enc.setRenderPipelineState(pipelineState)
+            } else {
+                // Drawing on canvas - no stencil clipping needed
+                enc.setDepthStencilState(stencilStateDefault)
+            }
+
+            // Create buffers and render live stroke
             let vertexBuffer = device.makeBuffer(
                 bytes: localVertices,
                 length: localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
@@ -1692,6 +2164,37 @@ class Coordinator: NSObject, MTKViewDelegate {
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: localVertices.count)
+
+            // STEP 3: Clean up stencil if we used it
+            if case .card(let card) = currentDrawingTarget {
+                enc.setDepthStencilState(stencilStateClear)
+                enc.setStencilReferenceValue(0)
+                enc.setRenderPipelineState(cardSolidPipelineState)
+
+                // Redraw card quad to clear stencil
+                var cardTransform = StrokeTransform(
+                    relativeOffset: SIMD2<Float>(Float((card.origin - cameraCenterWorld).x),
+                                                 Float((card.origin - cameraCenterWorld).y)),
+                    zoomScale: Float(zoomScale),
+                    screenWidth: Float(view.bounds.width),
+                    screenHeight: Float(view.bounds.height),
+                    rotationAngle: rotationAngle + card.rotation
+                )
+                enc.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                var clearColor = SIMD4<Float>(0, 0, 0, 0)
+                enc.setFragmentBytes(&clearColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+                let cardVertexBuffer = device.makeBuffer(
+                    bytes: card.localVertices,
+                    length: card.localVertices.count * MemoryLayout<StrokeVertex>.stride,
+                    options: .storageModeShared
+                )
+                enc.setVertexBuffer(cardVertexBuffer, offset: 0, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+                // Reset to default
+                enc.setDepthStencilState(stencilStateDefault)
+            }
         }
 
         enc.endEncoding()
@@ -1763,11 +2266,125 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     func makePipeLine() {
         let library = device.makeDefaultLibrary()!
+
+        // Stroke Pipeline
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction   = library.makeFunction(name: "vertex_main")
         desc.fragmentFunction = library.makeFunction(name: "fragment_main")
         desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        desc.stencilAttachmentPixelFormat = .stencil8 // 🟢 Required for stencil buffer
         pipelineState = try? device.makeRenderPipelineState(descriptor: desc)
+
+        // Setup vertex descriptor for StrokeVertex structure (shared by both card pipelines)
+        let vertexDesc = MTLVertexDescriptor()
+        // Position attribute (attribute 0)
+        vertexDesc.attributes[0].format = .float2
+        vertexDesc.attributes[0].offset = 0
+        vertexDesc.attributes[0].bufferIndex = 0
+        // UV attribute (attribute 1)
+        vertexDesc.attributes[1].format = .float2
+        vertexDesc.attributes[1].offset = MemoryLayout<SIMD2<Float>>.stride
+        vertexDesc.attributes[1].bufferIndex = 0
+        // Layout
+        vertexDesc.layouts[0].stride = MemoryLayout<StrokeVertex>.stride
+        vertexDesc.layouts[0].stepFunction = .perVertex
+
+        // Textured Card Pipeline (for images, PDFs)
+        let cardDesc = MTLRenderPipelineDescriptor()
+        cardDesc.vertexFunction   = library.makeFunction(name: "vertex_card")
+        cardDesc.fragmentFunction = library.makeFunction(name: "fragment_card_texture")
+        cardDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        cardDesc.colorAttachments[0].isBlendingEnabled = true
+        cardDesc.colorAttachments[0].rgbBlendOperation = .add
+        cardDesc.colorAttachments[0].alphaBlendOperation = .add
+        cardDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        cardDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        cardDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        cardDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        cardDesc.vertexDescriptor = vertexDesc
+        cardDesc.stencilAttachmentPixelFormat = .stencil8 // 🟢 Required for stencil buffer
+        cardPipelineState = try? device.makeRenderPipelineState(descriptor: cardDesc)
+
+        // Solid Color Card Pipeline (for placeholders, backgrounds)
+        let cardSolidDesc = MTLRenderPipelineDescriptor()
+        cardSolidDesc.vertexFunction   = library.makeFunction(name: "vertex_card")
+        cardSolidDesc.fragmentFunction = library.makeFunction(name: "fragment_card_solid")
+        cardSolidDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        cardSolidDesc.colorAttachments[0].isBlendingEnabled = true
+        cardSolidDesc.colorAttachments[0].rgbBlendOperation = .add
+        cardSolidDesc.colorAttachments[0].alphaBlendOperation = .add
+        cardSolidDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        cardSolidDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        cardSolidDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        cardSolidDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        cardSolidDesc.vertexDescriptor = vertexDesc
+        cardSolidDesc.stencilAttachmentPixelFormat = .stencil8 // 🟢 Required for stencil buffer
+
+        do {
+            cardSolidPipelineState = try device.makeRenderPipelineState(descriptor: cardSolidDesc)
+        } catch {
+            fatalError("Failed to create solid card pipeline: \(error)")
+        }
+
+        // Create Sampler for card textures
+        let samplerDesc = MTLSamplerDescriptor()
+        samplerDesc.minFilter = .linear
+        samplerDesc.magFilter = .linear
+        samplerDesc.mipFilter = .linear
+        samplerDesc.sAddressMode = .clampToEdge
+        samplerDesc.tAddressMode = .clampToEdge
+        samplerState = device.makeSamplerState(descriptor: samplerDesc)
+
+        // Initialize stencil states for card clipping
+        makeDepthStencilStates()
+    }
+
+    func makeDepthStencilStates() {
+        let desc = MTLDepthStencilDescriptor()
+        desc.depthCompareFunction = .always
+        desc.isDepthWriteEnabled = false
+
+        // 0. DEFAULT State (Passthrough - no stencil testing or writing)
+        // "Always pass, keep everything as-is"
+        let stencilDefault = MTLStencilDescriptor()
+        stencilDefault.stencilCompareFunction = .always
+        stencilDefault.stencilFailureOperation = .keep
+        stencilDefault.depthFailureOperation = .keep
+        stencilDefault.depthStencilPassOperation = .keep
+        desc.frontFaceStencil = stencilDefault
+        desc.backFaceStencil = stencilDefault
+        stencilStateDefault = device.makeDepthStencilState(descriptor: desc)
+
+        // 1. WRITE State (Used when drawing the Card Background)
+        // "Always pass, and replace the stencil value with the reference (1)"
+        let stencilWrite = MTLStencilDescriptor()
+        stencilWrite.stencilCompareFunction = .always
+        stencilWrite.stencilFailureOperation = .keep
+        stencilWrite.depthFailureOperation = .keep
+        stencilWrite.depthStencilPassOperation = .replace
+        desc.frontFaceStencil = stencilWrite
+        desc.backFaceStencil = stencilWrite
+        stencilStateWrite = device.makeDepthStencilState(descriptor: desc)
+
+        // 2. READ State (Used when drawing Card Strokes)
+        // "Only pass if the stencil value equals the reference (1)"
+        let stencilRead = MTLStencilDescriptor()
+        stencilRead.stencilCompareFunction = .equal
+        stencilRead.stencilFailureOperation = .keep
+        stencilRead.depthFailureOperation = .keep
+        stencilRead.depthStencilPassOperation = .keep
+        desc.frontFaceStencil = stencilRead
+        desc.backFaceStencil = stencilRead
+        stencilStateRead = device.makeDepthStencilState(descriptor: desc)
+
+        // 3. CLEAR State (Used to clean up after a card)
+        // "Always pass, and replace stencil with 0"
+        let stencilClear = MTLStencilDescriptor()
+        stencilClear.stencilCompareFunction = .always
+        stencilClear.depthStencilPassOperation = .zero // Reset to 0
+        desc.frontFaceStencil = stencilClear
+        desc.backFaceStencil = stencilClear
+        stencilStateClear = device.makeDepthStencilState(descriptor: desc)
     }
 
     func makeVertexBuffer() {
@@ -1810,13 +2427,14 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     // MARK: - Touch Handling
 
-    func handleTouchBegan(at point: CGPoint) {
+    func handleTouchBegan(at point: CGPoint, touchType: UITouch.TouchType) {
+        // 🟢 MODAL INPUT: Only allow Pencil for drawing
+        guard touchType == .pencil else { return }
+
         guard let view = metalView else { return }
 
-        // PHASE 5: Establish temporary origin for live stroke
-        // The first touch point becomes the origin (in world coordinates, Double precision)
-        // 🟢 FIX: Use PureDouble version to match actual stroke creation
-        liveStrokeOrigin = screenToWorldPixels_PureDouble(
+        // Calculate World Point (High Precision) for the Frame
+        let worldPoint = screenToWorldPixels_PureDouble(
             point,
             viewSize: view.bounds.size,
             panOffset: panOffset,
@@ -1824,22 +2442,45 @@ class Coordinator: NSObject, MTKViewDelegate {
             rotationAngle: rotationAngle
         )
 
+        // 🟢 HIT TEST CARDS (Reverse order = Top first)
+        var hitCard: Card? = nil
+        for card in activeFrame.cards.reversed() {
+            if card.hitTest(pointInFrame: worldPoint) {
+                hitCard = card
+                break
+            }
+        }
+
+        if let card = hitCard {
+            // DRAW ON CARD
+            currentDrawingTarget = .card(card)
+            // For card strokes, we'll transform points into card space later
+            liveStrokeOrigin = worldPoint
+        } else {
+            // DRAW ON CANVAS
+            currentDrawingTarget = .canvas(activeFrame)
+            liveStrokeOrigin = worldPoint
+        }
+
         // Keep points in SCREEN space during drawing
         currentTouchPoints = [point]
 
         // Debug tiling system (only when debug mode enabled)
-        if tileManager.debugMode, let origin = liveStrokeOrigin {
-            let worldPointCG = CGPoint(x: origin.x, y: origin.y)
+        if tileManager.debugMode {
+            let worldPointCG = CGPoint(x: worldPoint.x, y: worldPoint.y)
             let tileKey = tileManager.getTileKey(worldPoint: worldPointCG)
             let debugOutput = tileManager.debugInfo(worldPoint: worldPointCG,
                                                     screenPoint: point,
                                                     tileKey: tileKey)
-            print("\n📍 TOUCH BEGAN - Temporary Origin: \(origin)")
+            print("\n📍 TOUCH BEGAN - Target: \(currentDrawingTarget != nil ? "Card" : "Canvas")")
             print(debugOutput)
         }
     }
 
-    func handleTouchMoved(at point: CGPoint) {
+    func handleTouchMoved(at point: CGPoint, touchType: UITouch.TouchType) {
+        // 🟢 MODAL INPUT: Only allow Pencil for drawing
+        guard touchType == .pencil else { return }
+
         // Keep points in SCREEN space during drawing (key for precision!)
         currentTouchPoints.append(point)
 
@@ -1860,7 +2501,10 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
     }
 
-    func handleTouchEnded(at point: CGPoint) {
+    func handleTouchEnded(at point: CGPoint, touchType: UITouch.TouchType) {
+        // 🟢 MODAL INPUT: Only allow Pencil for drawing
+        guard touchType == .pencil, let target = currentDrawingTarget else { return }
+
         guard let view = metalView else { return }
 
         // Keep final point in SCREEN space
@@ -1884,6 +2528,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         guard currentTouchPoints.count >= 4 else {
             currentTouchPoints = []
             liveStrokeOrigin = nil
+            currentDrawingTarget = nil
             return
         }
 
@@ -1893,24 +2538,155 @@ class Coordinator: NSObject, MTKViewDelegate {
                                                   alpha: 0.5,
                                                   segmentsPerCurve: 20)
 
-        // 🟢 NEW: Pass SCREEN points directly to avoid Double precision loss
-        // The stroke will calculate geometry using screen-space deltas: (pt - firstPt) / zoom
-        // This preserves perfect smoothness at any zoom level
-        let stroke = Stroke(screenPoints: smoothScreenPoints,
-                            zoomAtCreation: zoomScale,
-                            panAtCreation: panOffset,
-                            viewSize: view.bounds.size,
-                            rotationAngle: rotationAngle,
-                            color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0))
+        // 🟢 MODAL INPUT: Route stroke to correct target
+        switch target {
+        case .canvas(let frame):
+            // DRAW ON CANVAS (existing logic)
+            let stroke = Stroke(screenPoints: smoothScreenPoints,
+                                zoomAtCreation: zoomScale,
+                                panAtCreation: panOffset,
+                                viewSize: view.bounds.size,
+                                rotationAngle: rotationAngle,
+                                color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0))
+            frame.strokes.append(stroke)
 
-        activeFrame.strokes.append(stroke)
+        case .card(let card):
+            // DRAW ON CARD
+            // Transform points into card-local space so strokes move with the card
+            let cardStroke = createStrokeForCard(
+                screenPoints: smoothScreenPoints,
+                card: card,
+                viewSize: view.bounds.size
+            )
+            card.strokes.append(cardStroke)
+        }
+
+        currentTouchPoints = []
+        liveStrokeOrigin = nil
+        currentDrawingTarget = nil
+    }
+
+    func handleTouchCancelled(touchType: UITouch.TouchType) {
+        // 🟢 MODAL INPUT: Only allow Pencil for drawing
+        guard touchType == .pencil else { return }
         currentTouchPoints = []
         liveStrokeOrigin = nil  // Clear temporary origin
     }
 
-    func handleTouchCancelled() {
-        currentTouchPoints = []
-        liveStrokeOrigin = nil  // Clear temporary origin
+    // MARK: - Card Management
+
+    /// Add a new card to the canvas at the camera center
+    /// The card will be a solid color and can be selected/dragged/edited
+    func addCard() {
+        print("🎯 addCard() called")
+        guard let view = metalView else {
+            print("❌ ERROR: metalView is nil!")
+            return
+        }
+        print("✅ metalView exists")
+
+        // 1. Calculate camera center in world coordinates (where the user is looking)
+        let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
+
+        // 2. Create card at camera center with reasonable size
+        // Size is in world units - at 1.0 zoom, this is ~300x200 pixels (increased for visibility)
+        let cardSize = SIMD2<Double>(300.0, 200.0)
+
+        // 3. Use neon pink for high visibility against cyan background
+        let neonPink = SIMD4<Float>(1.0, 0.0, 1.0, 1.0)  // Bright magenta
+
+        // 4. Create the card
+        let card = Card(
+            origin: cameraCenterWorld,
+            size: cardSize,
+            rotation: 0,
+            type: .solidColor(neonPink)
+        )
+
+        // 5. Add to active frame
+        activeFrame.cards.append(card)
+
+        // 6. Debug output
+        print("📦 ========== ADD CARD DEBUG ==========")
+        print("📦 Card Position: (\(cameraCenterWorld.x), \(cameraCenterWorld.y))")
+        print("📦 Card Size: \(cardSize.x) × \(cardSize.y) world units")
+        print("📦 Card Color: Neon Pink (1.0, 0.0, 1.0, 1.0)")
+        print("📦 Card Rotation: 0 radians")
+        print("📦 Current Zoom: \(zoomScale)")
+        print("📦 Current Pan: (\(panOffset.x), \(panOffset.y))")
+        print("📦 Current Rotation: \(rotationAngle) radians")
+        print("📦 Total Cards in Frame: \(activeFrame.cards.count)")
+        print("📦 Card ID: \(card.id)")
+        print("📦 ======================================")
+    }
+
+    /// Create a stroke in card-local coordinates
+    /// Transforms screen-space points into the card's local coordinate system
+    /// This ensures the stroke "sticks" to the card when it's moved or rotated
+    ///
+    /// - Parameters:
+    ///   - screenPoints: Raw screen-space touch points
+    ///   - card: The card to draw on
+    ///   - viewSize: Screen dimensions
+    /// - Returns: A stroke with points relative to card center
+    func createStrokeForCard(screenPoints: [CGPoint], card: Card, viewSize: CGSize) -> Stroke {
+        // 1. Get the Card's World Position & Rotation (in the current Frame)
+        let cardOrigin = card.origin
+        let cardRot = Double(card.rotation)
+
+        // Pre-calculate rotation trig
+        let c = cos(-cardRot) // Inverse rotation to un-apply card angle
+        let s = sin(-cardRot)
+
+        // 2. Transform Screen Points -> Card Local Points
+        // We effectively treat the Card as a temporary "Universe" for these points
+        var cardLocalPoints: [CGPoint] = []
+        let currentZoom = Double(zoomScale) // Capture current zoom
+
+        for screenPt in screenPoints {
+            // A. Screen -> Frame World (Standard conversion)
+            // This divides by zoom to get world units
+            let worldPt = screenToWorldPixels_PureDouble(
+                screenPt,
+                viewSize: viewSize,
+                panOffset: panOffset,
+                zoomScale: zoomScale,
+                rotationAngle: rotationAngle
+            )
+
+            // B. Frame World -> Card Local (World Units)
+            // Translate (Subtract Card Origin)
+            let dx = worldPt.x - cardOrigin.x
+            let dy = worldPt.y - cardOrigin.y
+
+            // Rotate (Un-rotate by Card Rotation)
+            // x' = x*c - y*s
+            // y' = x*s + y*c
+            let localX = dx * c - dy * s
+            let localY = dx * s + dy * c
+
+            // 🟢 CRITICAL FIX: Scale up to "virtual screen space"
+            // We multiply by zoom so when Stroke.init divides by zoom,
+            // we get back to world units (localX, localY).
+            // This allows Stroke.init to correctly calculate stroke width (10.0 / zoom).
+            let virtualScreenX = localX * currentZoom
+            let virtualScreenY = localY * currentZoom
+
+            cardLocalPoints.append(CGPoint(x: virtualScreenX, y: virtualScreenY))
+        }
+
+        // 3. Create the Stroke
+        // 🟢 The math:
+        // - Geometry: (WorldPos * Zoom) / Zoom = WorldPos ✅ Correct position
+        // - Width: 10.0 / Zoom = Correct world width ✅
+        return Stroke(
+            screenPoints: cardLocalPoints,   // Virtual screen space (world units * zoom)
+            zoomAtCreation: zoomScale,       // Actual zoom (will divide, canceling multiply)
+            panAtCreation: .zero,            // We handled position manually
+            viewSize: .zero,                 // We handled centering manually
+            rotationAngle: 0,                // We handled rotation manually
+            color: SIMD4<Float>(0.0, 0.0, 1.0, 1.0) // Blue for card strokes
+        )
     }
 
     // MARK: - Phase 3: Tile-Local Current Stroke Rendering
