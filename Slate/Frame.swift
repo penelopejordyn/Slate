@@ -28,6 +28,9 @@ class Frame: Identifiable {
     /// Strokes that belong to this specific "depth" or layer of reality
     var strokes: [Stroke] = []
 
+    /// Cards that belong to this Frame (Images, PDFs, Sketches)
+    var cards: [Card] = []
+
     /// The "Universe" containing this frame (nil for root frame)
     var parent: Frame?
 
