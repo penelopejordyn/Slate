@@ -42,10 +42,21 @@ func catmullRomPoints(points: [CGPoint],
         if i == startIndex {
             result.append(p1)
         }
-        
-        // Subdivide the cubic bezier - use the parameter
-        for j in 1...segmentsPerCurve {
-            let t = CGFloat(j) / CGFloat(segmentsPerCurve)
+
+        //  OPTIMIZATION: Adaptive Segments
+        // Calculate the physical distance of this segment
+        let segmentDistance = distance(p1, p2)
+
+        // Rule: 1 segment per 2 pixels of length
+        // This prevents vertex explosion for slow strokes where points are close together
+        // Min: 1 segment (don't generate zero segments)
+        // Max: 20 segments (don't over-smooth long lines)
+        let estimatedSegments = Int(segmentDistance / 2.0)
+        let adaptiveSegments = min(max(1, estimatedSegments), 20)
+
+        // Subdivide using the adaptive segment count
+        for j in 1...adaptiveSegments {
+            let t = CGFloat(j) / CGFloat(adaptiveSegments)
             let point = cubicBezierPoint(p0: p1, p1: b1, p2: b2, p3: p2, t: t)
             result.append(point)
         }

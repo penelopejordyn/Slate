@@ -35,6 +35,10 @@ class Coordinator: NSObject, MTKViewDelegate {
     var predictedTouchPoints: [CGPoint] = []    // Future points (Transient, SCREEN space)
     var liveStrokeOrigin: SIMD2<Double>?        // Temporary origin for live stroke (Double precision)
 
+    //  OPTIMIZATION: Adaptive Fidelity
+    // Track last saved point for distance filtering to prevent vertex explosion during slow drawing
+    var lastSavedPoint: CGPoint?
+
     // Telescoping Reference Frames
     // Instead of a flat array, we use a linked list of Frames for infinite zoom
     let rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
@@ -981,11 +985,27 @@ class Coordinator: NSObject, MTKViewDelegate {
         //  MODAL INPUT: Only allow Pencil for drawing
         guard touchType == .pencil else { return }
 
-        // 1. Store the REAL point permanently for this stroke
-        currentTouchPoints.append(point)
+        //  OPTIMIZATION: Distance Filter
+        // Only add the point if it's far enough from the last one (e.g., 2.0 pixels)
+        // This prevents "vertex explosion" when drawing slowly at 120Hz/240Hz.
+        let minimumDistance: CGFloat = 2.0
 
-        // 2. Store PREDICTED points temporarily (overwrite previous predictions)
-        // These are only for the visual display of the current frame.
+        var shouldAdd = false
+        if let last = currentTouchPoints.last {
+            let dist = hypot(point.x - last.x, point.y - last.y)
+            if dist > minimumDistance {
+                shouldAdd = true
+            }
+        } else {
+            shouldAdd = true // Always add the first point
+        }
+
+        if shouldAdd {
+            currentTouchPoints.append(point)
+            lastSavedPoint = point
+        }
+
+        // Update prediction (always do this for responsiveness, even if we filter the real point)
         predictedTouchPoints = predicted
 
         // Debug tiling system (only when debug mode enabled, every 10th point)
@@ -1105,6 +1125,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         currentTouchPoints = []
         liveStrokeOrigin = nil
         currentDrawingTarget = nil
+        lastSavedPoint = nil  // Clear for next stroke
     }
 
     func handleTouchCancelled(touchType: UITouch.TouchType) {
@@ -1113,6 +1134,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         predictedTouchPoints = []  // Clear predictions
         currentTouchPoints = []
         liveStrokeOrigin = nil  // Clear temporary origin
+        lastSavedPoint = nil  // Clear for next stroke
     }
 
     // MARK: - Card Management
