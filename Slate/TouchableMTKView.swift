@@ -610,7 +610,21 @@ class TouchableMTKView: MTKView {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard event?.allTouches?.count == 1, let touch = touches.first else { return }
         let location = touch.location(in: self)
-        coordinator?.handleTouchMoved(at: location, touchType: touch.type)
+
+        //  GET PREDICTED TOUCHES
+        // These are high-precision estimates of where the finger will be next frame.
+        var predictedPoints: [CGPoint] = []
+
+        if let predicted = event?.predictedTouches(for: touch) {
+            for pTouch in predicted {
+                predictedPoints.append(pTouch.location(in: self))
+            }
+        }
+
+        // Pass both Real and Predicted to Coordinator
+        coordinator?.handleTouchMoved(at: location,
+                                    predicted: predictedPoints,
+                                    touchType: touch.type)
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard event?.allTouches?.count == 1, let touch = touches.first else { return }

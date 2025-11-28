@@ -31,8 +31,9 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
     var currentDrawingTarget: DrawingTarget?
 
-    var currentTouchPoints: [CGPoint] = []  // Stored in SCREEN space during drawing
-    var liveStrokeOrigin: SIMD2<Double>?    // Temporary origin for live stroke (Double precision)
+    var currentTouchPoints: [CGPoint] = []      // Real historical points (SCREEN space)
+    var predictedTouchPoints: [CGPoint] = []    // Future points (Transient, SCREEN space)
+    var liveStrokeOrigin: SIMD2<Double>?        // Temporary origin for live stroke (Double precision)
 
     //  COMMIT 1: Telescoping Reference Frames
     // Instead of a flat array, we use a linked list of Frames for infinite zoom
@@ -459,9 +460,14 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         //  COMMIT 2: LIVE STROKE RENDERING
         // Live strokes are rendered on top of all committed strokes (foreground)
-        if currentTouchPoints.count >= 2, let tempOrigin = liveStrokeOrigin {
+        //  COMBINE REAL + PREDICTED for latency reduction
+        if (currentTouchPoints.count + predictedTouchPoints.count) >= 2, let tempOrigin = liveStrokeOrigin {
             let zoom = Double(zoomScale)
             let worldWidth = 10.0 / zoom
+
+            //  COMBINE REAL + PREDICTED
+            // We create a temporary array just for this frame's rendering
+            let pointsToDraw = currentTouchPoints + predictedTouchPoints
 
             var localPoints: [SIMD2<Float>]
             var liveTransform: StrokeTransform
@@ -469,7 +475,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             //  Handle card vs canvas drawing differently
             if case .card(let card) = currentDrawingTarget {
                 // CARD DRAWING: Transform to card-local coordinates
-                let firstScreenPt = currentTouchPoints[0]
+                let firstScreenPt = currentTouchPoints[0]  // Origin is always the REAL first point
                 let cardOrigin = card.origin
                 let cardRot = Double(card.rotation)
                 let cameraRot = Double(rotationAngle)
@@ -482,7 +488,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 let cCam = cos(cameraRot)
                 let sCam = sin(cameraRot)
 
-                localPoints = currentTouchPoints.map { pt in
+                localPoints = pointsToDraw.map { pt in
                     // A. Screen → World (un-rotate by camera, apply zoom)
                     let dx = Double(pt.x) - Double(firstScreenPt.x)
                     let dy = Double(pt.y) - Double(firstScreenPt.y)
@@ -531,12 +537,12 @@ class Coordinator: NSObject, MTKViewDelegate {
                 )
             } else {
                 // CANVAS DRAWING: Use original approach
-                let firstScreenPt = currentTouchPoints[0]
+                let firstScreenPt = currentTouchPoints[0]  // Origin is always the REAL first point
                 let angle = Double(rotationAngle)
                 let c = cos(angle)
                 let s = sin(angle)
 
-                localPoints = currentTouchPoints.map { pt in
+                localPoints = pointsToDraw.map { pt in
                     let dx = Double(pt.x) - Double(firstScreenPt.x)
                     let dy = Double(pt.y) - Double(firstScreenPt.y)
 
@@ -942,12 +948,16 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
     }
 
-    func handleTouchMoved(at point: CGPoint, touchType: UITouch.TouchType) {
+    func handleTouchMoved(at point: CGPoint, predicted: [CGPoint], touchType: UITouch.TouchType) {
         //  MODAL INPUT: Only allow Pencil for drawing
         guard touchType == .pencil else { return }
 
-        // Keep points in SCREEN space during drawing (key for precision!)
+        // 1. Store the REAL point permanently for this stroke
         currentTouchPoints.append(point)
+
+        // 2. Store PREDICTED points temporarily (overwrite previous predictions)
+        // These are only for the visual display of the current frame.
+        predictedTouchPoints = predicted
 
         // Debug tiling system (only when debug mode enabled, every 10th point)
         if tileManager.debugMode && currentTouchPoints.count % 10 == 0 {
@@ -972,6 +982,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         guard let view = metalView else { return }
 
+        // Clear predictions (no longer needed)
+        predictedTouchPoints = []
+
         // Keep final point in SCREEN space
         currentTouchPoints.append(point)
 
@@ -990,18 +1003,54 @@ class Coordinator: NSObject, MTKViewDelegate {
             print(debugOutput)
         }
 
-        guard currentTouchPoints.count >= 4 else {
+        //  FIX 1: Allow dots (Don't return if count < 4)
+        guard !currentTouchPoints.isEmpty else {
             currentTouchPoints = []
             liveStrokeOrigin = nil
             currentDrawingTarget = nil
             return
         }
 
-        // Smooth the screen-space points
-        let smoothScreenPoints = catmullRomPoints(points: currentTouchPoints,
+        //  FIX 2: Phantom Points for Catmull-Rom
+        // Extrapolate phantom points to ensure the spline reaches the start and end
+        var smoothScreenPoints: [CGPoint]
+
+        if currentTouchPoints.count < 3 {
+            // Too few points for a spline, just use lines/dots
+            smoothScreenPoints = currentTouchPoints
+        } else {
+            // Extrapolate phantom points instead of duplicating
+            // First phantom: A - (B - A) = 2A - B (extends backward from A)
+            // Last phantom: D + (D - C) = 2D - C (extends forward from D)
+            var paddedPoints = currentTouchPoints
+
+            // Add phantom point at the start
+            if paddedPoints.count >= 2 {
+                let first = paddedPoints[0]
+                let second = paddedPoints[1]
+                let phantomStart = CGPoint(
+                    x: 2 * first.x - second.x,
+                    y: 2 * first.y - second.y
+                )
+                paddedPoints.insert(phantomStart, at: 0)
+            }
+
+            // Add phantom point at the end
+            if paddedPoints.count >= 3 {  // Now at least 3 because we added one
+                let last = paddedPoints[paddedPoints.count - 1]
+                let secondLast = paddedPoints[paddedPoints.count - 2]
+                let phantomEnd = CGPoint(
+                    x: 2 * last.x - secondLast.x,
+                    y: 2 * last.y - secondLast.y
+                )
+                paddedPoints.append(phantomEnd)
+            }
+
+            smoothScreenPoints = catmullRomPoints(points: paddedPoints,
                                                   closed: false,
                                                   alpha: 0.5,
                                                   segmentsPerCurve: 20)
+        }
 
         //  MODAL INPUT: Route stroke to correct target
         switch target {
@@ -1034,6 +1083,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     func handleTouchCancelled(touchType: UITouch.TouchType) {
         //  MODAL INPUT: Only allow Pencil for drawing
         guard touchType == .pencil else { return }
+        predictedTouchPoints = []  // Clear predictions
         currentTouchPoints = []
         liveStrokeOrigin = nil  // Clear temporary origin
     }
