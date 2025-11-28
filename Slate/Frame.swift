@@ -39,7 +39,7 @@ class Frame: Identifiable {
     /// This tells us: "1 unit in parent space = 1000 units in this frame"
     var scaleRelativeToParent: Double
 
-    ///  COMMIT 4 FIX: Track the sub-universes created inside this frame
+    /// Track the sub-universes created inside this frame
     /// This allows us to re-enter existing frames instead of creating parallel universes
     var children: [Frame] = []
 

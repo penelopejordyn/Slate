@@ -10,30 +10,63 @@ struct ContentView: View {
             MetalView(coordinator: $metalViewCoordinator)
             .edgesIgnoringSafeArea(.all)
 
-            // Add Card Button
-            Button(action: {
-                print(" Add Card button tapped")
-                if metalViewCoordinator == nil {
-                    print(" ERROR: Coordinator is nil!")
-                } else {
-                    print(" Coordinator exists, calling addCard()")
+            VStack(spacing: 16) {
+                // Add Card Button
+                Button(action: {
                     metalViewCoordinator?.addCard()
+                }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "plus.rectangle.fill")
+                        Text("Add Card")
+                    }
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(20)
                 }
-            }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "plus.rectangle.fill")
-                    Text("Add Card")
+
+                // Stroke Size Slider
+                if let coordinator = metalViewCoordinator {
+                    StrokeSizeSlider(brushSettings: coordinator.brushSettings)
+                        .frame(width: 200)
                 }
-                .font(.system(size: 16, weight: .medium))
-                .foregroundColor(.white)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(.ultraThinMaterial)
-                .cornerRadius(20)
             }
             .padding(.top, 60)
             .padding(.trailing, 16)
         }
+    }
+}
+
+// MARK: - Stroke Size Slider Component
+
+struct StrokeSizeSlider: View {
+    @ObservedObject var brushSettings: BrushSettings
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "pencil.tip")
+                    .font(.system(size: 14))
+                    .foregroundColor(.white)
+                Text("\(Int(brushSettings.size))pt")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.white)
+                    .frame(width: 50, alignment: .leading)
+            }
+
+            Slider(
+                value: $brushSettings.size,
+                in: BrushSettings.minSize...BrushSettings.maxSize,
+                step: 1.0
+            )
+            .tint(.white)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial)
+        .cornerRadius(20)
     }
 }
 

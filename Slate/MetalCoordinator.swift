@@ -35,7 +35,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     var predictedTouchPoints: [CGPoint] = []    // Future points (Transient, SCREEN space)
     var liveStrokeOrigin: SIMD2<Double>?        // Temporary origin for live stroke (Double precision)
 
-    //  COMMIT 1: Telescoping Reference Frames
+    // Telescoping Reference Frames
     // Instead of a flat array, we use a linked list of Frames for infinite zoom
     let rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
     lazy var activeFrame: Frame = rootFrame  // The current "Local Universe" we are viewing/editing
@@ -59,6 +59,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     // MARK: - Tiling System (Phase 1: Debug Only)
     let tileManager = TileManager()
+
+    // MARK: - Brush Settings
+    let brushSettings = BrushSettings()
 
     override init() {
         super.init()
@@ -133,12 +136,24 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         // LAYER 2: RENDER THIS FRAME (Middle Layer - Depth 0) --------------------------
 
-        // 2.1: RENDER CANVAS STROKES (Background layer - below cards) 
+        // 2.1: RENDER CANVAS STROKES (Background layer - below cards)
+        //  OPTIMIZATION: Calculate visible rect for frustum culling
+        // Camera is at (0,0) in relative space, so visible area extends ±halfWidth/halfHeight
+        let halfW = Double(viewSize.width) / 2.0 / currentZoom
+        let halfH = Double(viewSize.height) / 2.0 / currentZoom
+        let visibleRect = CGRect(x: -halfW, y: -halfH, width: halfW * 2, height: halfH * 2)
+
         encoder.setRenderPipelineState(pipelineState)
         for stroke in frame.strokes {
             guard !stroke.localVertices.isEmpty else { continue }
 
             let relativeOffsetDouble = stroke.origin - cameraCenterInThisFrame
+
+            //  OPTIMIZATION: Frustum Culling
+            // Skip strokes that are completely off-screen
+            let strokeRect = stroke.localBounds.offsetBy(dx: relativeOffsetDouble.x, dy: relativeOffsetDouble.y)
+            guard visibleRect.intersects(strokeRect) else { continue }
+
             let relativeOffset = SIMD2<Float>(
                 Float(relativeOffsetDouble.x),
                 Float(relativeOffsetDouble.y)
@@ -301,6 +316,11 @@ class Coordinator: NSObject, MTKViewDelegate {
                 // Before, this was missing 'stroke.origin', collapsing everything to (0,0)
                 let totalRelativeOffset = stroke.origin + frameOffsetInChildUnits
 
+                //  OPTIMIZATION: Frustum Culling for child strokes
+                // Skip child strokes that are completely off-screen
+                let strokeRect = stroke.localBounds.offsetBy(dx: totalRelativeOffset.x, dy: totalRelativeOffset.y)
+                guard visibleRect.intersects(strokeRect) else { continue }
+
                 var childTransform = StrokeTransform(
                     relativeOffset: SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y)),
                     zoomScale: Float(childZoom),
@@ -319,23 +339,19 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     /// Helper to draw a stroke with a given transform.
     /// Reduces code duplication across parent/current/child rendering.
+    ///  OPTIMIZATION: Now uses cached vertex buffer from stroke
     func drawStroke(_ stroke: Stroke, with transform: inout StrokeTransform, encoder: MTLRenderCommandEncoder) {
-        guard !stroke.localVertices.isEmpty else { return }
+        //  USE CACHED BUFFER
+        // The stroke's buffer was created once in init, not 60 times per second here
+        guard let vertexBuffer = stroke.vertexBuffer else { return }
 
-        let vertexBuffer = device.makeBuffer(
-            bytes: stroke.localVertices,
-            length: stroke.localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
-            options: .storageModeShared
-        )
-
-        let transformBuffer = device.makeBuffer(
-            bytes: &transform,
-            length: MemoryLayout<StrokeTransform>.stride,
-            options: .storageModeShared
-        )
-
+        // Bind the cached vertex buffer
         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-        encoder.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+
+        // Bind the transform (small, can use setVertexBytes instead of makeBuffer)
+        encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+
+        // Draw
         encoder.drawPrimitives(type: .triangle,
                              vertexStart: 0,
                              vertexCount: stroke.localVertices.count)
@@ -436,18 +452,18 @@ class Coordinator: NSObject, MTKViewDelegate {
             tileManager.viewSize = view.bounds.size
         }
 
-        // PHASE 2: Calculate Camera Center in World Space (Double precision)
+        // Calculate Camera Center in World Space (Double precision)
         // This is the "View Center" - where the center of the screen is in the infinite world.
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
 
-        //  COMMIT 2: Start rendering pipeline
+        // Start rendering pipeline
         let commandBuffer = commandQueue.makeCommandBuffer()!
         guard let rpd = view.currentRenderPassDescriptor else { return }
         let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
         enc.setRenderPipelineState(pipelineState)
         enc.setCullMode(.none)
 
-        //  COMMIT 2: RECURSIVE RENDERING
+        // Recursive Rendering
         // Render all committed strokes using the recursive renderer
         // This will automatically render parent frames (background) before the active frame (foreground)
         renderFrame(activeFrame,
@@ -458,12 +474,12 @@ class Coordinator: NSObject, MTKViewDelegate {
                    encoder: enc,
                    excludedChild: nil) // Start with no exclusion
 
-        //  COMMIT 2: LIVE STROKE RENDERING
+        // Live Stroke Rendering
         // Live strokes are rendered on top of all committed strokes (foreground)
-        //  COMBINE REAL + PREDICTED for latency reduction
+        // Combine real + predicted points for latency reduction
         if (currentTouchPoints.count + predictedTouchPoints.count) >= 2, let tempOrigin = liveStrokeOrigin {
             let zoom = Double(zoomScale)
-            let worldWidth = 10.0 / zoom
+            let worldWidth = brushSettings.size / zoom
 
             //  COMBINE REAL + PREDICTED
             // We create a temporary array just for this frame's rendering
@@ -672,7 +688,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()
 
-        //  COMMIT 4: Update Debug HUD
+        // Update Debug HUD
         updateDebugHUD(view: view)
     }
 
@@ -940,11 +956,9 @@ class Coordinator: NSObject, MTKViewDelegate {
         if tileManager.debugMode {
             let worldPointCG = CGPoint(x: worldPoint.x, y: worldPoint.y)
             let tileKey = tileManager.getTileKey(worldPoint: worldPointCG)
-            let debugOutput = tileManager.debugInfo(worldPoint: worldPointCG,
-                                                    screenPoint: point,
-                                                    tileKey: tileKey)
-            print("\n TOUCH BEGAN - Target: \(currentDrawingTarget != nil ? "Card" : "Canvas")")
-            print(debugOutput)
+            _ = tileManager.debugInfo(worldPoint: worldPointCG,
+                                      screenPoint: point,
+                                      tileKey: tileKey)
         }
     }
 
@@ -968,11 +982,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                                                zoomScale: Float(zoomScale),
                                                rotationAngle: rotationAngle)
             let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
-            let debugOutput = tileManager.debugInfo(worldPoint: worldPoint,
-                                                    screenPoint: point,
-                                                    tileKey: tileKey)
-            print("\n TOUCH MOVED (point \(currentTouchPoints.count))")
-            print(debugOutput)
+            _ = tileManager.debugInfo(worldPoint: worldPoint,
+                                      screenPoint: point,
+                                      tileKey: tileKey)
         }
     }
 
@@ -996,11 +1008,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                                                zoomScale: Float(zoomScale),
                                                rotationAngle: rotationAngle)
             let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
-            let debugOutput = tileManager.debugInfo(worldPoint: worldPoint,
-                                                    screenPoint: point,
-                                                    tileKey: tileKey)
-            print("\n TOUCH ENDED")
-            print(debugOutput)
+            _ = tileManager.debugInfo(worldPoint: worldPoint,
+                                      screenPoint: point,
+                                      tileKey: tileKey)
         }
 
         //  FIX 1: Allow dots (Don't return if count < 4)
@@ -1061,7 +1071,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                                 panAtCreation: panOffset,
                                 viewSize: view.bounds.size,
                                 rotationAngle: rotationAngle,
-                                color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0))
+                                color: brushSettings.color,
+                                baseWidth: brushSettings.size,
+                                device: device)
             frame.strokes.append(stroke)
 
         case .card(let card):
@@ -1093,12 +1105,9 @@ class Coordinator: NSObject, MTKViewDelegate {
     /// Add a new card to the canvas at the camera center
     /// The card will be a solid color and can be selected/dragged/edited
     func addCard() {
-        print(" addCard() called")
         guard let view = metalView else {
-            print(" ERROR: metalView is nil!")
             return
         }
-        print(" metalView exists")
 
         // 1. Calculate camera center in world coordinates (where the user is looking)
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
@@ -1120,19 +1129,6 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         // 5. Add to active frame
         activeFrame.cards.append(card)
-
-        // 6. Debug output
-        print(" ========== ADD CARD DEBUG ==========")
-        print(" Card Position: (\(cameraCenterWorld.x), \(cameraCenterWorld.y))")
-        print(" Card Size: \(cardSize.x) × \(cardSize.y) world units")
-        print(" Card Color: Neon Pink (1.0, 0.0, 1.0, 1.0)")
-        print(" Card Rotation: 0 radians")
-        print(" Current Zoom: \(zoomScale)")
-        print(" Current Pan: (\(panOffset.x), \(panOffset.y))")
-        print(" Current Rotation: \(rotationAngle) radians")
-        print(" Total Cards in Frame: \(activeFrame.cards.count)")
-        print(" Card ID: \(card.id)")
-        print(" ======================================")
     }
 
     /// Create a stroke in card-local coordinates
@@ -1193,14 +1189,16 @@ class Coordinator: NSObject, MTKViewDelegate {
         // 3. Create the Stroke
         //  The math:
         // - Geometry: (WorldPos * Zoom) / Zoom = WorldPos  Correct position
-        // - Width: 10.0 / Zoom = Correct world width 
+        // - Width: brushSettings.size / Zoom = Correct world width
         return Stroke(
             screenPoints: cardLocalPoints,   // Virtual screen space (world units * zoom)
             zoomAtCreation: zoomScale,       // Actual zoom (will divide, canceling multiply)
             panAtCreation: .zero,            // We handled position manually
             viewSize: .zero,                 // We handled centering manually
             rotationAngle: 0,                // We handled rotation manually
-            color: SIMD4<Float>(0.0, 0.0, 1.0, 1.0) // Blue for card strokes
+            color: brushSettings.color,      // Use brush settings color
+            baseWidth: brushSettings.size,   // Use brush settings size
+            device: device                   // Pass device for buffer caching
         )
     }
 
@@ -1225,23 +1223,6 @@ class Coordinator: NSObject, MTKViewDelegate {
             pointToTile[index] = tileKey
         }
 
-        // DEBUG: Check for tile boundary crossings
-        if tileManager.debugMode {
-            var crossings = 0
-            for i in 0..<(currentTouchPoints.count - 1) {
-                if pointToTile[i] != pointToTile[i + 1] {
-                    crossings += 1
-                    print(" TILE BOUNDARY CROSSING at segment \(i)→\(i+1)")
-                    print("   Point \(i): tile \(pointToTile[i]?.description ?? "?")")
-                    print("   Point \(i+1): tile \(pointToTile[i+1]?.description ?? "?")")
-                }
-            }
-
-            if pointsByTile.count > 1 {
-                print(" Stroke spans \(pointsByTile.count) tiles, \(crossings) boundary crossings")
-                print("   Points per tile: \(pointsByTile.mapValues { $0.count })")
-            }
-        }
 
         // 3. Tessellate each tile's segment in tile-local space
         var allLocalVertices: [(tileKey: TileKey, vertices: [SIMD2<Float>])] = []
@@ -1277,62 +1258,6 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
         }
 
-        // Debug output for Phase 3
-        if tileManager.debugMode && currentTouchPoints.count >= 2 {
-            print("\n PHASE 3: TILE-LOCAL STROKE RENDERING")
-            print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            print("Zoom: \(zoomScale)x (level \(tileManager.referenceLevel))")
-            print("Tile Size (world): \(String(format: "%.9f", tileManager.tileSizeAtReferenceLevel)) px")
-            print("Width (world): \(String(format: "%.9f", 10.0 / Double(zoomScale))) px")
-            print("Width (tile-local): \(String(format: "%.6f", widthTile)) units")
-            print("Touch Points: \(currentTouchPoints.count)")
-            print("Tiles Spanned: \(pointsByTile.count)")
-            print("Total Vertices: \(finalVertices.count)")
-
-            // Detailed point analysis
-            print("\nPoint Analysis:")
-            for (index, worldPoint) in currentTouchPoints.prefix(3).enumerated() {
-                let tileKey = pointToTile[index]!
-                let localPoint = tileManager.worldToTileLocal(worldPoint: worldPoint, tileKey: tileKey)
-
-                print("  Point \(index):")
-                print("    World: (\(String(format: "%.3f", worldPoint.x)), \(String(format: "%.3f", worldPoint.y)))")
-                print("    Tile: Level \(tileKey.level), Grid (\(tileKey.tx), \(tileKey.ty))")
-                print("    Local [0,1024]: (\(String(format: "%.3f", localPoint.x)), \(String(format: "%.3f", localPoint.y)))")
-
-                // Check if local coords are in valid range
-                if localPoint.x < 0 || localPoint.x > 1024 || localPoint.y < 0 || localPoint.y > 1024 {
-                    print("     OUT OF RANGE!")
-                } else {
-                    print("     Valid")
-                }
-            }
-
-            // Tessellation check
-            print("\nTessellation Results:")
-            for (tileKey, localPoints) in pointsByTile.prefix(3) {
-                print("  Tile Level \(tileKey.level), Grid (\(tileKey.tx), \(tileKey.ty)): \(localPoints.count) points")
-                if localPoints.count < 2 {
-                    print("     INSUFFICIENT POINTS (need 2+)")
-                }
-            }
-
-            // Coordinate magnitude check
-            if let firstTile = allLocalVertices.first, let firstVertex = firstTile.vertices.first {
-                print("\nCoordinate Magnitude Check:")
-                print("  Tile-local vertex: (\(String(format: "%.3f", firstVertex.x)), \(String(format: "%.3f", firstVertex.y)))")
-                let magnitude = max(abs(firstVertex.x), abs(firstVertex.y))
-                print("  Max magnitude: \(String(format: "%.1f", magnitude))")
-
-                if magnitude < 2000 {
-                    print("   SMALL NUMBERS - Float precision preserved!")
-                } else {
-                    print("   LARGE NUMBERS - Float precision at risk!")
-                }
-            }
-            print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-        }
-
         return finalVertices
     }
 
@@ -1340,135 +1265,14 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     /// Diagnose gaps issue - test simple 2-point stroke
     func diagnoseGapsIssue() {
-        print("\n GAP DIAGNOSIS")
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-        guard let view = metalView else { return }
-
-        // Simulate a simple 2-point stroke at current zoom
-        let screenP1 = CGPoint(x: 100, y: 100)
-        let screenP2 = CGPoint(x: 200, y: 100)  // Horizontal line
-
-        let worldP1 = screenToWorldPixels(screenP1, viewSize: view.bounds.size,
-                                         panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
-                                         zoomScale: Float(zoomScale),
-                                         rotationAngle: rotationAngle)
-        let worldP2 = screenToWorldPixels(screenP2, viewSize: view.bounds.size,
-                                         panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
-                                         zoomScale: Float(zoomScale),
-                                         rotationAngle: rotationAngle)
-
-        print("Test Stroke: Horizontal line, 100px on screen")
-        print("  Screen P1: \(screenP1)")
-        print("  Screen P2: \(screenP2)")
-        print("  World P1: (\(String(format: "%.3f", worldP1.x)), \(String(format: "%.3f", worldP1.y)))")
-        print("  World P2: (\(String(format: "%.3f", worldP2.x)), \(String(format: "%.3f", worldP2.y)))")
-        print("  World distance: \(String(format: "%.3f", hypot(worldP2.x - worldP1.x, worldP2.y - worldP1.y))) px")
-
-        // Check tile assignment
-        let tile1 = tileManager.getTileKey(worldPoint: worldP1)
-        let tile2 = tileManager.getTileKey(worldPoint: worldP2)
-        let sameTile = (tile1 == tile2)
-
-        print("\nTile Assignment:")
-        print("  P1 tile: \(tile1.description)")
-        print("  P2 tile: \(tile2.description)")
-        print("  Same tile: \(sameTile ? " YES" : " NO - CROSSES BOUNDARY!")")
-
-        // Test tile-local conversion
-        let local1 = tileManager.worldToTileLocal(worldPoint: worldP1, tileKey: tile1)
-        let local2 = tileManager.worldToTileLocal(worldPoint: worldP2, tileKey: tile2)
-
-        print("\nTile-Local Coordinates:")
-        print("  P1 local: (\(String(format: "%.3f", local1.x)), \(String(format: "%.3f", local1.y)))")
-        print("  P2 local: (\(String(format: "%.3f", local2.x)), \(String(format: "%.3f", local2.y)))")
-
-        if sameTile {
-            let localDist = hypot(local2.x - local1.x, local2.y - local1.y)
-            print("  Local distance: \(String(format: "%.3f", localDist))")
-
-            // Test tessellation
-            let widthTile = tileManager.calculateTileLocalWidth(baseWidth: 10.0)
-            print("\nTessellation Test:")
-            print("  Width (tile-local): \(String(format: "%.6f", widthTile))")
-
-            let vertices = tessellateStrokeLocal(
-                centerPoints: [local1, local2],
-                width: CGFloat(widthTile)
-            )
-            print("  Generated vertices: \(vertices.count)")
-
-            if vertices.isEmpty {
-                print("   NO VERTICES GENERATED!")
-            }
-        } else {
-            print("   Points in different tiles - segment will be LOST!")
-        }
-
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        // Diagnostic function - no output
     }
 
     // MARK: - Phase 2 Testing
 
     /// Test tile-local tessellation with known inputs
     func testTileLocalTessellation() {
-        print("\n TESTING TILE-LOCAL TESSELLATION")
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-        // Test case: Simple stroke in tile-local space
-        let localPoints = [
-            CGPoint(x: 100, y: 100),
-            CGPoint(x: 200, y: 200),
-            CGPoint(x: 300, y: 200)
-        ]
-
-        // Calculate tile-local width at current zoom
-        let tileLocalWidth = tileManager.calculateTileLocalWidth(baseWidth: 10.0)
-
-        print("Width Calculation:")
-        print("  Zoom Scale: \(tileManager.currentZoomScale)")
-        print("  Reference Level: \(tileManager.referenceLevel)")
-        print("  Tile Size (world): \(String(format: "%.6f", tileManager.tileSizeAtReferenceLevel)) px")
-        print("  World Width: \(String(format: "%.6f", 10.0 / Double(tileManager.currentZoomScale))) px")
-        print("  Tile-Local Width: \(String(format: "%.6f", tileLocalWidth)) units")
-
-        // Tessellate
-        let vertices = tessellateStrokeLocal(
-            centerPoints: localPoints,
-            width: CGFloat(tileLocalWidth)
-        )
-
-        print("\nTessellation Results:")
-        print("  Input Points: \(localPoints.count)")
-        print("  Output Vertices: \(vertices.count)")
-
-        if !vertices.isEmpty {
-            let minX = vertices.map { $0.x }.min() ?? 0
-            let maxX = vertices.map { $0.x }.max() ?? 0
-            let minY = vertices.map { $0.y }.min() ?? 0
-            let maxY = vertices.map { $0.y }.max() ?? 0
-
-            print("  Vertex Range:")
-            print("    X: [\(String(format: "%.2f", minX)), \(String(format: "%.2f", maxX))]")
-            print("    Y: [\(String(format: "%.2f", minY)), \(String(format: "%.2f", maxY))]")
-
-            // Check width offset from centerline
-            let halfWidth = Float(tileLocalWidth / 2.0)
-            print("  Expected Half-Width: \(String(format: "%.6f", halfWidth))")
-
-            // Sample first quad (should be offset by halfWidth from p1)
-            if vertices.count >= 6 {
-                let p1 = SIMD2<Float>(Float(localPoints[0].x), Float(localPoints[0].y))
-                let T1 = vertices[0]  // Top vertex of first segment
-                let offset = distance(T1, p1)
-                print("  Actual Offset from Center: \(String(format: "%.6f", offset))")
-
-                let isCorrect = abs(offset - halfWidth) < 0.001
-                print("   Width Correct: \(isCorrect)")
-            }
-        }
-
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        // Diagnostic function - no output
     }
 }
 

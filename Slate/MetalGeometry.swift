@@ -164,7 +164,7 @@ func createCircle(at point: CGPoint,
     return vertices
 }
 
-// MARK: - Tile-Local Tessellation (Phase 2)
+// MARK: - Tile-Local Tessellation
 
 /// Create triangles for a stroke in tile-local space [0, 1024].
 /// This works with tile-local coordinates and widths, avoiding float precision issues.

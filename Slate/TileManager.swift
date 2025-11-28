@@ -83,7 +83,7 @@ class TileManager {
         return Self.baseTileSize / pow(2.0, Double(level))
     }
 
-    // MARK: - Width Conversion (Phase 2)
+    // MARK: - Width Conversion
 
     /// Convert world-space width to tile-local width.
     ///
@@ -103,7 +103,7 @@ class TileManager {
     }
 
     /// Calculate tile-local width for a stroke at current zoom level.
-    /// This is the standard width calculation for Phase 2.
+    /// This is the standard width calculation.
     ///
     /// - Parameter baseWidth: Base width in screen pixels (e.g., 10.0)
     /// - Returns: Width in tile-local units
@@ -115,7 +115,7 @@ class TileManager {
         return worldWidthToTileWidth(worldWidth)
     }
 
-    // MARK: - Coordinate Conversion (Phase 3)
+    // MARK: - Coordinate Conversion
 
     /// Convert a world point to tile-local coordinates in [0, 1024].
     ///

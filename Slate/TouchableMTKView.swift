@@ -19,7 +19,7 @@ class TouchableMTKView: MTKView {
     var rotationGesture: UIRotationGestureRecognizer!
     var longPressGesture: UILongPressGestureRecognizer!
 
-    //  COMMIT 4: Debug HUD
+    // Debug HUD
     var debugLabel: UILabel!
 
     //  UPGRADED: Anchors now use Double for infinite precision at extreme zoom
@@ -77,7 +77,7 @@ class TouchableMTKView: MTKView {
 
     func clearAnchorIfUnused() { activeOwner = .none }
 
-    // MARK: -  COMMIT 3: Telescoping Transitions
+    // MARK: - Telescoping Transitions
 
     /// Check if zoom has exceeded thresholds and perform frame transitions if needed.
     /// Returns TRUE if a transition occurred (caller should return early).
@@ -152,8 +152,6 @@ class TouchableMTKView: MTKView {
                 rotationAngle: coord.rotationAngle
             )
 
-            print(" Re-entered frame. Strokes: \(existing.strokes.count)")
-
         } else {
             //  CREATE NEW FRAME
 
@@ -185,8 +183,6 @@ class TouchableMTKView: MTKView {
                 zoomScale: 1.0,
                 rotationAngle: coord.rotationAngle
             )
-
-            print(" Created NEW frame. Origin centered on pinch. Depth: \(frameDepth(coord.activeFrame))")
         }
 
         // 7. RE-ANCHOR GESTURES (update with new coordinate system)
@@ -256,8 +252,6 @@ class TouchableMTKView: MTKView {
             )
             self.anchorScreen = currentCentroid
         }
-
-        print(" Popped up to parent frame. Depth: \(frameDepth(coord.activeFrame))")
     }
 
     /// Helper: Calculate the depth of a frame (how many parents it has)
@@ -313,7 +307,7 @@ class TouchableMTKView: MTKView {
         rotationGesture.delegate = self
         longPressGesture.delegate = self
 
-        //  COMMIT 4: Setup Debug HUD
+        // Setup Debug HUD
         setupDebugHUD()
     }
 
@@ -363,7 +357,6 @@ class TouchableMTKView: MTKView {
             if card.hitTest(pointInFrame: worldPoint) {
                 // Toggle Edit Mode
                 card.isEditing.toggle()
-                print(" Card \(card.id) Editing: \(card.isEditing)")
                 return
             }
         }
@@ -372,7 +365,6 @@ class TouchableMTKView: MTKView {
         for card in coord.activeFrame.cards {
             card.isEditing = false
         }
-        print(" All cards deselected")
     }
 
     ///  MODAL INPUT: PAN (Finger Only - Drag Card or Pan Canvas)
@@ -401,7 +393,6 @@ class TouchableMTKView: MTKView {
                 if card.hitTest(pointInFrame: worldPoint) {
                     if card.isEditing {
                         draggedCard = card
-                        print(" Started dragging card \(card.id)")
                         return // Stop processing; we are dragging a card
                     }
                     // If card is NOT editing, we ignore it (Pass through to Canvas Pan)
@@ -452,9 +443,6 @@ class TouchableMTKView: MTKView {
             }
 
         case .ended, .cancelled, .failed:
-            if let card = draggedCard {
-                print(" Finished dragging card \(card.id)")
-            }
             draggedCard = nil
 
         default:
@@ -486,10 +474,10 @@ class TouchableMTKView: MTKView {
             coord.zoomScale = coord.zoomScale * Double(gesture.scale)
             gesture.scale = 1.0
 
-            //  COMMIT 3: TELESCOPING TRANSITIONS
+            // Telescoping Transitions
             // Check if we need to drill down (zoom in) or pop up (zoom out)
             // Pass the current touch centroid to anchor transitions to finger position
-            //  FIX: If we switched frames, STOP here.
+            // Fix: If we switched frames, STOP here.
             // The transition logic has already calculated the perfect panOffset
             // to keep the finger pinned. Running the standard solver below
             // would overwrite it with a "glitched" value.
@@ -573,29 +561,6 @@ class TouchableMTKView: MTKView {
 
         if gesture.state == .began {
             coord.tileManager.debugMode.toggle()
-            let status = coord.tileManager.debugMode ? "ON" : "OFF"
-            print("\n TILE DEBUG MODE: \(status)")
-            print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-            if coord.tileManager.debugMode {
-                let loc = gesture.location(in: self)
-                let worldPoint = screenToWorldPixels(loc,
-                                                     viewSize: bounds.size,
-                                                     panOffset: SIMD2<Float>(Float(coord.panOffset.x), Float(coord.panOffset.y)),
-                                                     zoomScale: Float(coord.zoomScale),
-                                                     rotationAngle: coord.rotationAngle)
-                let tileKey = coord.tileManager.getTileKey(worldPoint: worldPoint)
-                let debugOutput = coord.tileManager.debugInfo(worldPoint: worldPoint,
-                                                              screenPoint: loc,
-                                                              tileKey: tileKey)
-                print(debugOutput)
-
-                // PHASE 2 TEST: Tile-local tessellation
-                coord.testTileLocalTessellation()
-
-                // PHASE 3 DIAGNOSIS: Check for gaps issue
-                coord.diagnoseGapsIssue()
-            }
         }
     }
 

@@ -1,9 +1,10 @@
 // Stroke.swift models pen and pencil strokes, including coordinate transforms and tessellation helpers.
 import SwiftUI
+import Metal
 
 /// A stroke on the infinite canvas using Floating Origin architecture.
 ///
-/// ** COMMIT 4: Local Realism**
+/// Local Realism:
 /// Strokes are "locally aware" - they only know their position within the current Frame.
 /// They are ignorant of the infinite universe and never see large numbers.
 ///
@@ -14,12 +15,25 @@ import SwiftUI
 ///
 /// This ensures the GPU only ever receives small Float values, eliminating precision gaps.
 /// The stroke never needs to know if it exists at 10^100 zoom or 10^-50 zoom.
-struct Stroke {
+///
+/// ** OPTIMIZATION: Buffer Caching**
+/// Changed from struct to class to cache the GPU vertex buffer.
+/// The buffer is created ONCE when the stroke is committed, eliminating
+/// the CPU overhead of creating new buffers 60 times per second.
+class Stroke: Identifiable {
     let id: UUID
     let origin: SIMD2<Double>           // Anchor point within the Frame (Double precision, always small)
     let localVertices: [SIMD2<Float>]   // Vertices relative to origin (Float precision)
     let worldWidth: Double              // Width in world units
     let color: SIMD4<Float>
+
+    //  OPTIMIZATION: Cached GPU Buffer
+    // Created once in init, reused every frame
+    var vertexBuffer: MTLBuffer?
+
+    //  OPTIMIZATION: Bounding Box for Culling
+    // Calculated once in init, used to skip off-screen strokes
+    var localBounds: CGRect = .zero
 
     /// Initialize stroke from screen-space points using direct delta calculation.
     /// This avoids Double precision loss at extreme zoom levels by calculating
@@ -33,13 +47,18 @@ struct Stroke {
     ///   - viewSize: View dimensions
     ///   - rotationAngle: Camera rotation angle
     ///   - color: Stroke color
+    ///   - baseWidth: Base stroke width in world units (before zoom adjustment)
+    ///   - device: MTLDevice for creating cached vertex buffer
     ///  UPGRADED: Now accepts Double for zoom and pan to maintain precision
+    ///  OPTIMIZATION: Now caches vertex buffer and bounding box in init
     init(screenPoints: [CGPoint],
          zoomAtCreation: Double,
          panAtCreation: SIMD2<Double>,
          viewSize: CGSize,
          rotationAngle: Float,
-         color: SIMD4<Float>) {
+         color: SIMD4<Float>,
+         baseWidth: Double = 10.0,
+         device: MTLDevice?) {
         self.id = UUID()
         self.color = color
 
@@ -84,8 +103,8 @@ struct Stroke {
             return SIMD2<Float>(Float(worldDx), Float(worldDy))
         }
 
-        // 3. World width is simply screen width (10px) divided by zoom
-        let worldWidth = 10.0 / zoom
+        // 3. World width is the base width divided by zoom
+        let worldWidth = baseWidth / zoom
         self.worldWidth = worldWidth
 
         // 4. Tessellate in LOCAL space (no view-specific transforms)
@@ -93,5 +112,37 @@ struct Stroke {
             centerPoints: relativePoints,
             width: Float(worldWidth)
         )
+
+        // 5.  OPTIMIZATION: Create Cached Buffer
+        // This is done ONCE here, not 60 times per second in drawStroke
+        if let device = device, !localVertices.isEmpty {
+            self.vertexBuffer = device.makeBuffer(
+                bytes: localVertices,
+                length: localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
+                options: .storageModeShared
+            )
+        }
+
+        // 6.  OPTIMIZATION: Calculate Bounding Box for Culling
+        if !localVertices.isEmpty {
+            var minX = localVertices[0].x
+            var maxX = minX
+            var minY = localVertices[0].y
+            var maxY = minY
+
+            for vertex in localVertices {
+                if vertex.x < minX { minX = vertex.x }
+                if vertex.x > maxX { maxX = vertex.x }
+                if vertex.y < minY { minY = vertex.y }
+                if vertex.y > maxY { maxY = vertex.y }
+            }
+
+            self.localBounds = CGRect(
+                x: Double(minX),
+                y: Double(minY),
+                width: Double(maxX - minX),
+                height: Double(maxY - minY)
+            )
+        }
     }
 }
