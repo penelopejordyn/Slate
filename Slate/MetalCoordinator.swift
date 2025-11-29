@@ -13,6 +13,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     var pipelineState: MTLRenderPipelineState!
     var cardPipelineState: MTLRenderPipelineState!      // Pipeline for textured cards
     var cardSolidPipelineState: MTLRenderPipelineState! // Pipeline for solid color cards
+    var cardProceduralPipelineState: MTLRenderPipelineState! // Pipeline for procedural backgrounds (lined/grid)
     var samplerState: MTLSamplerState!                  // Sampler for card textures
     var vertexBuffer: MTLBuffer!
 
@@ -174,7 +175,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             drawStroke(stroke, with: &transform, visibleRect: visibleRect, encoder: encoder)
         }
 
-        // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes) 
+        // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
         for card in frame.cards {
             // A. Calculate Position
             // Card lives in the Frame, so it moves with the Frame
@@ -199,24 +200,51 @@ class Coordinator: NSObject, MTKViewDelegate {
             encoder.setDepthStencilState(stencilStateWrite)
             encoder.setStencilReferenceValue(1)
 
-            // C. Set Pipeline & Bind Content Based on Card Type
-            switch card.type {
-            case .solidColor(let color):
-                // Use solid color pipeline (no texture required)
+            // C. Select pipeline based on background style
+            switch card.background.style {
+            case .lined, .grid:
+                // Use procedural shader for lined/grid (infinite resolution, zero memory)
+                encoder.setRenderPipelineState(cardProceduralPipelineState)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                var uniforms = card.background.makeUniforms(cardSize: card.size)
+                encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardBackgroundUniforms>.stride, index: 0)
+
+            case .image:
+                // Use texture pipeline for images
+                if card.background.style != .none {
+                    card.updateBackgroundTexture(device: device)
+                }
+                if let backgroundTexture = card.backgroundTexture {
+                    encoder.setRenderPipelineState(cardPipelineState)
+                    encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                    encoder.setFragmentTexture(backgroundTexture, index: 0)
+                    encoder.setFragmentSamplerState(samplerState, index: 0)
+                } else {
+                    // Fallback to white if texture failed to load
+                    encoder.setRenderPipelineState(cardSolidPipelineState)
+                    encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                    var c = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
+                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                }
+
+            case .solidColor(let bgColor):
+                // Use solid color pipeline
                 encoder.setRenderPipelineState(cardSolidPipelineState)
                 encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                var c = color
+                var c = SIMD4<Float>(
+                    Float(bgColor.red),
+                    Float(bgColor.green),
+                    Float(bgColor.blue),
+                    Float(bgColor.alpha)
+                )
                 encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
 
-            case .image(let texture):
-                // Use textured pipeline (requires texture binding)
-                encoder.setRenderPipelineState(cardPipelineState)
+            case .none:
+                // No background, use white
+                encoder.setRenderPipelineState(cardSolidPipelineState)
                 encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                encoder.setFragmentTexture(texture, index: 0)
-                encoder.setFragmentSamplerState(samplerState, index: 0)
-
-            case .drawing:
-                continue // Future: Render nested strokes
+                var c = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
+                encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
             }
 
             // D. Draw the Card Quad (writes to both color buffer and stencil)
@@ -312,7 +340,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             // (Because the shader multiplies everything by childZoom, we must pre-scale the offset up)
             let frameOffsetInChildUnits = frameOffsetInParentUnits * child.scaleRelativeToParent
 
-            // 4. Render each stroke individually
+            // 4. Render child strokes
             for stroke in child.strokes {
                 guard !stroke.localVertices.isEmpty else { continue }
 
@@ -334,6 +362,130 @@ class Coordinator: NSObject, MTKViewDelegate {
                 )
 
                 drawStroke(stroke, with: &childTransform, visibleRect: visibleRect, encoder: encoder)
+            }
+
+            // 5. Render child cards
+            for card in child.cards {
+                // Calculate card position in parent frame
+                // Card's origin is in child frame, convert to parent frame
+                let cardOriginInParent = child.originInParent + (card.origin / child.scaleRelativeToParent)
+
+                // Calculate relative offset for rendering
+                let relativeOffsetDouble = cardOriginInParent - cameraCenterInThisFrame
+                let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x), Float(relativeOffsetDouble.y))
+
+                // Card rotation stays the same
+                let finalRotation = currentRotation + card.rotation
+
+                var cardTransform = StrokeTransform(
+                    relativeOffset: relativeOffset,
+                    zoomScale: Float(childZoom),
+                    screenWidth: Float(viewSize.width),
+                    screenHeight: Float(viewSize.height),
+                    rotationAngle: finalRotation
+                )
+
+                // Write to stencil
+                encoder.setDepthStencilState(stencilStateWrite)
+                encoder.setStencilReferenceValue(1)
+
+                // Render based on background style
+                switch card.background.style {
+                case .lined, .grid:
+                    // Use procedural shader for lined/grid
+                    encoder.setRenderPipelineState(cardProceduralPipelineState)
+                    encoder.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                    var uniforms = card.background.makeUniforms(cardSize: card.size)
+                    encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardBackgroundUniforms>.stride, index: 0)
+
+                case .image:
+                    // Use texture pipeline for images
+                    if card.background.style != .none {
+                        card.updateBackgroundTexture(device: device)
+                    }
+                    if let backgroundTexture = card.backgroundTexture {
+                        encoder.setRenderPipelineState(cardPipelineState)
+                        encoder.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                        encoder.setFragmentTexture(backgroundTexture, index: 0)
+                        encoder.setFragmentSamplerState(samplerState, index: 0)
+                    } else {
+                        // Fallback to white if texture failed
+                        encoder.setRenderPipelineState(cardSolidPipelineState)
+                        encoder.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                        var c = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
+                        encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                    }
+
+                case .solidColor(let bgColor):
+                    // Use solid color pipeline
+                    encoder.setRenderPipelineState(cardSolidPipelineState)
+                    encoder.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                    var c = SIMD4<Float>(
+                        Float(bgColor.red),
+                        Float(bgColor.green),
+                        Float(bgColor.blue),
+                        Float(bgColor.alpha)
+                    )
+                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+                case .none:
+                    // No background, use white
+                    encoder.setRenderPipelineState(cardSolidPipelineState)
+                    encoder.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                    var c = SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
+                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                }
+
+                // Draw card quad
+                let cardVertexBuffer = device.makeBuffer(
+                    bytes: card.localVertices,
+                    length: card.localVertices.count * MemoryLayout<StrokeVertex>.stride,
+                    options: .storageModeShared
+                )
+                encoder.setVertexBuffer(cardVertexBuffer, offset: 0, index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+                // Render card strokes if any (clipped to card)
+                if !card.strokes.isEmpty {
+                    encoder.setRenderPipelineState(pipelineState)
+                    encoder.setDepthStencilState(stencilStateRead)
+                    encoder.setStencilReferenceValue(1)
+
+                    // Calculate magic offset for card-local strokes
+                    let distX = cardOriginInParent.x - cameraCenterInThisFrame.x
+                    let distY = cardOriginInParent.y - cameraCenterInThisFrame.y
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    let magicOffsetX = distX * c - distY * s
+                    let magicOffsetY = distX * s + distY * c
+                    let offset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
+
+                    for stroke in card.strokes {
+                        guard !stroke.localVertices.isEmpty else { continue }
+                        let strokeOffset = stroke.origin
+                        var strokeTransform = StrokeTransform(
+                            relativeOffset: offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y)),
+                            zoomScale: Float(childZoom),
+                            screenWidth: Float(viewSize.width),
+                            screenHeight: Float(viewSize.height),
+                            rotationAngle: finalRotation
+                        )
+                        drawStroke(stroke, with: &strokeTransform, visibleRect: visibleRect, encoder: encoder)
+                    }
+                }
+
+                // Clear stencil
+                encoder.setDepthStencilState(stencilStateClear)
+                encoder.setStencilReferenceValue(0)
+                encoder.setRenderPipelineState(cardSolidPipelineState)
+                encoder.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                var clearColor = SIMD4<Float>(0, 0, 0, 0)
+                encoder.setFragmentBytes(&clearColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                encoder.setVertexBuffer(cardVertexBuffer, offset: 0, index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+                // Reset stencil state
+                encoder.setDepthStencilState(stencilStateDefault)
             }
 
             // Note: We do NOT recurse into grandchildren to avoid rendering depth ±2, ±3, etc.
@@ -832,6 +984,27 @@ class Coordinator: NSObject, MTKViewDelegate {
             fatalError("Failed to create solid card pipeline: \(error)")
         }
 
+        // Procedural Card Background Pipeline (for lined/grid patterns)
+        let cardProceduralDesc = MTLRenderPipelineDescriptor()
+        cardProceduralDesc.vertexFunction   = library.makeFunction(name: "vertex_card")
+        cardProceduralDesc.fragmentFunction = library.makeFunction(name: "fragment_card_procedural")
+        cardProceduralDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        cardProceduralDesc.colorAttachments[0].isBlendingEnabled = true
+        cardProceduralDesc.colorAttachments[0].rgbBlendOperation = .add
+        cardProceduralDesc.colorAttachments[0].alphaBlendOperation = .add
+        cardProceduralDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        cardProceduralDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        cardProceduralDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        cardProceduralDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        cardProceduralDesc.vertexDescriptor = vertexDesc
+        cardProceduralDesc.stencilAttachmentPixelFormat = .stencil8
+
+        do {
+            cardProceduralPipelineState = try device.makeRenderPipelineState(descriptor: cardProceduralDesc)
+        } catch {
+            fatalError("Failed to create procedural card pipeline: \(error)")
+        }
+
         // Create Sampler for card textures
         let samplerDesc = MTLSamplerDescriptor()
         samplerDesc.minFilter = .linear
@@ -1141,6 +1314,7 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     /// Add a new card to the canvas at the camera center
     /// The card will be a solid color and can be selected/dragged/edited
+    /// The size is scaled based on zoom level to maintain consistent screen appearance
     func addCard() {
         guard let view = metalView else {
             return
@@ -1149,20 +1323,29 @@ class Coordinator: NSObject, MTKViewDelegate {
         // 1. Calculate camera center in world coordinates (where the user is looking)
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
 
-        // 2. Create card at camera center with reasonable size
-        // Size is in world units - at 1.0 zoom, this is ~300x200 pixels (increased for visibility)
-        let cardSize = SIMD2<Double>(300.0, 200.0)
+        // 2. Create card at camera center with size relative to zoom level
+        // We want the card to appear as ~300x200 pixels on screen
+        // In world units, this is: screenSize / zoomScale
+        let screenWidth: Double = 300.0
+        let screenHeight: Double = 200.0
+        let cardSize = SIMD2<Double>(
+            screenWidth / zoomScale,
+            screenHeight / zoomScale
+        )
 
-        // 3. Use neon pink for high visibility against cyan background
-        let neonPink = SIMD4<Float>(1.0, 0.0, 1.0, 1.0)  // Bright magenta
+        // 3. Use white background by default (user can change via long press)
+        let whiteColor = CodableColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
 
-        // 4. Create the card
+        // 4. Create the card with white background
         let card = Card(
             origin: cameraCenterWorld,
             size: cardSize,
             rotation: 0,
-            type: .solidColor(neonPink)
+            type: .solidColor(SIMD4<Float>(1.0, 1.0, 1.0, 1.0))
         )
+
+        // Set the background to white (using new background system)
+        card.background = CardBackground(style: .solidColor(color: whiteColor))
 
         // 5. Add to active frame
         activeFrame.cards.append(card)

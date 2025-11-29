@@ -4,6 +4,8 @@ import SwiftUI
 struct ContentView: View {
     // Reference to MetalView's coordinator for adding cards
     @State private var metalViewCoordinator: MetalView.Coordinator?
+    @State private var showingBackgroundConfig = false
+    @State private var selectedCard: Card?
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -35,6 +37,17 @@ struct ContentView: View {
             }
             .padding(.top, 60)
             .padding(.trailing, 16)
+        }
+        .sheet(isPresented: $showingBackgroundConfig) {
+            if let card = selectedCard {
+                CardBackgroundConfigView(card: ObservableCard(card: card))
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ShowCardBackgroundConfig"))) { notification in
+            if let card = notification.object as? Card {
+                selectedCard = card
+                showingBackgroundConfig = true
+            }
         }
     }
 }

@@ -31,6 +31,10 @@ class Card: Identifiable {
     // This ensures drawings move with the card when it's repositioned
     var strokes: [Stroke] = []
 
+    // MARK: - Background
+    // Visual background for the card (lined paper, image, etc.)
+    var background: CardBackground = CardBackground()
+
     // MARK: - Cached Geometry
     // We pre-calculate the 2 triangles (Quad) that represent this card.
     // This optimization means we don't have to do math every frame.

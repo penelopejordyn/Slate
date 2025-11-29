@@ -84,18 +84,18 @@ class TouchableMTKView: MTKView {
     func checkTelescopingTransitions(coord: Coordinator, currentCentroid: CGPoint) -> Bool {
         // DRILL DOWN: Zoom exceeded upper limit → Create child frame
         if coord.zoomScale > 1000.0 {
-            //  Pass the shared anchor instead of recomputing
+            // 🟢 FIX: Use 'currentCentroid' (LIVE) instead of 'anchorScreen' (STALE)
             drillDownToNewFrame(coord: coord,
                                anchorWorld: anchorWorld,
-                               anchorScreen: anchorScreen)
+                               anchorScreen: currentCentroid)
             return true //  Transition happened
         }
         // POP UP: Zoom fell below lower limit → Return to parent frame
         else if coord.zoomScale < 0.5, coord.activeFrame.parent != nil {
-            //  Pass the shared anchor instead of recomputing
+            // 🟢 FIX: Use 'currentCentroid' (LIVE) instead of 'anchorScreen' (STALE)
             popUpToParentFrame(coord: coord,
                               anchorWorld: anchorWorld,
-                              anchorScreen: anchorScreen)
+                              anchorScreen: currentCentroid)
             return true //  Transition happened
         }
 
@@ -138,6 +138,7 @@ class TouchableMTKView: MTKView {
 
             let localPinchX = diffX * existing.scaleRelativeToParent
             let localPinchY = diffY * existing.scaleRelativeToParent
+            let localPinch = SIMD2<Double>(localPinchX, localPinchY)
 
             // 5. RESET ZOOM
             // We do this AFTER calculating positions
@@ -145,12 +146,19 @@ class TouchableMTKView: MTKView {
 
             // 6. SOLVE PAN
             coord.panOffset = solvePanOffsetForAnchor_Double(
-                anchorWorld: SIMD2<Double>(localPinchX, localPinchY),
+                anchorWorld: localPinch,
                 desiredScreen: currentCentroid,
                 viewSize: bounds.size,
                 zoomScale: coord.zoomScale, // Now ~1.0
                 rotationAngle: coord.rotationAngle
             )
+
+            // 7. RE-ANCHOR GESTURES (update with new coordinate system)
+            // 🟢 CRITICAL FIX: Use the Child-space coordinate we already calculated
+            if activeOwner != .none {
+                self.anchorWorld = localPinch // 🟢 Use Child-space coordinate
+                self.anchorScreen = currentCentroid
+            }
 
         } else {
             //  CREATE NEW FRAME
@@ -183,19 +191,16 @@ class TouchableMTKView: MTKView {
                 zoomScale: 1.0,
                 rotationAngle: coord.rotationAngle
             )
+
+            // 7. RE-ANCHOR GESTURES (update with new coordinate system)
+            // 🟢 CRITICAL FIX: The anchor is at the origin (0,0) in the new frame
+            if activeOwner != .none {
+                self.anchorWorld = SIMD2<Double>(0, 0) // 🟢 Finger is at new frame's origin
+                self.anchorScreen = currentCentroid
+            }
         }
 
-        // 7. RE-ANCHOR GESTURES (update with new coordinate system)
-        if activeOwner != .none {
-            self.anchorWorld = screenToWorldPixels_PureDouble(
-                currentCentroid,
-                viewSize: bounds.size,
-                panOffset: coord.panOffset,
-                zoomScale: coord.zoomScale,
-                rotationAngle: coord.rotationAngle
-            )
-            self.anchorScreen = currentCentroid
-        }
+        print("⬆️ Drilled down to child frame. Depth: \(frameDepth(coord.activeFrame))")
     }
 
     /// Helper: Calculate Euclidean distance between two points
@@ -223,13 +228,15 @@ class TouchableMTKView: MTKView {
         let currentCentroid = anchorScreen
 
         // 3. Convert Child Pinch Position -> Parent Pinch Position
+        // This is the CRITICAL point: We need the anchor's position in the PARENT frame
         // Parent = Origin + (Child / Scale)
         let pinchPosInParentX = currentFrame.originInParent.x + (pinchPosInChild.x / currentFrame.scaleRelativeToParent)
         let pinchPosInParentY = currentFrame.originInParent.y + (pinchPosInChild.y / currentFrame.scaleRelativeToParent)
+        let pinchPosInParent = SIMD2<Double>(pinchPosInParentX, pinchPosInParentY)
 
         // 4. Solve Pan to lock FINGER position
         let newPanOffset = solvePanOffsetForAnchor_Double(
-            anchorWorld: SIMD2<Double>(pinchPosInParentX, pinchPosInParentY),
+            anchorWorld: pinchPosInParent, // 🟢 Use Parent-Space Anchor
             desiredScreen: currentCentroid,
             viewSize: bounds.size,
             zoomScale: newZoom,
@@ -241,17 +248,17 @@ class TouchableMTKView: MTKView {
         coord.zoomScale = newZoom
         coord.panOffset = newPanOffset
 
-        // 6. RE-ANCHOR GESTURES (update with new coordinate system)
+        // 6. RE-ANCHOR GESTURES
+        // 🟢 CRITICAL FIX: We must update the class-level 'anchorWorld' to be the PARENT coordinate
+        // so the next handlePinch call uses the correct value.
+        // DO NOT recalculate using screenToWorldPixels - that would introduce rounding errors.
+        // Instead, use the exact Parent-space coordinate we already calculated.
         if activeOwner != .none {
-            self.anchorWorld = screenToWorldPixels_PureDouble(
-                currentCentroid,
-                viewSize: bounds.size,
-                panOffset: coord.panOffset,
-                zoomScale: coord.zoomScale,
-                rotationAngle: coord.rotationAngle
-            )
+            self.anchorWorld = pinchPosInParent // 🟢 Use Parent-space coordinate
             self.anchorScreen = currentCentroid
         }
+
+        print("⬇️ Popped up to parent frame. Depth: \(frameDepth(coord.activeFrame))")
     }
 
     /// Helper: Calculate the depth of a frame (how many parents it has)
@@ -299,7 +306,8 @@ class TouchableMTKView: MTKView {
 
         longPressGesture = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         longPressGesture.minimumPressDuration = 0.5
-        longPressGesture.numberOfTouchesRequired = 2
+        longPressGesture.numberOfTouchesRequired = 1
+        longPressGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
         addGestureRecognizer(longPressGesture)
 
         panGesture.delegate = self
@@ -558,8 +566,31 @@ class TouchableMTKView: MTKView {
 
     @objc func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         guard let coord = coordinator else { return }
+        let loc = gesture.location(in: self)
 
         if gesture.state == .began {
+            // Calculate World Point
+            let worldPoint = screenToWorldPixels_PureDouble(
+                loc,
+                viewSize: bounds.size,
+                panOffset: coord.panOffset,
+                zoomScale: coord.zoomScale,
+                rotationAngle: coord.rotationAngle
+            )
+
+            // Hit Test Cards (Reverse order = Top first)
+            for card in coord.activeFrame.cards.reversed() {
+                if card.hitTest(pointInFrame: worldPoint) {
+                    // Long pressed on a card - post notification to show config
+                    NotificationCenter.default.post(
+                        name: NSNotification.Name("ShowCardBackgroundConfig"),
+                        object: card
+                    )
+                    return
+                }
+            }
+
+            // If no card was hit, toggle debug mode (existing behavior for empty area)
             coord.tileManager.debugMode.toggle()
         }
     }
