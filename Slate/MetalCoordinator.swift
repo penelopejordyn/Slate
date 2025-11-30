@@ -53,22 +53,9 @@ class Coordinator: NSObject, MTKViewDelegate {
     var onEditCard: ((Card) -> Void)?
 
     //  UPGRADED: Store camera state as Double for infinite precision
-    var panOffset: SIMD2<Double> = .zero {
-        didSet {
-            // Cast to Float only when updating tile manager
-            tileManager.currentPanOffset = SIMD2<Float>(Float(panOffset.x), Float(panOffset.y))
-        }
-    }
-    var zoomScale: Double = 1.0 {
-        didSet {
-            // Cast to Float only when updating tile manager
-            tileManager.currentZoomScale = Float(zoomScale)
-        }
-    }
+    var panOffset: SIMD2<Double> = .zero
+    var zoomScale: Double = 1.0
     var rotationAngle: Float = 0.0
-
-    // MARK: - Tiling System (Phase 1: Debug Only)
-    let tileManager = TileManager()
 
     // MARK: - Brush Settings
     let brushSettings = BrushSettings()
@@ -79,15 +66,6 @@ class Coordinator: NSObject, MTKViewDelegate {
         commandQueue = device.makeCommandQueue()!
         makePipeLine()
         makeVertexBuffer()
-
-        // Initialize tile manager state (cast Double to Float)
-        tileManager.currentZoomScale = Float(zoomScale)
-        tileManager.currentPanOffset = SIMD2<Float>(Float(panOffset.x), Float(panOffset.y))
-    }
-
-    /// Update tile manager with current view size (call when view size changes)
-    func updateTileManagerViewSize(_ size: CGSize) {
-        tileManager.viewSize = size
     }
 
     // MARK: - Commit 2: Recursive Renderer
@@ -668,11 +646,6 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        // Update tile manager view size (only changes when view resizes)
-        if tileManager.viewSize != view.bounds.size {
-            tileManager.viewSize = view.bounds.size
-        }
-
         // Calculate Camera Center in World Space (Double precision)
         // This is the "View Center" - where the center of the screen is in the infinite world.
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
@@ -1392,17 +1365,6 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         // Keep points in SCREEN space during drawing
         currentTouchPoints = [point]
-
-        // Debug tiling system (only when debug mode enabled)
-        if tileManager.debugMode {
-            if let origin = liveStrokeOrigin {
-                let worldPointCG = CGPoint(x: origin.x, y: origin.y)
-                let tileKey = tileManager.getTileKey(worldPoint: worldPointCG)
-                _ = tileManager.debugInfo(worldPoint: worldPointCG,
-                                          screenPoint: point,
-                                          tileKey: tileKey)
-            }
-        }
     }
 
     func handleTouchMoved(at point: CGPoint, predicted: [CGPoint], touchType: UITouch.TouchType) {
@@ -1431,20 +1393,6 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         // Update prediction (always do this for responsiveness, even if we filter the real point)
         predictedTouchPoints = predicted
-
-        // Debug tiling system (only when debug mode enabled, every 10th point)
-        if tileManager.debugMode && currentTouchPoints.count % 10 == 0 {
-            guard let view = metalView else { return }
-            let worldPoint = screenToWorldPixels(point,
-                                               viewSize: view.bounds.size,
-                                               panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
-                                               zoomScale: Float(zoomScale),
-                                               rotationAngle: rotationAngle)
-            let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
-            _ = tileManager.debugInfo(worldPoint: worldPoint,
-                                      screenPoint: point,
-                                      tileKey: tileKey)
-        }
     }
 
     func handleTouchEnded(at point: CGPoint, touchType: UITouch.TouchType) {
@@ -1458,19 +1406,6 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         // Keep final point in SCREEN space
         currentTouchPoints.append(point)
-
-        // Debug tiling system (only when debug mode enabled)
-        if tileManager.debugMode {
-            let worldPoint = screenToWorldPixels(point,
-                                               viewSize: view.bounds.size,
-                                               panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
-                                               zoomScale: Float(zoomScale),
-                                               rotationAngle: rotationAngle)
-            let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
-            _ = tileManager.debugInfo(worldPoint: worldPoint,
-                                      screenPoint: point,
-                                      tileKey: tileKey)
-        }
 
         //  FIX 1: Allow dots (Don't return if count < 4)
         guard !currentTouchPoints.isEmpty else {
@@ -1778,78 +1713,6 @@ class Coordinator: NSObject, MTKViewDelegate {
         )
     }
 
-    // MARK: - Phase 3: Tile-Local Current Stroke Rendering
-
-    /// Render current stroke using tile-local tessellation to avoid precision issues.
-    /// This is the critical function that enables gap-free drawing at any zoom level!
-    func renderCurrentStrokeTileLocal(view: MTKView) -> [SIMD2<Float>] {
-        guard currentTouchPoints.count >= 2 else { return [] }
-
-        // 1. Calculate width in tile-local space
-        let widthTile = tileManager.calculateTileLocalWidth(baseWidth: 10.0)
-
-        // 2. Group touch points by tile AND track which tiles each point belongs to
-        var pointsByTile: [TileKey: [CGPoint]] = [:]
-        var pointToTile: [Int: TileKey] = [:]  // Index → TileKey mapping
-
-        for (index, worldPoint) in currentTouchPoints.enumerated() {
-            let tileKey = tileManager.getTileKey(worldPoint: worldPoint)
-            let localPoint = tileManager.worldToTileLocal(worldPoint: worldPoint, tileKey: tileKey)
-            pointsByTile[tileKey, default: []].append(localPoint)
-            pointToTile[index] = tileKey
-        }
-
-
-        // 3. Tessellate each tile's segment in tile-local space
-        var allLocalVertices: [(tileKey: TileKey, vertices: [SIMD2<Float>])] = []
-
-        for (tileKey, localPoints) in pointsByTile {
-            guard localPoints.count >= 2 else { continue }
-
-            let vertices = tessellateStrokeLocal(
-                centerPoints: localPoints,
-                width: CGFloat(widthTile)
-            )
-            allLocalVertices.append((tileKey: tileKey, vertices: vertices))
-        }
-
-        // 4. Convert tile-local vertices to world space, then to NDC
-        var finalVertices: [SIMD2<Float>] = []
-
-        for (tileKey, vertices) in allLocalVertices {
-            for vertex in vertices {
-                // Convert tile-local vertex to world coordinates
-                let localPoint = CGPoint(x: Double(vertex.x), y: Double(vertex.y))
-                let worldPoint = tileManager.tileLocalToWorld(localPoint: localPoint, tileKey: tileKey)
-
-                // Convert world to NDC (existing pipeline)
-                let ndcVertex = worldPixelToNDC(
-                    point: worldPoint,
-                    viewSize: view.bounds.size,
-                    panOffset: SIMD2<Float>(Float(panOffset.x), Float(panOffset.y)),
-                    zoomScale: Float(zoomScale)
-                )
-
-                finalVertices.append(ndcVertex)
-            }
-        }
-
-        return finalVertices
-    }
-
-    // MARK: - Phase 3 Diagnostics
-
-    /// Diagnose gaps issue - test simple 2-point stroke
-    func diagnoseGapsIssue() {
-        // Diagnostic function - no output
-    }
-
-    // MARK: - Phase 2 Testing
-
-    /// Test tile-local tessellation with known inputs
-    func testTileLocalTessellation() {
-        // Diagnostic function - no output
-    }
 }
 
 // MARK: - Gesture Delegate

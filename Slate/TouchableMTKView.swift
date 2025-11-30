@@ -573,11 +573,8 @@ class TouchableMTKView: MTKView {
     }
 
     @objc func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-        guard let coord = coordinator else { return }
-
-        if gesture.state == .began {
-            coord.tileManager.debugMode.toggle()
-        }
+        // Two-finger long press - currently unused
+        // Could be used for global actions (zoom reset, frame navigation, etc.)
     }
 
     /// Single-finger long press to open card settings
