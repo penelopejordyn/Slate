@@ -4,11 +4,20 @@ import SwiftUI
 struct ContentView: View {
     // Reference to MetalView's coordinator for adding cards
     @State private var metalViewCoordinator: MetalView.Coordinator?
+    @State private var editingCard: Card? // The card being edited
+    @State private var showSettingsSheet = false
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             MetalView(coordinator: $metalViewCoordinator)
             .edgesIgnoringSafeArea(.all)
+            .onChange(of: metalViewCoordinator) { newCoord in
+                // Bind the callback when coordinator is set
+                newCoord?.onEditCard = { card in
+                    self.editingCard = card
+                    self.showSettingsSheet = true
+                }
+            }
 
             VStack(spacing: 16) {
                 // Add Card Button
@@ -35,6 +44,12 @@ struct ContentView: View {
             }
             .padding(.top, 60)
             .padding(.trailing, 16)
+        }
+        .sheet(isPresented: $showSettingsSheet) {
+            if let card = editingCard {
+                CardSettingsView(card: card)
+                    .presentationDetents([.medium])
+            }
         }
     }
 }
