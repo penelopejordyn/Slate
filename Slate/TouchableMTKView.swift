@@ -98,25 +98,25 @@ class TouchableMTKView: MTKView {
 
     /// Check if zoom has exceeded thresholds and perform frame transitions if needed.
     /// Returns TRUE if a transition occurred (caller should return early).
-    func checkTelescopingTransitions(coord: Coordinator, currentCentroid: CGPoint) -> Bool {
-        // DRILL DOWN: Zoom exceeded upper limit → Create child frame
+    func checkTelescopingTransitions(coord: Coordinator,
+                                     anchorWorld: SIMD2<Double>,
+                                     anchorScreen: CGPoint) -> Bool {
+        // DRILL DOWN
         if coord.zoomScale > 1000.0 {
-            //  Pass the shared anchor instead of recomputing
             drillDownToNewFrame(coord: coord,
+                                anchorWorld: anchorWorld,
+                                anchorScreen: anchorScreen)
+            return true
+        }
+        // POP UP
+        else if coord.zoomScale < 0.5, coord.activeFrame.parent != nil {
+            popUpToParentFrame(coord: coord,
                                anchorWorld: anchorWorld,
                                anchorScreen: anchorScreen)
-            return true //  Transition happened
-        }
-        // POP UP: Zoom fell below lower limit → Return to parent frame
-        else if coord.zoomScale < 0.5, coord.activeFrame.parent != nil {
-            //  Pass the shared anchor instead of recomputing
-            popUpToParentFrame(coord: coord,
-                              anchorWorld: anchorWorld,
-                              anchorScreen: anchorScreen)
-            return true //  Transition happened
+            return true
         }
 
-        return false // No change
+        return false
     }
 
     /// "The Silent Teleport" - Drill down into a child frame.
@@ -462,46 +462,56 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            // Start of pinch: claim the anchor if nobody owns it yet.
             lastPinchTouchCount = tc
-            if activeOwner == .none { lockAnchor(owner: .pinch, at: loc, coord: coord) }
+            if activeOwner == .none {
+                lockAnchor(owner: .pinch, at: loc, coord: coord)
+            }
 
         case .changed:
-            // If touch count changed (finger lifted/added), re-lock to new centroid w/o moving content.
+            // If finger count changes, re-lock to new centroid WITHOUT moving content.
             if activeOwner == .pinch, tc != lastPinchTouchCount {
-                relockAnchorAtCurrentCentroid(owner: .pinch, screenPt: loc, coord: coord)
+                relockAnchorAtCurrentCentroid(owner: .pinch,
+                                              screenPt: loc,
+                                              coord: coord)
                 lastPinchTouchCount = tc
-                // Do not solve pan on this exact frame; early-return to avoid visible snap.
+                // Avoid solving pan on this frame; we just re-synced the anchor.
                 gesture.scale = 1.0
                 return
             }
 
-            //  Normal incremental zoom - multiply using Double precision
-            coord.zoomScale = coord.zoomScale * Double(gesture.scale)
+            // Normal incremental zoom (always relative)
+            coord.zoomScale *= Double(gesture.scale)
             gesture.scale = 1.0
 
-            // Telescoping Transitions
-            // Check if we need to drill down (zoom in) or pop up (zoom out)
-            // Pass the current touch centroid to anchor transitions to finger position
-            // Fix: If we switched frames, STOP here.
-            // The transition logic has already calculated the perfect panOffset
-            // to keep the finger pinned. Running the standard solver below
-            // would overwrite it with a "glitched" value.
-            if checkTelescopingTransitions(coord: coord, currentCentroid: loc) {
+            // 🔑 IMPORTANT: depth switches are driven by the *shared anchor*,
+            // not by re-sampling world from the current centroid.
+            if checkTelescopingTransitions(coord: coord,
+                                           anchorWorld: anchorWorld,
+                                           anchorScreen: anchorScreen) {
+                // The transition functions already solved a perfect panOffset
+                // to keep the anchor pinned. Do NOT overwrite it this frame.
                 return
             }
 
-            // Standard Solver (Only runs if we did NOT switch frames)
-            let target = (activeOwner == .pinch) ? loc : anchorScreen
-            coord.panOffset = solvePanOffsetForAnchor_Double(anchorWorld: anchorWorld,
-                                                             desiredScreen: target,
-                                                             viewSize: bounds.size,
-                                                             zoomScale: coord.zoomScale,
-                                                             rotationAngle: coord.rotationAngle)
-            if activeOwner == .pinch { anchorScreen = target }
+            // No frame switch: solve panOffset to keep the anchor fixed.
+            let targetScreen: CGPoint = (activeOwner == .pinch) ? loc : anchorScreen
+
+            coord.panOffset = solvePanOffsetForAnchor_Double(
+                anchorWorld: anchorWorld,
+                desiredScreen: targetScreen,
+                viewSize: bounds.size,
+                zoomScale: coord.zoomScale,
+                rotationAngle: coord.rotationAngle
+            )
+
+            if activeOwner == .pinch {
+                anchorScreen = targetScreen
+            }
 
         case .ended, .cancelled, .failed:
             if activeOwner == .pinch {
-                // If rotation is active, hand off smoothly to its centroid
+                // If rotation is active, hand off the anchor smoothly.
                 if rotationGesture.state == .changed || rotationGesture.state == .began {
                     let rloc = rotationGesture.location(in: self)
                     handoffAnchor(to: .rotation, screenPt: rloc, coord: coord)
@@ -511,7 +521,8 @@ class TouchableMTKView: MTKView {
             }
             lastPinchTouchCount = 0
 
-        default: break
+        default:
+            break
         }
     }
     @objc func handleRotation(_ gesture: UIRotationGestureRecognizer) {
