@@ -2,10 +2,28 @@
 import SwiftUI
 import Metal
 
+// Configuration for procedural backgrounds
+struct LinedBackgroundConfig {
+    var spacing: Float      // Line spacing in points (e.g. 25.0)
+    var lineWidth: Float    // Thickness (e.g. 1.0)
+    var color: SIMD4<Float> // Line color (e.g. Light Blue)
+}
+
 enum CardType {
     case solidColor(SIMD4<Float>) // For testing/backgrounds
-    case image(MTLTexture)        // Future: User photos
+    case image(MTLTexture)        // User photos
+    case lined(LinedBackgroundConfig) // Procedural Lines
+    case grid(LinedBackgroundConfig)  // Procedural Grid
     case drawing([Stroke])        // Future: Mini-canvas inside the card
+}
+
+// Helper to get raw values for Metal (Uniform buffer)
+struct CardShaderUniforms {
+    var spacing: Float
+    var lineWidth: Float
+    var color: SIMD4<Float>
+    var cardWidth: Float  // Needed to calculate UV aspect ratio
+    var cardHeight: Float // Needed to calculate UV aspect ratio
 }
 
 class Card: Identifiable {
@@ -17,6 +35,13 @@ class Card: Identifiable {
     var origin: SIMD2<Double>
     var size: SIMD2<Double>   // Width, Height
     var rotation: Float       // Radians
+
+    // MARK: - Creation Context
+    // The "Scale Factor" - Zoom level when this card was created.
+    // We use this to calculate how big "25 points" is in world units.
+    // This is the "Rosetta Stone" that allows us to translate point sizes
+    // into the correct world size forever, regardless of current zoom.
+    var creationZoom: Double
 
     // MARK: - Content
     var type: CardType
@@ -36,10 +61,11 @@ class Card: Identifiable {
     // This optimization means we don't have to do math every frame.
     var localVertices: [StrokeVertex] = []
 
-    init(origin: SIMD2<Double>, size: SIMD2<Double>, rotation: Float = 0, type: CardType) {
+    init(origin: SIMD2<Double>, size: SIMD2<Double>, rotation: Float = 0, zoom: Double, type: CardType) {
         self.origin = origin
         self.size = size
         self.rotation = rotation
+        self.creationZoom = zoom // Store this!
         self.type = type
 
         // Generate the geometry immediately
@@ -53,12 +79,21 @@ class Card: Identifiable {
         let halfW = Float(size.x) / 2.0
         let halfH = Float(size.y) / 2.0
 
-        // Standard Quad (Two Triangles)
-        // UVs map 0.0 to 1.0 across the card face
-        let v1 = StrokeVertex(position: SIMD2<Float>(-halfW, -halfH), uv: SIMD2<Float>(0, 0)) // Top-Left
-        let v2 = StrokeVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(0, 1)) // Bot-Left
-        let v3 = StrokeVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1, 0)) // Top-Right
-        let v4 = StrokeVertex(position: SIMD2<Float>( halfW,  halfH), uv: SIMD2<Float>(1, 1)) // Bot-Right
+        // FIX: Image Inversion
+        // Metal textures (Origin BottomLeft) map (0,0) to the bottom-left pixel.
+        // We want that pixel at the Bottom-Left of the card.
+        // Screen Y is Down. So -H is Top, +H is Bottom.
+
+        // Vertices (Local Space relative to center):
+        // TL: (-W, -H) -> Should map to Image Top-Left UV(0, 1)
+        // BL: (-W,  H) -> Should map to Image Bottom-Left UV(0, 0)
+        // TR: ( W, -H) -> Should map to Image Top-Right UV(1, 1)
+        // BR: ( W,  H) -> Should map to Image Bottom-Right UV(1, 0)
+
+        let v1 = StrokeVertex(position: SIMD2<Float>(-halfW, -halfH), uv: SIMD2<Float>(0, 1)) // Top-Left
+        let v2 = StrokeVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(0, 0)) // Bot-Left
+        let v3 = StrokeVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1, 1)) // Top-Right
+        let v4 = StrokeVertex(position: SIMD2<Float>( halfW,  halfH), uv: SIMD2<Float>(1, 0)) // Bot-Right
 
         // Triangle Strip or List (List is safer for mixed geometry)
         // Tri 1: TL -> BL -> TR

@@ -7,7 +7,23 @@ import simd
 
 // MARK: - Associated Object Keys for gesture state storage
 private struct AssociatedKeys {
-    static var draggedCard: UInt8 = 0
+    static var dragContext: UInt8 = 0
+}
+
+// MARK: - Drag Context for Cross-Depth Dragging
+/// Stores the card being dragged and its coordinate conversion scale
+/// The conversion scale translates movement between coordinate systems:
+///   - Parent cards: scale < 1.0 (move slower)
+///   - Active cards: scale = 1.0 (normal movement)
+///   - Child cards: scale > 1.0 (move faster)
+private class DragContext {
+    let card: Card
+    let conversionScale: Double
+
+    init(card: Card, conversionScale: Double) {
+        self.card = card
+        self.conversionScale = conversionScale
+    }
 }
 
 // MARK: - TouchableMTKView
@@ -18,6 +34,7 @@ class TouchableMTKView: MTKView {
     var pinchGesture: UIPinchGestureRecognizer!
     var rotationGesture: UIRotationGestureRecognizer!
     var longPressGesture: UILongPressGestureRecognizer!
+    var cardLongPressGesture: UILongPressGestureRecognizer! // Single-finger long press for card settings
 
     // Debug HUD
     var debugLabel: UILabel!
@@ -81,25 +98,25 @@ class TouchableMTKView: MTKView {
 
     /// Check if zoom has exceeded thresholds and perform frame transitions if needed.
     /// Returns TRUE if a transition occurred (caller should return early).
-    func checkTelescopingTransitions(coord: Coordinator, currentCentroid: CGPoint) -> Bool {
-        // DRILL DOWN: Zoom exceeded upper limit → Create child frame
+    func checkTelescopingTransitions(coord: Coordinator,
+                                     anchorWorld: SIMD2<Double>,
+                                     anchorScreen: CGPoint) -> Bool {
+        // DRILL DOWN
         if coord.zoomScale > 1000.0 {
-            //  Pass the shared anchor instead of recomputing
             drillDownToNewFrame(coord: coord,
+                                anchorWorld: anchorWorld,
+                                anchorScreen: anchorScreen)
+            return true
+        }
+        // POP UP
+        else if coord.zoomScale < 0.5, coord.activeFrame.parent != nil {
+            popUpToParentFrame(coord: coord,
                                anchorWorld: anchorWorld,
                                anchorScreen: anchorScreen)
-            return true //  Transition happened
-        }
-        // POP UP: Zoom fell below lower limit → Return to parent frame
-        else if coord.zoomScale < 0.5, coord.activeFrame.parent != nil {
-            //  Pass the shared anchor instead of recomputing
-            popUpToParentFrame(coord: coord,
-                              anchorWorld: anchorWorld,
-                              anchorScreen: anchorScreen)
-            return true //  Transition happened
+            return true
         }
 
-        return false // No change
+        return false
     }
 
     /// "The Silent Teleport" - Drill down into a child frame.
@@ -302,10 +319,18 @@ class TouchableMTKView: MTKView {
         longPressGesture.numberOfTouchesRequired = 2
         addGestureRecognizer(longPressGesture)
 
+        // Single-finger long press for card settings
+        cardLongPressGesture = UILongPressGestureRecognizer(target: self, action: #selector(handleCardLongPress(_:)))
+        cardLongPressGesture.minimumPressDuration = 0.5
+        cardLongPressGesture.numberOfTouchesRequired = 1
+        cardLongPressGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)] // Finger only
+        addGestureRecognizer(cardLongPressGesture)
+
         panGesture.delegate = self
         pinchGesture.delegate = self
         rotationGesture.delegate = self
         longPressGesture.delegate = self
+        cardLongPressGesture.delegate = self
 
         // Setup Debug HUD
         setupDebugHUD()
@@ -343,107 +368,87 @@ class TouchableMTKView: MTKView {
         let loc = gesture.location(in: self)
         guard let coord = coordinator else { return }
 
-        // 1. Calculate World Point
-        let worldPoint = screenToWorldPixels_PureDouble(
-            loc,
-            viewSize: bounds.size,
-            panOffset: coord.panOffset,
-            zoomScale: coord.zoomScale,
-            rotationAngle: coord.rotationAngle
-        )
-
-        // 2. Hit Test Cards (Reverse order = Top first)
-        for card in coord.activeFrame.cards.reversed() {
-            if card.hitTest(pointInFrame: worldPoint) {
-                // Toggle Edit Mode
-                card.isEditing.toggle()
-                return
-            }
+        // Use the new hierarchical hit test to find cards at any depth
+        if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size) {
+            // Toggle Edit on the card (wherever it lives - parent, active, or child)
+            result.card.isEditing.toggle()
+            return
         }
 
-        // If we tapped nothing, deselect all cards
-        for card in coord.activeFrame.cards {
-            card.isEditing = false
-        }
+        // If we tapped nothing, deselect all cards (requires recursive clear)
+        clearSelectionRecursive(frame: coord.rootFrame)
+    }
+
+    /// Helper to clear all card selections recursively across the entire hierarchy
+    func clearSelectionRecursive(frame: Frame) {
+        frame.cards.forEach { $0.isEditing = false }
+        frame.children.forEach { clearSelectionRecursive(frame: $0) }
     }
 
     ///  MODAL INPUT: PAN (Finger Only - Drag Card or Pan Canvas)
+    /// Now supports cross-depth dragging with proper coordinate conversion
     @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
         let loc = gesture.location(in: self)
         guard let coord = coordinator else { return }
 
-        // Track which card we are dragging (stored in TouchableMTKView)
-        var draggedCard: Card? {
-            get { objc_getAssociatedObject(self, &AssociatedKeys.draggedCard) as? Card }
-            set { objc_setAssociatedObject(self, &AssociatedKeys.draggedCard, newValue, .OBJC_ASSOCIATION_RETAIN) }
+        // Track drag context (card + conversion scale)
+        var dragContext: DragContext? {
+            get { objc_getAssociatedObject(self, &AssociatedKeys.dragContext) as? DragContext }
+            set { objc_setAssociatedObject(self, &AssociatedKeys.dragContext, newValue, .OBJC_ASSOCIATION_RETAIN) }
         }
 
         switch gesture.state {
         case .began:
-            // 1. Check if we hit an EDITING card
-            let worldPoint = screenToWorldPixels_PureDouble(
-                loc,
-                viewSize: bounds.size,
-                panOffset: coord.panOffset,
-                zoomScale: coord.zoomScale,
-                rotationAngle: coord.rotationAngle
-            )
-
-            for card in coord.activeFrame.cards.reversed() {
-                if card.hitTest(pointInFrame: worldPoint) {
-                    if card.isEditing {
-                        draggedCard = card
-                        return // Stop processing; we are dragging a card
-                    }
-                    // If card is NOT editing, we ignore it (Pass through to Canvas Pan)
+            // Hit test hierarchy to find card AND its coordinate scale
+            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size) {
+                if result.card.isEditing {
+                    // Store Card + Scale Factor for cross-depth dragging
+                    dragContext = DragContext(card: result.card, conversionScale: result.conversionScale)
+                    return
                 }
             }
-            draggedCard = nil // We are panning the canvas
+            dragContext = nil // Pan Canvas
 
         case .changed:
             let translation = gesture.translation(in: self)
 
-            if let card = draggedCard {
-                //  DRAG CARD
-                // Convert screen translation to World translation
-                // dxWorld = dxScreen / zoom
-                let dx = Double(translation.x) / coord.zoomScale
-                let dy = Double(translation.y) / coord.zoomScale
+            if let context = dragContext {
+                //  DRAG CARD (Cross-Depth Compatible)
 
-                // Handle rotation of the drag vector if camera is rotated
+                // 1. Convert Screen Delta -> Active World Delta
+                let dxActive = Double(translation.x) / coord.zoomScale
+                let dyActive = Double(translation.y) / coord.zoomScale
+
+                // 2. Apply Camera Rotation
                 let ang = Double(coord.rotationAngle)
                 let c = cos(ang), s = sin(ang)
-                let dxRot = dx * c + dy * s
-                let dyRot = -dx * s + dy * c
+                let dxRot = dxActive * c + dyActive * s
+                let dyRot = -dxActive * s + dyActive * c
 
-                // Update Card Position
-                card.origin.x += dxRot
-                card.origin.y += dyRot
+                // 3. Convert Active Delta -> Target Frame Delta
+                // Use the conversion scale we found during Hit Test!
+                // Parent: Scale < 1.0 (Move slower - parent coords are smaller)
+                // Child: Scale > 1.0 (Move faster - child coords are larger)
+                context.card.origin.x += dxRot * context.conversionScale
+                context.card.origin.y += dyRot * context.conversionScale
 
-                // Reset gesture so we get incremental updates
                 gesture.setTranslation(.zero, in: self)
 
             } else {
-                //  PAN CANVAS
-                // Convert screen translation to world translation (accounting for zoom)
+                //  PAN CANVAS (Existing Logic)
                 let dx = Double(translation.x) / coord.zoomScale
                 let dy = Double(translation.y) / coord.zoomScale
 
-                // Handle rotation
                 let ang = Double(coord.rotationAngle)
                 let c = cos(ang), s = sin(ang)
-                let dxRot = dx * c + dy * s
-                let dyRot = -dx * s + dy * c
 
-                // Update pan offset
-                coord.panOffset.x += dxRot
-                coord.panOffset.y += dyRot
-
+                coord.panOffset.x += dx * c + dy * s
+                coord.panOffset.y += -dx * s + dy * c
                 gesture.setTranslation(.zero, in: self)
             }
 
         case .ended, .cancelled, .failed:
-            draggedCard = nil
+            dragContext = nil
 
         default:
             break
@@ -457,46 +462,56 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            // Start of pinch: claim the anchor if nobody owns it yet.
             lastPinchTouchCount = tc
-            if activeOwner == .none { lockAnchor(owner: .pinch, at: loc, coord: coord) }
+            if activeOwner == .none {
+                lockAnchor(owner: .pinch, at: loc, coord: coord)
+            }
 
         case .changed:
-            // If touch count changed (finger lifted/added), re-lock to new centroid w/o moving content.
+            // If finger count changes, re-lock to new centroid WITHOUT moving content.
             if activeOwner == .pinch, tc != lastPinchTouchCount {
-                relockAnchorAtCurrentCentroid(owner: .pinch, screenPt: loc, coord: coord)
+                relockAnchorAtCurrentCentroid(owner: .pinch,
+                                              screenPt: loc,
+                                              coord: coord)
                 lastPinchTouchCount = tc
-                // Do not solve pan on this exact frame; early-return to avoid visible snap.
+                // Avoid solving pan on this frame; we just re-synced the anchor.
                 gesture.scale = 1.0
                 return
             }
 
-            //  Normal incremental zoom - multiply using Double precision
-            coord.zoomScale = coord.zoomScale * Double(gesture.scale)
+            // Normal incremental zoom (always relative)
+            coord.zoomScale *= Double(gesture.scale)
             gesture.scale = 1.0
 
-            // Telescoping Transitions
-            // Check if we need to drill down (zoom in) or pop up (zoom out)
-            // Pass the current touch centroid to anchor transitions to finger position
-            // Fix: If we switched frames, STOP here.
-            // The transition logic has already calculated the perfect panOffset
-            // to keep the finger pinned. Running the standard solver below
-            // would overwrite it with a "glitched" value.
-            if checkTelescopingTransitions(coord: coord, currentCentroid: loc) {
+            // 🔑 IMPORTANT: depth switches are driven by the *shared anchor*,
+            // not by re-sampling world from the current centroid.
+            if checkTelescopingTransitions(coord: coord,
+                                           anchorWorld: anchorWorld,
+                                           anchorScreen: anchorScreen) {
+                // The transition functions already solved a perfect panOffset
+                // to keep the anchor pinned. Do NOT overwrite it this frame.
                 return
             }
 
-            // Standard Solver (Only runs if we did NOT switch frames)
-            let target = (activeOwner == .pinch) ? loc : anchorScreen
-            coord.panOffset = solvePanOffsetForAnchor_Double(anchorWorld: anchorWorld,
-                                                             desiredScreen: target,
-                                                             viewSize: bounds.size,
-                                                             zoomScale: coord.zoomScale,
-                                                             rotationAngle: coord.rotationAngle)
-            if activeOwner == .pinch { anchorScreen = target }
+            // No frame switch: solve panOffset to keep the anchor fixed.
+            let targetScreen: CGPoint = (activeOwner == .pinch) ? loc : anchorScreen
+
+            coord.panOffset = solvePanOffsetForAnchor_Double(
+                anchorWorld: anchorWorld,
+                desiredScreen: targetScreen,
+                viewSize: bounds.size,
+                zoomScale: coord.zoomScale,
+                rotationAngle: coord.rotationAngle
+            )
+
+            if activeOwner == .pinch {
+                anchorScreen = targetScreen
+            }
 
         case .ended, .cancelled, .failed:
             if activeOwner == .pinch {
-                // If rotation is active, hand off smoothly to its centroid
+                // If rotation is active, hand off the anchor smoothly.
                 if rotationGesture.state == .changed || rotationGesture.state == .began {
                     let rloc = rotationGesture.location(in: self)
                     handoffAnchor(to: .rotation, screenPt: rloc, coord: coord)
@@ -506,7 +521,8 @@ class TouchableMTKView: MTKView {
             }
             lastPinchTouchCount = 0
 
-        default: break
+        default:
+            break
         }
     }
     @objc func handleRotation(_ gesture: UIRotationGestureRecognizer) {
@@ -561,6 +577,16 @@ class TouchableMTKView: MTKView {
 
         if gesture.state == .began {
             coord.tileManager.debugMode.toggle()
+        }
+    }
+
+    /// Single-finger long press to open card settings
+    @objc func handleCardLongPress(_ gesture: UILongPressGestureRecognizer) {
+        guard let coord = coordinator else { return }
+
+        if gesture.state == .began {
+            let location = gesture.location(in: self)
+            coord.handleLongPress(at: location)
         }
     }
 

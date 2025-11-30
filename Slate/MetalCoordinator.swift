@@ -13,6 +13,8 @@ class Coordinator: NSObject, MTKViewDelegate {
     var pipelineState: MTLRenderPipelineState!
     var cardPipelineState: MTLRenderPipelineState!      // Pipeline for textured cards
     var cardSolidPipelineState: MTLRenderPipelineState! // Pipeline for solid color cards
+    var cardLinedPipelineState: MTLRenderPipelineState! // Pipeline for lined paper cards
+    var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
     var samplerState: MTLSamplerState!                  // Sampler for card textures
     var vertexBuffer: MTLBuffer!
 
@@ -25,9 +27,10 @@ class Coordinator: NSObject, MTKViewDelegate {
     // MARK: - Modal Input: Pencil vs. Finger
 
     /// Tracks what object we are currently drawing on with the pencil
+    /// Now includes the Frame to support cross-depth drawing
     enum DrawingTarget {
         case canvas(Frame)
-        case card(Card)
+        case card(Card, Frame) // Track BOTH Card and the Frame it belongs to
     }
     var currentDrawingTarget: DrawingTarget?
 
@@ -45,6 +48,9 @@ class Coordinator: NSObject, MTKViewDelegate {
     lazy var activeFrame: Frame = rootFrame  // The current "Local Universe" we are viewing/editing
 
     weak var metalView: MTKView?
+
+    // MARK: - Card Interaction Callbacks
+    var onEditCard: ((Card) -> Void)?
 
     //  UPGRADED: Store camera state as Double for infinite precision
     var panOffset: SIMD2<Double> = .zero {
@@ -215,6 +221,54 @@ class Coordinator: NSObject, MTKViewDelegate {
                 encoder.setFragmentTexture(texture, index: 0)
                 encoder.setFragmentSamplerState(samplerState, index: 0)
 
+            case .lined(let config):
+                // Use procedural lined paper pipeline
+                encoder.setRenderPipelineState(cardLinedPipelineState)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+
+                // 1. Background Color (Paper White)
+                var bg = SIMD4<Float>(1, 1, 1, 1)
+                encoder.setFragmentBytes(&bg, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+                // 2. Uniforms (Lines)
+                // FIX: Calculate World Spacing based on Creation Zoom
+                // Formula: SpacingPts / CreationZoom = SpacingWorld
+                // Example: 25pts / 1000x = 0.025 world units
+                let worldSpacing = config.spacing / Float(card.creationZoom)
+                let worldLineWidth = config.lineWidth / Float(card.creationZoom)
+
+                var uniforms = CardShaderUniforms(
+                    spacing: worldSpacing,        // Pass WORLD units to shader
+                    lineWidth: worldLineWidth,    // Scale line width too!
+                    color: config.color,
+                    cardWidth: Float(card.size.x),
+                    cardHeight: Float(card.size.y)
+                )
+                encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardShaderUniforms>.stride, index: 1)
+
+            case .grid(let config):
+                // Use procedural grid paper pipeline
+                encoder.setRenderPipelineState(cardGridPipelineState)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+
+                // 1. Background Color (Paper White)
+                var bg = SIMD4<Float>(1, 1, 1, 1)
+                encoder.setFragmentBytes(&bg, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+                // 2. Uniforms (Grid)
+                // FIX: Calculate World Spacing based on Creation Zoom
+                let worldSpacing = config.spacing / Float(card.creationZoom)
+                let worldLineWidth = config.lineWidth / Float(card.creationZoom)
+
+                var uniforms = CardShaderUniforms(
+                    spacing: worldSpacing,        // Pass WORLD units to shader
+                    lineWidth: worldLineWidth,    // Scale line width too!
+                    color: config.color,
+                    cardWidth: Float(card.size.x),
+                    cardHeight: Float(card.size.y)
+                )
+                encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardShaderUniforms>.stride, index: 1)
+
             case .drawing:
                 continue // Future: Render nested strokes
             }
@@ -312,6 +366,18 @@ class Coordinator: NSObject, MTKViewDelegate {
             // (Because the shader multiplies everything by childZoom, we must pre-scale the offset up)
             let frameOffsetInChildUnits = frameOffsetInParentUnits * child.scaleRelativeToParent
 
+            //  FIX CULLING: Scale Visible Rect to Child Space
+            // Because strokes in the child are scaled up (by 1000x or more), we must scale
+            // the culling rect up to match them, otherwise they are culled falsely.
+            // Example: Stroke at (100,000) checking against (500) fails.
+            //          Stroke at (100,000) checking against (500,000) passes.
+            let childVisibleRect = CGRect(
+                x: visibleRect.origin.x * child.scaleRelativeToParent,
+                y: visibleRect.origin.y * child.scaleRelativeToParent,
+                width: visibleRect.width * child.scaleRelativeToParent,
+                height: visibleRect.height * child.scaleRelativeToParent
+            )
+
             // 4. Render each stroke individually
             for stroke in child.strokes {
                 guard !stroke.localVertices.isEmpty else { continue }
@@ -322,8 +388,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                 //  OPTIMIZATION: Frustum Culling for child strokes
                 // Skip child strokes that are completely off-screen
+                // Use SCALED visible rect for correct culling!
                 let strokeRect = stroke.localBounds.offsetBy(dx: totalRelativeOffset.x, dy: totalRelativeOffset.y)
-                guard visibleRect.intersects(strokeRect) else { continue }
+                guard childVisibleRect.intersects(strokeRect) else { continue }
 
                 var childTransform = StrokeTransform(
                     relativeOffset: SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y)),
@@ -333,7 +400,142 @@ class Coordinator: NSObject, MTKViewDelegate {
                     rotationAngle: currentRotation
                 )
 
-                drawStroke(stroke, with: &childTransform, visibleRect: visibleRect, encoder: encoder)
+                drawStroke(stroke, with: &childTransform, visibleRect: childVisibleRect, encoder: encoder)
+            }
+
+            // 5. Render Child Cards (Same logic as Layer 2, but with childZoom)
+            for card in child.cards {
+                // 1. Calculate Relative Position
+                // Same logic as strokes: Frame Offset + Card Origin
+                let totalRelativeOffset = card.origin + frameOffsetInChildUnits
+
+                // 2. Setup Transform
+                let relativeOffset = SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y))
+
+                var childCardTransform = StrokeTransform(
+                    relativeOffset: relativeOffset,
+                    zoomScale: Float(childZoom), // Use the calculated childZoom
+                    screenWidth: Float(viewSize.width),
+                    screenHeight: Float(viewSize.height),
+                    rotationAngle: currentRotation + card.rotation
+                )
+
+                // 3. Draw Card Background
+                // Write to Stencil to clip strokes (same logic as Layer 2)
+                encoder.setDepthStencilState(stencilStateWrite)
+                encoder.setStencilReferenceValue(1)
+
+                switch card.type {
+                case .solidColor(let color):
+                    encoder.setRenderPipelineState(cardSolidPipelineState)
+                    encoder.setVertexBytes(&childCardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                    var c = color
+                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+                case .image(let texture):
+                    encoder.setRenderPipelineState(cardPipelineState)
+                    encoder.setVertexBytes(&childCardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                    encoder.setFragmentTexture(texture, index: 0)
+                    encoder.setFragmentSamplerState(samplerState, index: 0)
+
+                case .lined(let config):
+                    encoder.setRenderPipelineState(cardLinedPipelineState)
+                    encoder.setVertexBytes(&childCardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+
+                    var bg = SIMD4<Float>(1, 1, 1, 1)
+                    encoder.setFragmentBytes(&bg, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+                    // FIX: Scale Spacing to World Units
+                    let worldSpacing = config.spacing / Float(card.creationZoom)
+                    let worldLineWidth = config.lineWidth / Float(card.creationZoom)
+
+                    var uniforms = CardShaderUniforms(
+                        spacing: worldSpacing,
+                        lineWidth: worldLineWidth,
+                        color: config.color,
+                        cardWidth: Float(card.size.x),
+                        cardHeight: Float(card.size.y)
+                    )
+                    encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardShaderUniforms>.stride, index: 1)
+
+                case .grid(let config):
+                    encoder.setRenderPipelineState(cardGridPipelineState)
+                    encoder.setVertexBytes(&childCardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+
+                    var bg = SIMD4<Float>(1, 1, 1, 1)
+                    encoder.setFragmentBytes(&bg, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+                    // FIX: Scale Spacing to World Units
+                    let worldSpacing = config.spacing / Float(card.creationZoom)
+                    let worldLineWidth = config.lineWidth / Float(card.creationZoom)
+
+                    var uniforms = CardShaderUniforms(
+                        spacing: worldSpacing,
+                        lineWidth: worldLineWidth,
+                        color: config.color,
+                        cardWidth: Float(card.size.x),
+                        cardHeight: Float(card.size.y)
+                    )
+                    encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardShaderUniforms>.stride, index: 1)
+
+                case .drawing: break // Handle later
+                }
+
+                // Bind Geometry & Draw
+                let vBuffer = device.makeBuffer(bytes: card.localVertices, length: card.localVertices.count * MemoryLayout<StrokeVertex>.stride, options: [])
+                encoder.setVertexBuffer(vBuffer, offset: 0, index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+                // 4. Render Card Strokes (Clipped)
+                // FIX: Proper transform for child card strokes
+                if !card.strokes.isEmpty {
+                    encoder.setRenderPipelineState(pipelineState)
+                    encoder.setDepthStencilState(stencilStateRead)
+                    encoder.setStencilReferenceValue(1)
+
+                    // Calculate total rotation (camera + card)
+                    let totalRot = currentRotation + card.rotation
+
+                    // Rotation matrix for card rotation
+                    let c = cos(Double(card.rotation))
+                    let s = sin(Double(card.rotation))
+
+                    for stroke in card.strokes {
+                        guard !stroke.localVertices.isEmpty else { continue }
+
+                        // Transform Stroke Origin: Card Local -> Frame Local -> Camera Relative
+                        // 1. Stroke origin is in card-local coordinates (relative to card center)
+                        let sx = stroke.origin.x
+                        let sy = stroke.origin.y
+
+                        // 2. Rotate stroke origin by card rotation
+                        let rotX = sx * c - sy * s
+                        let rotY = sx * s + sy * c
+
+                        // 3. Add to card's frame position (already relative to camera)
+                        let strokePos = totalRelativeOffset + SIMD2<Double>(rotX, rotY)
+
+                        var strokeTrans = StrokeTransform(
+                            relativeOffset: SIMD2<Float>(Float(strokePos.x), Float(strokePos.y)),
+                            zoomScale: Float(childZoom),
+                            screenWidth: Float(viewSize.width),
+                            screenHeight: Float(viewSize.height),
+                            rotationAngle: totalRot
+                        )
+
+                        drawStroke(stroke, with: &strokeTrans, visibleRect: childVisibleRect, encoder: encoder)
+                    }
+                }
+
+                // 5. Cleanup Stencil
+                encoder.setRenderPipelineState(cardSolidPipelineState)
+                encoder.setDepthStencilState(stencilStateClear)
+                encoder.setStencilReferenceValue(0)
+                encoder.setVertexBytes(&childCardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                var clearCol = SIMD4<Float>(0,0,0,0)
+                encoder.setFragmentBytes(&clearCol, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                encoder.setVertexBuffer(vBuffer, offset: 0, index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
             }
 
             // Note: We do NOT recurse into grandchildren to avoid rendering depth ±2, ±3, etc.
@@ -498,7 +700,32 @@ class Coordinator: NSObject, MTKViewDelegate {
         // Combine real + predicted points for latency reduction
         if (currentTouchPoints.count + predictedTouchPoints.count) >= 2, let tempOrigin = liveStrokeOrigin {
             let zoom = Double(zoomScale)
-            let worldWidth = brushSettings.size / zoom
+
+            // Determine effective zoom and stroke width for cross-depth drawing
+            var effectiveZoom: Double = zoom
+            var worldWidth: Double
+
+            if case .card(_, let frame) = currentDrawingTarget {
+                // Calculate effective zoom for the card's frame
+                if frame === activeFrame {
+                    // Card is in active frame - use active zoom
+                    effectiveZoom = zoom
+                } else if let p = activeFrame.parent, frame === p {
+                    // Card is in parent frame - parent is zoomed IN from our perspective
+                    // effectiveZoom = activeZoom * activeScale (we see parent coords magnified)
+                    effectiveZoom = zoom * activeFrame.scaleRelativeToParent
+                } else if let child = activeFrame.children.first(where: { $0 === frame }) {
+                    // Card is in child frame - child is zoomed OUT from our perspective
+                    // effectiveZoom = activeZoom / childScale (we see child coords shrunk)
+                    effectiveZoom = zoom / child.scaleRelativeToParent
+                }
+
+                // Width should be based on effective zoom for the card's frame
+                worldWidth = brushSettings.size / effectiveZoom
+            } else {
+                // Drawing on canvas - normal calculation
+                worldWidth = brushSettings.size / zoom
+            }
 
             //  COMBINE REAL + PREDICTED
             // We create a temporary array just for this frame's rendering
@@ -508,12 +735,22 @@ class Coordinator: NSObject, MTKViewDelegate {
             var liveTransform: StrokeTransform
 
             //  Handle card vs canvas drawing differently
-            if case .card(let card) = currentDrawingTarget {
-                // CARD DRAWING: Transform to card-local coordinates
+            if case .card(let card, let frame) = currentDrawingTarget {
+                // CARD DRAWING (Cross-Depth Compatible): Transform to card-local coordinates
                 let firstScreenPt = currentTouchPoints[0]  // Origin is always the REAL first point
                 let cardOrigin = card.origin
                 let cardRot = Double(card.rotation)
                 let cameraRot = Double(rotationAngle)
+
+                // Determine Scale Factor (Active -> Card Frame)
+                var frameScale: Double = 1.0
+                if frame === activeFrame {
+                    frameScale = 1.0
+                } else if let p = activeFrame.parent, frame === p {
+                    frameScale = 1.0 / activeFrame.scaleRelativeToParent
+                } else if activeFrame.children.contains(where: { $0 === frame }) {
+                    frameScale = frame.scaleRelativeToParent
+                }
 
                 // Pre-calculate card inverse rotation
                 let cc = cos(-cardRot)
@@ -524,7 +761,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 let sCam = sin(cameraRot)
 
                 localPoints = pointsToDraw.map { pt in
-                    // A. Screen → World (un-rotate by camera, apply zoom)
+                    // A. Screen → Active World (un-rotate by camera, apply zoom)
                     let dx = Double(pt.x) - Double(firstScreenPt.x)
                     let dy = Double(pt.y) - Double(firstScreenPt.y)
 
@@ -534,7 +771,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                     let worldDx = unrotatedX / zoom
                     let worldDy = unrotatedY / zoom
 
-                    // B. Add to first touch world position
+                    // B. Add to first touch world position (in Active Frame)
                     let firstWorldPt = screenToWorldPixels_PureDouble(
                         firstScreenPt,
                         viewSize: view.bounds.size,
@@ -545,9 +782,21 @@ class Coordinator: NSObject, MTKViewDelegate {
                     let worldX = firstWorldPt.x + worldDx
                     let worldY = firstWorldPt.y + worldDy
 
-                    // C. World → Card Local (subtract card origin, un-rotate by card)
-                    let cardDx = worldX - cardOrigin.x
-                    let cardDy = worldY - cardOrigin.y
+                    // C. Active World → Card's Frame World (Apply scale transform)
+                    var targetWorldPt = SIMD2<Double>(worldX, worldY)
+                    if frame !== activeFrame {
+                        if frameScale > 1.0 {
+                            // Child Frame: Translate and Scale UP
+                            targetWorldPt = (SIMD2<Double>(worldX, worldY) - frame.originInParent) * frame.scaleRelativeToParent
+                        } else {
+                            // Parent Frame: Scale DOWN and Translate
+                            targetWorldPt = activeFrame.originInParent + (SIMD2<Double>(worldX, worldY) / activeFrame.scaleRelativeToParent)
+                        }
+                    }
+
+                    // D. Card's Frame World → Card Local (subtract card origin, un-rotate by card)
+                    let cardDx = targetWorldPt.x - cardOrigin.x
+                    let cardDy = targetWorldPt.y - cardOrigin.y
 
                     let localX = cardDx * cc - cardDy * ss
                     let localY = cardDx * ss + cardDy * cc
@@ -555,20 +804,66 @@ class Coordinator: NSObject, MTKViewDelegate {
                     return SIMD2<Float>(Float(localX), Float(localY))
                 }
 
-                // Use "magic offset" approach for card strokes
-                let distX = card.origin.x - cameraCenterWorld.x
-                let distY = card.origin.y - cameraCenterWorld.y
-                let c = cos(Double(-card.rotation))
-                let s = sin(Double(-card.rotation))
-                let magicOffsetX = distX * c - distY * s
-                let magicOffsetY = distX * s + distY * c
+                // Calculate transform for cross-depth rendering
+                // Key insight: localPoints are in the card's frame coordinate system
+                // We need to render them with the appropriate zoom for that frame
+                var magicOffsetX: Double
+                var magicOffsetY: Double
+                var renderZoom: Double
+
+                if frame === activeFrame {
+                    // Card is in active frame - use standard approach
+                    let cardRelativeOffset = card.origin - cameraCenterWorld
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    magicOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    magicOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    renderZoom = zoomScale
+
+                } else if let p = activeFrame.parent, frame === p {
+                    // Card is in parent frame
+                    // Convert camera position to parent frame coordinates
+                    let cameraCenterInParent = activeFrame.originInParent + (cameraCenterWorld / activeFrame.scaleRelativeToParent)
+                    let cardRelativeOffset = card.origin - cameraCenterInParent
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    magicOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    magicOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+
+                    // Parent is zoomed IN from our perspective (we see it magnified)
+                    // Use the effective zoom for parent coords
+                    renderZoom = effectiveZoom
+
+                } else if let child = activeFrame.children.first(where: { $0 === frame }) {
+                    // Card is in child frame
+                    // Convert camera position to child frame coordinates
+                    let cameraCenterInChild = (cameraCenterWorld - child.originInParent) * child.scaleRelativeToParent
+                    let cardRelativeOffset = card.origin - cameraCenterInChild
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    magicOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    magicOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+
+                    // Child is zoomed OUT from our perspective (we see it shrunk)
+                    // Use the effective zoom for child coords
+                    renderZoom = effectiveZoom
+
+                } else {
+                    // Fallback
+                    let cardRelativeOffset = card.origin - cameraCenterWorld
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    magicOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    magicOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    renderZoom = zoomScale
+                }
 
                 liveTransform = StrokeTransform(
                     relativeOffset: SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY)),
-                    zoomScale: Float(zoomScale),
+                    zoomScale: Float(renderZoom),  // Use effective zoom for the card's frame!
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
-                    rotationAngle: rotationAngle + card.rotation // Total rotation
+                    rotationAngle: rotationAngle + card.rotation
                 )
             } else {
                 // CANVAS DRAWING: Use original approach
@@ -615,18 +910,61 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             //  If drawing on a card, set up stencil clipping for the live preview
-            if case .card(let card) = currentDrawingTarget {
+            if case .card(let card, let frame) = currentDrawingTarget {
                 // STEP 1: Write card's stencil mask
                 enc.setDepthStencilState(stencilStateWrite)
                 enc.setStencilReferenceValue(1)
                 enc.setRenderPipelineState(cardSolidPipelineState)
 
-                // Calculate card transform
-                let cardRelativeOffset = card.origin - cameraCenterWorld
+                // Calculate card transform - MUST match live stroke transform!
+                // Use the same coordinate system and zoom as the live stroke
+                var stencilOffsetX: Double
+                var stencilOffsetY: Double
+                var stencilZoom: Double
+
+                if frame === activeFrame {
+                    // Card is in active frame
+                    let cardRelativeOffset = card.origin - cameraCenterWorld
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    stencilOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    stencilOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    stencilZoom = zoomScale
+
+                } else if let p = activeFrame.parent, frame === p {
+                    // Card is in parent frame
+                    let cameraCenterInParent = activeFrame.originInParent + (cameraCenterWorld / activeFrame.scaleRelativeToParent)
+                    let cardRelativeOffset = card.origin - cameraCenterInParent
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    stencilOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    stencilOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    stencilZoom = effectiveZoom
+
+                } else if let child = activeFrame.children.first(where: { $0 === frame }) {
+                    // Card is in child frame
+                    let cameraCenterInChild = (cameraCenterWorld - child.originInParent) * child.scaleRelativeToParent
+                    let cardRelativeOffset = card.origin - cameraCenterInChild
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    stencilOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    stencilOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    stencilZoom = effectiveZoom
+
+                } else {
+                    // Fallback
+                    let cardRelativeOffset = card.origin - cameraCenterWorld
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    stencilOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    stencilOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    stencilZoom = zoomScale
+                }
+
                 let cardRotation = rotationAngle + card.rotation
                 var cardTransform = StrokeTransform(
-                    relativeOffset: SIMD2<Float>(Float(cardRelativeOffset.x), Float(cardRelativeOffset.y)),
-                    zoomScale: Float(zoomScale),
+                    relativeOffset: SIMD2<Float>(Float(stencilOffsetX), Float(stencilOffsetY)),
+                    zoomScale: Float(stencilZoom),  // Use effective zoom to match live stroke!
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
                     rotationAngle: cardRotation
@@ -650,7 +988,10 @@ class Coordinator: NSObject, MTKViewDelegate {
                 enc.setStencilReferenceValue(1)
                 enc.setRenderPipelineState(pipelineState)
             } else {
-                // Drawing on canvas - no stencil clipping needed
+                // Drawing on canvas - reset to stroke pipeline
+                // FIX: The recursive renderer may have left cardSolidPipelineState active
+                // after rendering child frame cards. We must explicitly reset to pipelineState.
+                enc.setRenderPipelineState(pipelineState)
                 enc.setDepthStencilState(stencilStateDefault)
             }
 
@@ -672,16 +1013,55 @@ class Coordinator: NSObject, MTKViewDelegate {
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: localVertices.count)
 
             // STEP 3: Clean up stencil if we used it
-            if case .card(let card) = currentDrawingTarget {
+            if case .card(let card, let frame) = currentDrawingTarget {
                 enc.setDepthStencilState(stencilStateClear)
                 enc.setStencilReferenceValue(0)
                 enc.setRenderPipelineState(cardSolidPipelineState)
 
+                // Calculate card transform - MUST match stencil write transform!
+                var stencilOffsetX: Double
+                var stencilOffsetY: Double
+                var stencilZoom: Double
+
+                if frame === activeFrame {
+                    let cardRelativeOffset = card.origin - cameraCenterWorld
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    stencilOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    stencilOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    stencilZoom = zoomScale
+
+                } else if let p = activeFrame.parent, frame === p {
+                    let cameraCenterInParent = activeFrame.originInParent + (cameraCenterWorld / activeFrame.scaleRelativeToParent)
+                    let cardRelativeOffset = card.origin - cameraCenterInParent
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    stencilOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    stencilOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    stencilZoom = effectiveZoom
+
+                } else if let child = activeFrame.children.first(where: { $0 === frame }) {
+                    let cameraCenterInChild = (cameraCenterWorld - child.originInParent) * child.scaleRelativeToParent
+                    let cardRelativeOffset = card.origin - cameraCenterInChild
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    stencilOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    stencilOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    stencilZoom = effectiveZoom
+
+                } else {
+                    let cardRelativeOffset = card.origin - cameraCenterWorld
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    stencilOffsetX = cardRelativeOffset.x * c - cardRelativeOffset.y * s
+                    stencilOffsetY = cardRelativeOffset.x * s + cardRelativeOffset.y * c
+                    stencilZoom = zoomScale
+                }
+
                 // Redraw card quad to clear stencil
                 var cardTransform = StrokeTransform(
-                    relativeOffset: SIMD2<Float>(Float((card.origin - cameraCenterWorld).x),
-                                                 Float((card.origin - cameraCenterWorld).y)),
-                    zoomScale: Float(zoomScale),
+                    relativeOffset: SIMD2<Float>(Float(stencilOffsetX), Float(stencilOffsetY)),
+                    zoomScale: Float(stencilZoom),
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
                     rotationAngle: rotationAngle + card.rotation
@@ -832,6 +1212,48 @@ class Coordinator: NSObject, MTKViewDelegate {
             fatalError("Failed to create solid card pipeline: \(error)")
         }
 
+        // Lined Card Pipeline (Procedural horizontal lines)
+        let linedDesc = MTLRenderPipelineDescriptor()
+        linedDesc.vertexFunction = library.makeFunction(name: "vertex_card")
+        linedDesc.fragmentFunction = library.makeFunction(name: "fragment_card_lined")
+        linedDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        linedDesc.colorAttachments[0].isBlendingEnabled = true
+        linedDesc.colorAttachments[0].rgbBlendOperation = .add
+        linedDesc.colorAttachments[0].alphaBlendOperation = .add
+        linedDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        linedDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        linedDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        linedDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        linedDesc.vertexDescriptor = vertexDesc
+        linedDesc.stencilAttachmentPixelFormat = .stencil8
+
+        do {
+            cardLinedPipelineState = try device.makeRenderPipelineState(descriptor: linedDesc)
+        } catch {
+            fatalError("Failed to create lined card pipeline: \(error)")
+        }
+
+        // Grid Card Pipeline (Procedural horizontal and vertical lines)
+        let gridDesc = MTLRenderPipelineDescriptor()
+        gridDesc.vertexFunction = library.makeFunction(name: "vertex_card")
+        gridDesc.fragmentFunction = library.makeFunction(name: "fragment_card_grid")
+        gridDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        gridDesc.colorAttachments[0].isBlendingEnabled = true
+        gridDesc.colorAttachments[0].rgbBlendOperation = .add
+        gridDesc.colorAttachments[0].alphaBlendOperation = .add
+        gridDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        gridDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        gridDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        gridDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        gridDesc.vertexDescriptor = vertexDesc
+        gridDesc.stencilAttachmentPixelFormat = .stencil8
+
+        do {
+            cardGridPipelineState = try device.makeRenderPipelineState(descriptor: gridDesc)
+        } catch {
+            fatalError("Failed to create grid card pipeline: \(error)")
+        }
+
         // Create Sampler for card textures
         let samplerDesc = MTLSamplerDescriptor()
         samplerDesc.minFilter = .linear
@@ -939,33 +1361,33 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         guard let view = metalView else { return }
 
-        // Calculate World Point (High Precision) for the Frame
-        let worldPoint = screenToWorldPixels_PureDouble(
-            point,
-            viewSize: view.bounds.size,
-            panOffset: panOffset,
-            zoomScale: zoomScale,
-            rotationAngle: rotationAngle
-        )
+        // USE NEW HIERARCHICAL HIT TEST
+        // This checks children (foreground), active frame (middle), and parent (background)
+        if let result = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+            // Found a card (in active, parent, or child frame)
+            // Store BOTH the card AND the frame it belongs to for correct coordinate transforms
+            currentDrawingTarget = .card(result.card, result.frame)
 
-        //  HIT TEST CARDS (Reverse order = Top first)
-        var hitCard: Card? = nil
-        for card in activeFrame.cards.reversed() {
-            if card.hitTest(pointInFrame: worldPoint) {
-                hitCard = card
-                break
-            }
-        }
+            // For live rendering, we need the origin in ACTIVE World Space
+            liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                point,
+                viewSize: view.bounds.size,
+                panOffset: panOffset,
+                zoomScale: zoomScale,
+                rotationAngle: rotationAngle
+            )
 
-        if let card = hitCard {
-            // DRAW ON CARD
-            currentDrawingTarget = .card(card)
-            // For card strokes, we'll transform points into card space later
-            liveStrokeOrigin = worldPoint
         } else {
-            // DRAW ON CANVAS
+            // Draw on Canvas (Active Frame)
             currentDrawingTarget = .canvas(activeFrame)
-            liveStrokeOrigin = worldPoint
+
+            liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                point,
+                viewSize: view.bounds.size,
+                panOffset: panOffset,
+                zoomScale: zoomScale,
+                rotationAngle: rotationAngle
+            )
         }
 
         // Keep points in SCREEN space during drawing
@@ -973,11 +1395,13 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         // Debug tiling system (only when debug mode enabled)
         if tileManager.debugMode {
-            let worldPointCG = CGPoint(x: worldPoint.x, y: worldPoint.y)
-            let tileKey = tileManager.getTileKey(worldPoint: worldPointCG)
-            _ = tileManager.debugInfo(worldPoint: worldPointCG,
-                                      screenPoint: point,
-                                      tileKey: tileKey)
+            if let origin = liveStrokeOrigin {
+                let worldPointCG = CGPoint(x: origin.x, y: origin.y)
+                let tileKey = tileManager.getTileKey(worldPoint: worldPointCG)
+                _ = tileManager.debugInfo(worldPoint: worldPointCG,
+                                          screenPoint: point,
+                                          tileKey: tileKey)
+            }
         }
     }
 
@@ -1111,12 +1535,13 @@ class Coordinator: NSObject, MTKViewDelegate {
                                 device: device)
             frame.strokes.append(stroke)
 
-        case .card(let card):
-            // DRAW ON CARD
-            // Transform points into card-local space so strokes move with the card
+        case .card(let card, let frame):
+            // DRAW ON CARD (Cross-Depth Compatible)
+            // Transform points into card-local space accounting for which frame the card is in
             let cardStroke = createStrokeForCard(
                 screenPoints: smoothScreenPoints,
                 card: card,
+                frame: frame,
                 viewSize: view.bounds.size
             )
             card.strokes.append(cardStroke)
@@ -1139,8 +1564,77 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     // MARK: - Card Management
 
+    /// Hit test across the entire visible hierarchy (Parent -> Active -> Children)
+    /// Returns: The Card, The Frame it belongs to, and the Coordinate Conversion Scale
+    /// The conversion scale is used to translate movement deltas between coordinate systems:
+    ///   - Parent cards: scale < 1.0 (move slower - parent coords are smaller)
+    ///   - Active cards: scale = 1.0 (normal movement)
+    ///   - Child cards: scale > 1.0 (move faster - child coords are larger)
+    func hitTestHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> (card: Card, frame: Frame, conversionScale: Double)? {
+
+        // 1. Calculate Point in Active Frame (World Space)
+        let pointActive = screenToWorldPixels_PureDouble(
+            screenPoint,
+            viewSize: viewSize,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
+
+        // --- CHECK 1: CHILDREN (Foreground - Top Priority) ---
+        // Iterate children (reverse to hit top-most first)
+        for child in activeFrame.children.reversed() {
+            // Convert Active Point -> Child Point
+            // Math: Translate to child origin, then Scale UP (child coords are huge)
+            let pointInChild = (pointActive - child.originInParent) * child.scaleRelativeToParent
+
+            for card in child.cards.reversed() {
+                if card.hitTest(pointInFrame: pointInChild) {
+                    // Conversion: 1 unit in Active = 'scale' units in Child
+                    return (card, child, child.scaleRelativeToParent)
+                }
+            }
+        }
+
+        // --- CHECK 2: ACTIVE FRAME (Middle) ---
+        for card in activeFrame.cards.reversed() {
+            if card.hitTest(pointInFrame: pointActive) {
+                return (card, activeFrame, 1.0)
+            }
+        }
+
+        // --- CHECK 3: PARENT FRAME (Background) ---
+        if let parent = activeFrame.parent {
+            // Convert Active Point -> Parent Point
+            // Math: Scale DOWN (parent coords are small), then Translate to Active's origin in Parent
+            let pointInParent = activeFrame.originInParent + (pointActive / activeFrame.scaleRelativeToParent)
+
+            for card in parent.cards.reversed() {
+                if card.hitTest(pointInFrame: pointInParent) {
+                    // Conversion: 1 unit in Active = (1/scale) units in Parent
+                    return (card, parent, 1.0 / activeFrame.scaleRelativeToParent)
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Handle long press gesture to open card settings
+    /// Uses hierarchical hit testing to find cards at any depth level
+    func handleLongPress(at point: CGPoint) {
+        guard let view = metalView else { return }
+
+        // Use hierarchical hit test to find card at any depth
+        if let result = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+            // Found a card! Notify SwiftUI
+            onEditCard?(result.card)
+        }
+    }
+
     /// Add a new card to the canvas at the camera center
     /// The card will be a solid color and can be selected/dragged/edited
+    /// Cards are created with constant screen size (300pt) regardless of zoom level
     func addCard() {
         guard let view = metalView else {
             return
@@ -1149,22 +1643,31 @@ class Coordinator: NSObject, MTKViewDelegate {
         // 1. Calculate camera center in world coordinates (where the user is looking)
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
 
-        // 2. Create card at camera center with reasonable size
-        // Size is in world units - at 1.0 zoom, this is ~300x200 pixels (increased for visibility)
-        let cardSize = SIMD2<Double>(300.0, 200.0)
+        // 2. Define Desired Screen Size (e.g., 300x200 points)
+        // This ensures the card looks the same size to the user whether they are at 1x or 1000x zoom
+        let screenWidth: Double = 300.0
+        let screenHeight: Double = 200.0
 
-        // 3. Use neon pink for high visibility against cyan background
+        // 3. Convert to World Units
+        // world = screen / zoom
+        let worldW = screenWidth / zoomScale
+        let worldH = screenHeight / zoomScale
+        let cardSize = SIMD2<Double>(worldW, worldH)
+
+        // 4. Use neon pink for high visibility against cyan background
         let neonPink = SIMD4<Float>(1.0, 0.0, 1.0, 1.0)  // Bright magenta
 
-        // 4. Create the card
+        // 5. Create the card (Default to Solid Color for now)
+        // Capture current zoom so the card can correctly scale procedural backgrounds
         let card = Card(
             origin: cameraCenterWorld,
             size: cardSize,
             rotation: 0,
+            zoom: zoomScale, // Capture current zoom!
             type: .solidColor(neonPink)
         )
 
-        // 5. Add to active frame
+        // 6. Add to active frame
         activeFrame.cards.append(card)
     }
 
@@ -1172,29 +1675,61 @@ class Coordinator: NSObject, MTKViewDelegate {
     /// Transforms screen-space points into the card's local coordinate system
     /// This ensures the stroke "sticks" to the card when it's moved or rotated
     ///
+    /// **CROSS-DEPTH COMPATIBLE:**
+    /// This method now supports drawing on cards in different frames (Parent/Active/Child).
+    /// It determines the scale factor between the active frame and the target frame,
+    /// then applies the appropriate coordinate transforms.
+    ///
     /// - Parameters:
     ///   - screenPoints: Raw screen-space touch points
     ///   - card: The card to draw on
+    ///   - frame: The frame the card belongs to (may be parent, active, or child)
     ///   - viewSize: Screen dimensions
     /// - Returns: A stroke with points relative to card center
-    func createStrokeForCard(screenPoints: [CGPoint], card: Card, viewSize: CGSize) -> Stroke {
-        // 1. Get the Card's World Position & Rotation (in the current Frame)
+    func createStrokeForCard(screenPoints: [CGPoint], card: Card, frame: Frame, viewSize: CGSize) -> Stroke {
+        // 1. Get the Card's World Position & Rotation (in its Frame)
         let cardOrigin = card.origin
         let cardRot = Double(card.rotation)
 
-        // Pre-calculate rotation trig
-        let c = cos(-cardRot) // Inverse rotation to un-apply card angle
+        // Pre-calculate rotation trig (inverse rotation to convert to card-local)
+        let c = cos(-cardRot)
         let s = sin(-cardRot)
 
-        // 2. Transform Screen Points -> Card Local Points
-        // We effectively treat the Card as a temporary "Universe" for these points
+        // 2. Determine Scale Factor (Active -> Card's Frame)
+        // This tells us how to convert coordinates from active frame to the card's frame
+        var frameScale: Double = 1.0
+        if frame === activeFrame {
+            // Card is in active frame - no scaling needed
+            frameScale = 1.0
+        } else if let p = activeFrame.parent, frame === p {
+            // Card is in parent frame - parent coords are smaller, so scale down
+            frameScale = 1.0 / activeFrame.scaleRelativeToParent
+        } else if activeFrame.children.contains(where: { $0 === frame }) {
+            // Card is in child frame - child coords are larger, so scale up
+            frameScale = frame.scaleRelativeToParent
+        }
+
+        // 3. Calculate Effective Zoom for the Card's Frame
+        // This is critical for cross-depth drawing
+        var effectiveZoom: Double
+        if frame === activeFrame {
+            effectiveZoom = zoomScale
+        } else if let p = activeFrame.parent, frame === p {
+            // Parent frame is zoomed IN from our perspective
+            effectiveZoom = zoomScale * activeFrame.scaleRelativeToParent
+        } else if let child = activeFrame.children.first(where: { $0 === frame }) {
+            // Child frame is zoomed OUT from our perspective
+            effectiveZoom = zoomScale / child.scaleRelativeToParent
+        } else {
+            effectiveZoom = zoomScale
+        }
+
+        // 4. Transform Screen Points -> Card Local Points
         var cardLocalPoints: [CGPoint] = []
-        let currentZoom = Double(zoomScale) // Capture current zoom
 
         for screenPt in screenPoints {
-            // A. Screen -> Frame World (Standard conversion)
-            // This divides by zoom to get world units
-            let worldPt = screenToWorldPixels_PureDouble(
+            // A. Screen -> Active World (Standard conversion)
+            let worldPtActive = screenToWorldPixels_PureDouble(
                 screenPt,
                 viewSize: viewSize,
                 panOffset: panOffset,
@@ -1202,34 +1737,38 @@ class Coordinator: NSObject, MTKViewDelegate {
                 rotationAngle: rotationAngle
             )
 
-            // B. Frame World -> Card Local (World Units)
-            // Translate (Subtract Card Origin)
-            let dx = worldPt.x - cardOrigin.x
-            let dy = worldPt.y - cardOrigin.y
+            // B. Active World -> Card's Frame World (Apply scale transform)
+            var targetWorldPt = worldPtActive
+            if frame !== activeFrame {
+                if frameScale > 1.0 {
+                    // Child Frame: Translate and Scale UP
+                    targetWorldPt = (worldPtActive - frame.originInParent) * frame.scaleRelativeToParent
+                } else {
+                    // Parent Frame: Scale DOWN and Translate
+                    targetWorldPt = activeFrame.originInParent + (worldPtActive / activeFrame.scaleRelativeToParent)
+                }
+            }
 
-            // Rotate (Un-rotate by Card Rotation)
-            // x' = x*c - y*s
-            // y' = x*s + y*c
+            // C. Card's Frame World -> Card Local (Translate and Rotate)
+            let dx = targetWorldPt.x - cardOrigin.x
+            let dy = targetWorldPt.y - cardOrigin.y
+
             let localX = dx * c - dy * s
             let localY = dx * s + dy * c
 
-            //  CRITICAL FIX: Scale up to "virtual screen space"
-            // We multiply by zoom so when Stroke.init divides by zoom,
-            // we get back to world units (localX, localY).
-            // This allows Stroke.init to correctly calculate stroke width (10.0 / zoom).
-            let virtualScreenX = localX * currentZoom
-            let virtualScreenY = localY * currentZoom
+            //  CRITICAL: Scale up to "virtual screen space"
+            // We multiply by EFFECTIVE zoom so when Stroke.init divides by it,
+            // we get back to world units (localX, localY) in the card's frame.
+            let virtualScreenX = localX * effectiveZoom
+            let virtualScreenY = localY * effectiveZoom
 
             cardLocalPoints.append(CGPoint(x: virtualScreenX, y: virtualScreenY))
         }
 
-        // 3. Create the Stroke
-        //  The math:
-        // - Geometry: (WorldPos * Zoom) / Zoom = WorldPos  Correct position
-        // - Width: brushSettings.size / Zoom = Correct world width
+        // 5. Create the Stroke with Effective Zoom
         return Stroke(
-            screenPoints: cardLocalPoints,   // Virtual screen space (world units * zoom)
-            zoomAtCreation: zoomScale,       // Actual zoom (will divide, canceling multiply)
+            screenPoints: cardLocalPoints,   // Virtual screen space (world units * effectiveZoom)
+            zoomAtCreation: effectiveZoom,   // Use effective zoom for the card's frame!
             panAtCreation: .zero,            // We handled position manually
             viewSize: .zero,                 // We handled centering manually
             rotationAngle: 0,                // We handled rotation manually
