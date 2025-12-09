@@ -10,6 +10,8 @@ struct StrokeTransform {
     float screenWidth;      // Screen dimensions for NDC conversion
     float screenHeight;
     float rotationAngle;    // Camera rotation
+    float halfPixelWidth;   // Half of desired stroke width in pixels
+    uint vertexCount;       // Total vertices in the strip (for safe neighbor lookup)
 };
 
 /// Vertex input for batched stroke rendering
@@ -26,23 +28,40 @@ struct VertexOut {
     float4 color;
 };
 
-vertex VertexOut vertex_main(VertexIn in [[stage_in]],
+vertex VertexOut vertex_main(const device VertexIn *vertices [[buffer(0)]],
+                             uint vid [[vertex_id]],
                              constant StrokeTransform *transform [[buffer(1)]]) {
-    // Step 1: Apply Floating Origin offset (GPU does the math now)
-    float2 worldRelative = in.position + transform->relativeOffset;
+    VertexIn in = vertices[vid];
 
-    // Step 2: Rotation around camera center (0,0)
-    float c = cos(transform->rotationAngle);
-    float s = sin(transform->rotationAngle);
-    float rotX = worldRelative.x * c - worldRelative.y * s;
-    float rotY = worldRelative.x * s + worldRelative.y * c;
+    // Helper to transform a centerline position into screen space (pixels)
+    auto toScreen = ^(float2 position) {
+        float2 worldRelative = position + transform->relativeOffset;
+        float c = cos(transform->rotationAngle);
+        float s = sin(transform->rotationAngle);
+        float rotX = worldRelative.x * c - worldRelative.y * s;
+        float rotY = worldRelative.x * s + worldRelative.y * c;
+        return float2(rotX, rotY) * transform->zoomScale;
+    };
 
-    // Step 3: Zoom - Scale by zoom factor
-    float2 zoomed = float2(rotX, rotY) * transform->zoomScale;
+    uint sampleIndex = vid / 2;              // Two vertices per center sample
+    uint baseIndex = sampleIndex * 2;        // Even index stores the center position we need
+    uint totalSamples = max<uint>(1, transform->vertexCount / 2);
+    uint prevSample = sampleIndex > 0 ? sampleIndex - 1 : 0;
+    uint nextSample = min(sampleIndex + 1, totalSamples - 1);
 
-    // Step 4: Projection - Convert to NDC [-1, 1]
-    float ndcX = (zoomed.x / transform->screenWidth) * 2.0;
-    float ndcY = -(zoomed.y / transform->screenHeight) * 2.0;
+    float2 prevPos = toScreen(vertices[prevSample * 2].position);
+    float2 currPos = toScreen(vertices[baseIndex].position);
+    float2 nextPos = toScreen(vertices[nextSample * 2].position);
+
+    float2 tangent = nextPos - prevPos;
+    float len = length(tangent);
+    float2 normal = len > 1e-5 ? float2(-tangent.y, tangent.x) / len : float2(0.0, 1.0);
+
+    // Extrude in screen space before projecting to NDC
+    float2 extruded = currPos + normal * (transform->halfPixelWidth * in.uv.y);
+
+    float ndcX = (extruded.x / transform->screenWidth) * 2.0;
+    float ndcY = -(extruded.y / transform->screenHeight) * 2.0;
 
     VertexOut out;
     out.position = float4(ndcX, ndcY, 0.0, 1.0);

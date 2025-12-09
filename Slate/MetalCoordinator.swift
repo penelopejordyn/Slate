@@ -201,7 +201,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                 zoomScale: Float(currentZoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
-                rotationAngle: currentRotation
+                rotationAngle: currentRotation,
+                halfPixelWidth: Float(stroke.worldWidth * currentZoom * 0.5),
+                vertexCount: UInt32(stroke.localVertices.count)
             )
 
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -365,7 +367,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                         zoomScale: Float(currentZoom),
                         screenWidth: Float(viewSize.width),
                         screenHeight: Float(viewSize.height),
-                        rotationAngle: totalRotation
+                        rotationAngle: totalRotation,
+                        halfPixelWidth: Float(stroke.worldWidth * currentZoom * 0.5),
+                        vertexCount: UInt32(stroke.localVertices.count)
                     )
 
                     encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -451,7 +455,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                     zoomScale: Float(childZoom),
                     screenWidth: Float(viewSize.width),
                     screenHeight: Float(viewSize.height),
-                    rotationAngle: currentRotation
+                    rotationAngle: currentRotation,
+                    halfPixelWidth: Float(stroke.worldWidth * childZoom * 0.5),
+                    vertexCount: UInt32(stroke.localVertices.count)
                 )
 
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -596,7 +602,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                             zoomScale: Float(childZoom),
                             screenWidth: Float(viewSize.width),
                             screenHeight: Float(viewSize.height),
-                            rotationAngle: totalRot
+                            rotationAngle: totalRot,
+                            halfPixelWidth: Float(stroke.worldWidth * childZoom * 0.5),
+                            vertexCount: UInt32(stroke.localVertices.count)
                         )
 
                         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -879,7 +887,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                 zoomScale: Float(zoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
-                rotationAngle: rotation
+                rotationAngle: rotation,
+                halfPixelWidth: 0,
+                vertexCount: UInt32(handleVertices.count)
             )
 
             // Create buffer and draw
@@ -962,6 +972,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             var localPoints: [SIMD2<Float>]
             var liveTransform: StrokeTransform
             var liveRelativeOffset: SIMD2<Float>
+            var strokeZoomForWidth: Double = zoom
 
             //  Handle card vs canvas drawing differently
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -1093,8 +1104,11 @@ class Coordinator: NSObject, MTKViewDelegate {
                     zoomScale: Float(renderZoom),  // Use effective zoom for the card's frame!
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
-                    rotationAngle: rotationAngle + card.rotation
+                    rotationAngle: rotationAngle + card.rotation,
+                    halfPixelWidth: 0,
+                    vertexCount: 0
                 )
+                strokeZoomForWidth = renderZoom
             } else {
                 // CANVAS DRAWING: Use original approach
                 let firstScreenPt = currentTouchPoints[0]  // Origin is always the REAL first point
@@ -1123,8 +1137,11 @@ class Coordinator: NSObject, MTKViewDelegate {
                     zoomScale: Float(zoomScale),
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
-                    rotationAngle: rotationAngle
+                    rotationAngle: rotationAngle,
+                    halfPixelWidth: 0,
+                    vertexCount: 0
                 )
+                strokeZoomForWidth = zoomScale
             }
 
             // Tessellate in LOCAL space
@@ -1140,6 +1157,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                 commandBuffer.commit()
                 return
             }
+
+            liveTransform.halfPixelWidth = Float(worldWidth * strokeZoomForWidth * 0.5)
+            liveTransform.vertexCount = UInt32(localVertices.count)
 
             //  If drawing on a card, set up stencil clipping for the live preview
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -1231,8 +1251,8 @@ class Coordinator: NSObject, MTKViewDelegate {
             let livePrimitive: MTLPrimitiveType = localPoints.count > 1 ? .triangleStrip : .triangle
 
             let vertexBuffer = device.makeBuffer(
-                bytes: liveStrokeVertices,
-                length: liveStrokeVertices.count * MemoryLayout<StrokeVertex>.stride,
+                bytes: localVertices,
+                length: localVertices.count * MemoryLayout<StrokeVertex>.stride,
                 options: .storageModeShared
             )
 
