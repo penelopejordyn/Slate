@@ -182,14 +182,14 @@ class Coordinator: NSObject, MTKViewDelegate {
             let relativeOffsetDouble = stroke.origin - cameraCenterInThisFrame
             let ranges = stroke.visibleVertexRanges(relativeOffset: relativeOffsetDouble,
                                                    zoomScale: currentZoom,
-                                                   cullRadius: cullRadius)
+                                                   cullRadius: cullRadius) { vertexCount in
+                self.debugDrawnVerticesThisFrame += vertexCount
+                self.debugDrawnNodesThisFrame += 1
+            }
             if ranges.isEmpty {
                 culledStrokes += 1
                 continue // CULL!
             }
-
-            debugDrawnVerticesThisFrame += stroke.localVertices.count
-            debugDrawnNodesThisFrame += stroke.flatNodes.count
 
             let relativeOffset = SIMD2<Float>(
                 Float(relativeOffsetDouble.x),
@@ -352,15 +352,15 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                     let ranges = stroke.visibleVertexRanges(relativeOffset: strokeRelativeOffsetDouble,
                                                            zoomScale: currentZoom,
-                                                           cullRadius: cullRadius)
+                                                           cullRadius: cullRadius) { vertexCount in
+                        self.debugDrawnVerticesThisFrame += vertexCount
+                        self.debugDrawnNodesThisFrame += 1
+                    }
 
                     if ranges.isEmpty { continue }
 
                     let strokeRelativeOffset = SIMD2<Float>(Float(strokeRelativeOffsetDouble.x),
                                                             Float(strokeRelativeOffsetDouble.y))
-
-                    debugDrawnVerticesThisFrame += stroke.localVertices.count
-                    debugDrawnNodesThisFrame += stroke.flatNodes.count
 
                     var strokeTransform = StrokeTransform(
                         relativeOffset: strokeRelativeOffset,
@@ -441,13 +441,13 @@ class Coordinator: NSObject, MTKViewDelegate {
                 let totalRelativeOffset = stroke.origin + frameOffsetInChildUnits
                 let ranges = stroke.visibleVertexRanges(relativeOffset: totalRelativeOffset,
                                                         zoomScale: childZoom,
-                                                        cullRadius: cullRadius)
+                                                        cullRadius: cullRadius) { vertexCount in
+                    self.debugDrawnVerticesThisFrame += vertexCount
+                    self.debugDrawnNodesThisFrame += 1
+                }
                 if ranges.isEmpty {
                     continue // Cull!
                 }
-
-                debugDrawnVerticesThisFrame += stroke.localVertices.count
-                debugDrawnNodesThisFrame += stroke.flatNodes.count
 
                 let childRelativeOffset = SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y))
                 var childTransform = StrokeTransform(
@@ -578,9 +578,6 @@ class Coordinator: NSObject, MTKViewDelegate {
                     for stroke in card.strokes {
                         guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
 
-                        debugDrawnVerticesThisFrame += stroke.localVertices.count
-                        debugDrawnNodesThisFrame += stroke.flatNodes.count
-
                         // Transform Stroke Origin: Card Local -> Frame Local -> Camera Relative
                         let sx = stroke.origin.x
                         let sy = stroke.origin.y
@@ -591,7 +588,10 @@ class Coordinator: NSObject, MTKViewDelegate {
                         let strokePos = totalRelativeOffset + SIMD2<Double>(rotX, rotY)
                         let ranges = stroke.visibleVertexRanges(relativeOffset: strokePos,
                                                                 zoomScale: childZoom,
-                                                                cullRadius: cullRadius)
+                                                                cullRadius: cullRadius) { vertexCount in
+                            self.debugDrawnVerticesThisFrame += vertexCount
+                            self.debugDrawnNodesThisFrame += 1
+                        }
 
                         if ranges.isEmpty { continue }
 
