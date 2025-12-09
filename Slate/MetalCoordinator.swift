@@ -786,7 +786,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                     zoomScale: Float(tileZoom),
                     screenWidth: Float(Frame.tileTextureSize),
                     screenHeight: Float(Frame.tileTextureSize),
-                    rotationAngle: 0
+                    rotationAngle: 0,
+                    halfPixelWidth: Float(stroke.worldWidth * tileZoom * 0.5),
+                    vertexCount: UInt32(stroke.localVertices.count)
                 )
 
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -1159,7 +1161,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             liveTransform.halfPixelWidth = Float(worldWidth * strokeZoomForWidth * 0.5)
-            liveTransform.vertexCount = UInt32(localVertices.count)
+            liveTransform.vertexCount = UInt32(liveStrokeVertices.count)
 
             //  If drawing on a card, set up stencil clipping for the live preview
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -1251,8 +1253,8 @@ class Coordinator: NSObject, MTKViewDelegate {
             let livePrimitive: MTLPrimitiveType = localPoints.count > 1 ? .triangleStrip : .triangle
 
             let vertexBuffer = device.makeBuffer(
-                bytes: localVertices,
-                length: localVertices.count * MemoryLayout<StrokeVertex>.stride,
+                bytes: liveStrokeVertices,
+                length: liveStrokeVertices.count * MemoryLayout<StrokeVertex>.stride,
                 options: .storageModeShared
             )
 

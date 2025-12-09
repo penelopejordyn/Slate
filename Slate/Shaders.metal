@@ -44,7 +44,7 @@ vertex VertexOut vertex_main(const device VertexIn *vertices [[buffer(0)]],
 
     uint sampleIndex = vid / 2;              // Two vertices per center sample
     uint baseIndex = sampleIndex * 2;        // Even index stores the center position we need
-    uint totalSamples = max<uint>(1, transform->vertexCount / 2);
+    uint totalSamples = max(1u, transform->vertexCount / 2);
     uint prevSample = sampleIndex > 0 ? sampleIndex - 1 : 0;
     uint nextSample = min(sampleIndex + 1, totalSamples - 1);
 
