@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import Metal
 
 /// A Frame represents a bounded coordinate system (a "Local Universe").
 ///
@@ -43,6 +44,32 @@ class Frame: Identifiable {
     /// This allows us to re-enter existing frames instead of creating parallel universes
     var children: [Frame] = []
 
+    // MARK: - Tile Caching (Canvas Baking)
+
+    /// Tile key in world space. Level is reserved for future LOD tiers.
+    struct TileKey: Hashable {
+        let x: Int
+        let y: Int
+        let level: Int
+    }
+
+    /// Cached tile texture and dirtiness flag.
+    struct Tile {
+        var texture: MTLTexture?
+        var dirty: Bool
+        let key: TileKey
+        let worldRect: CGRect
+    }
+
+    /// Fixed world-space tile size (width/height in frame units).
+    static let tileWorldSize: Double = 1024.0
+
+    /// Fixed resolution used when baking to textures.
+    static let tileTextureSize: Int = 512
+
+    /// Sparse grid of baked tiles keyed by integer tile coordinates.
+    var tiles: [TileKey: Tile] = [:]
+
     /// Initialize a new Frame
     /// - Parameters:
     ///   - parent: The containing universe (nil for root)
@@ -52,5 +79,64 @@ class Frame: Identifiable {
         self.parent = parent
         self.originInParent = origin
         self.scaleRelativeToParent = scale
+    }
+
+    // MARK: - Tile Helpers
+
+    /// Calculate the world rect for a given tile key.
+    func worldRect(for key: TileKey) -> CGRect {
+        let origin = CGPoint(
+            x: Double(key.x) * Frame.tileWorldSize,
+            y: Double(key.y) * Frame.tileWorldSize
+        )
+        let size = CGSize(width: Frame.tileWorldSize, height: Frame.tileWorldSize)
+        return CGRect(origin: origin, size: size)
+    }
+
+    /// Get the tile key for a world position.
+    func tileKey(for position: SIMD2<Double>, level: Int = 0) -> TileKey {
+        let x = Int(floor(position.x / Frame.tileWorldSize))
+        let y = Int(floor(position.y / Frame.tileWorldSize))
+        return TileKey(x: x, y: y, level: level)
+    }
+
+    /// Find all tile keys that overlap the provided world rect.
+    func tileKeys(overlapping rect: CGRect, level: Int = 0) -> [TileKey] {
+        guard rect.width > 0, rect.height > 0 else { return [] }
+        let minX = Int(floor(rect.minX / Frame.tileWorldSize))
+        let maxX = Int(floor(rect.maxX / Frame.tileWorldSize))
+        let minY = Int(floor(rect.minY / Frame.tileWorldSize))
+        let maxY = Int(floor(rect.maxY / Frame.tileWorldSize))
+
+        var keys: [TileKey] = []
+        for x in minX...maxX {
+            for y in minY...maxY {
+                keys.append(TileKey(x: x, y: y, level: level))
+            }
+        }
+        return keys
+    }
+
+    /// Mark tiles intersecting the stroke as dirty so they are re-baked.
+    func markTilesDirty(for stroke: Stroke) {
+        let bounds = stroke.localBounds
+        let rect = CGRect(
+            x: stroke.origin.x + Double(bounds.origin.x),
+            y: stroke.origin.y + Double(bounds.origin.y),
+            width: Double(bounds.width),
+            height: Double(bounds.height)
+        )
+
+        for key in tileKeys(overlapping: rect) {
+            let tileRect = worldRect(for: key)
+            let existing = tiles[key]
+            let newTile = Tile(
+                texture: existing?.texture,
+                dirty: true,
+                key: key,
+                worldRect: tileRect
+            )
+            tiles[key] = newTile
+        }
     }
 }
