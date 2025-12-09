@@ -125,22 +125,54 @@ class Coordinator: NSObject, MTKViewDelegate {
         // LAYER 2: RENDER THIS FRAME (Middle Layer - Depth 0) --------------------------
 
         // 2.1: RENDER CANVAS STROKES (Background layer - below cards)
-        //  OPTIMIZATION: Calculate visible rect for frustum culling
-        // Camera is at (0,0) in relative space, so visible area extends ±halfWidth/halfHeight
-        let halfW = Double(viewSize.width) / 2.0 / currentZoom
-        let halfH = Double(viewSize.height) / 2.0 / currentZoom
-        let visibleRect = CGRect(x: -halfW, y: -halfH, width: halfW * 2, height: halfH * 2)
+        // SCREEN SPACE CULLING FIX:
+        // Instead of calculating world bounds (which fail at extreme zoom), we calculate
+        // the "Maximum Visible Radius" from the screen center in screen-space pixels.
+        // This is numerically stable at all zoom levels because screen dimensions are constant.
+
+        let screenW = Double(viewSize.width)
+        let screenH = Double(viewSize.height)
+
+        // Distance from screen center to corner (diagonal)
+        let screenRadius = sqrt(screenW * screenW + screenH * screenH) * 0.5
+
+        // Apply Culling Multiplier for testing
+        let cullRadius = screenRadius * brushSettings.cullingMultiplier
+
+        // DEBUG: Track culling stats
+        var totalStrokes = 0
+        var culledStrokes = 0
 
         encoder.setRenderPipelineState(pipelineState)
         for stroke in frame.strokes {
             guard !stroke.localVertices.isEmpty else { continue }
+            totalStrokes += 1
 
             let relativeOffsetDouble = stroke.origin - cameraCenterInThisFrame
 
-            //  OPTIMIZATION: Frustum Culling
-            // Skip strokes that are completely off-screen
-            let strokeRect = stroke.localBounds.offsetBy(dx: relativeOffsetDouble.x, dy: relativeOffsetDouble.y)
-            guard visibleRect.intersects(strokeRect) else { continue }
+            // SCREEN SPACE CULLING: Check if stroke is visible
+            // Calculate stroke center position relative to camera
+            let boundsCenter = SIMD2<Double>(stroke.localBounds.midX, stroke.localBounds.midY)
+            let worldCenter = relativeOffsetDouble + boundsCenter
+            let distWorld = sqrt(worldCenter.x * worldCenter.x + worldCenter.y * worldCenter.y)
+
+            // Convert distance to screen pixels
+            let distScreen = distWorld * currentZoom
+
+            // Calculate stroke radius in screen space
+            let strokeRadiusWorld = sqrt(pow(stroke.localBounds.width, 2) + pow(stroke.localBounds.height, 2)) * 0.5
+            let strokeRadiusScreen = strokeRadiusWorld * currentZoom
+
+            // DEBUG: Print first 3 strokes
+            if totalStrokes <= 3 {
+                print("  Stroke #\(totalStrokes): distScreen=\(Int(distScreen))px, strokeRadius=\(Int(strokeRadiusScreen))px, test=\(Int(distScreen - strokeRadiusScreen))px vs cullRadius=\(Int(cullRadius))px -> \((distScreen - strokeRadiusScreen) > cullRadius ? "CULLED" : "VISIBLE")")
+            }
+
+            // Cull if stroke is beyond screen radius
+            if (distScreen - strokeRadiusScreen) > cullRadius {
+                culledStrokes += 1
+                continue // CULL!
+            }
 
             let relativeOffset = SIMD2<Float>(
                 Float(relativeOffsetDouble.x),
@@ -155,14 +187,30 @@ class Coordinator: NSObject, MTKViewDelegate {
                 rotationAngle: currentRotation
             )
 
-            drawStroke(stroke, with: &transform, visibleRect: visibleRect, encoder: encoder)
+            drawStroke(stroke, with: &transform, viewSize: viewSize, encoder: encoder)
         }
 
-        // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes) 
+        // DEBUG: Print culling stats
+        if totalStrokes > 0 {
+            print("🔍 CULLING: \(culledStrokes)/\(totalStrokes) strokes culled (\(Int((Double(culledStrokes)/Double(totalStrokes))*100))%) | cullRadius: \(Int(cullRadius))px | screenRadius: \(Int(screenRadius))px | multiplier: \(String(format: "%.2f", brushSettings.cullingMultiplier))x | zoom: \(String(format: "%.2f", currentZoom))x")
+        }
+
+        // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
         for card in frame.cards {
             // A. Calculate Position
             // Card lives in the Frame, so it moves with the Frame
             let relativeOffsetDouble = card.origin - cameraCenterInThisFrame
+
+            // SCREEN SPACE CULLING for cards
+            let distWorld = sqrt(relativeOffsetDouble.x * relativeOffsetDouble.x + relativeOffsetDouble.y * relativeOffsetDouble.y)
+            let distScreen = distWorld * currentZoom
+            let cardRadiusWorld = sqrt(pow(card.size.x, 2) + pow(card.size.y, 2)) * 0.5
+            let cardRadiusScreen = cardRadiusWorld * currentZoom
+
+            if (distScreen - cardRadiusScreen) > cullRadius {
+                continue // Cull card
+            }
+
             let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x), Float(relativeOffsetDouble.y))
 
             // B. Handle Rotation
@@ -287,7 +335,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                         screenHeight: Float(viewSize.height),
                         rotationAngle: totalRotation
                     )
-                    drawStroke(stroke, with: &strokeTransform, visibleRect: visibleRect, encoder: encoder)
+                    drawStroke(stroke, with: &strokeTransform, viewSize: viewSize, encoder: encoder)
                 }
             }
 
@@ -344,19 +392,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             // (Because the shader multiplies everything by childZoom, we must pre-scale the offset up)
             let frameOffsetInChildUnits = frameOffsetInParentUnits * child.scaleRelativeToParent
 
-            //  FIX CULLING: Scale Visible Rect to Child Space
-            // Because strokes in the child are scaled up (by 1000x or more), we must scale
-            // the culling rect up to match them, otherwise they are culled falsely.
-            // Example: Stroke at (100,000) checking against (500) fails.
-            //          Stroke at (100,000) checking against (500,000) passes.
-            let childVisibleRect = CGRect(
-                x: visibleRect.origin.x * child.scaleRelativeToParent,
-                y: visibleRect.origin.y * child.scaleRelativeToParent,
-                width: visibleRect.width * child.scaleRelativeToParent,
-                height: visibleRect.height * child.scaleRelativeToParent
-            )
-
-            // 4. Render each stroke individually
+            // 4. Render each stroke individually with screen-space culling
             for stroke in child.strokes {
                 guard !stroke.localVertices.isEmpty else { continue }
 
@@ -364,11 +400,19 @@ class Coordinator: NSObject, MTKViewDelegate {
                 // Before, this was missing 'stroke.origin', collapsing everything to (0,0)
                 let totalRelativeOffset = stroke.origin + frameOffsetInChildUnits
 
-                //  OPTIMIZATION: Frustum Culling for child strokes
-                // Skip child strokes that are completely off-screen
-                // Use SCALED visible rect for correct culling!
-                let strokeRect = stroke.localBounds.offsetBy(dx: totalRelativeOffset.x, dy: totalRelativeOffset.y)
-                guard childVisibleRect.intersects(strokeRect) else { continue }
+                // SCREEN SPACE CULLING for child strokes
+                // Note: Distances are in Child World Units, Zoom is Child Zoom
+                let boundsCenter = SIMD2<Double>(stroke.localBounds.midX, stroke.localBounds.midY)
+                let worldCenter = totalRelativeOffset + boundsCenter
+                let distWorld = sqrt(worldCenter.x * worldCenter.x + worldCenter.y * worldCenter.y)
+                let distScreen = distWorld * childZoom
+
+                let strokeRadiusWorld = sqrt(pow(stroke.localBounds.width, 2) + pow(stroke.localBounds.height, 2)) * 0.5
+                let strokeRadiusScreen = strokeRadiusWorld * childZoom
+
+                if (distScreen - strokeRadiusScreen) > cullRadius {
+                    continue // Cull!
+                }
 
                 var childTransform = StrokeTransform(
                     relativeOffset: SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y)),
@@ -378,7 +422,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                     rotationAngle: currentRotation
                 )
 
-                drawStroke(stroke, with: &childTransform, visibleRect: childVisibleRect, encoder: encoder)
+                drawStroke(stroke, with: &childTransform, viewSize: viewSize, encoder: encoder)
             }
 
             // 5. Render Child Cards (Same logic as Layer 2, but with childZoom)
@@ -386,6 +430,16 @@ class Coordinator: NSObject, MTKViewDelegate {
                 // 1. Calculate Relative Position
                 // Same logic as strokes: Frame Offset + Card Origin
                 let totalRelativeOffset = card.origin + frameOffsetInChildUnits
+
+                // SCREEN SPACE CULLING for child cards
+                let distWorld = sqrt(totalRelativeOffset.x * totalRelativeOffset.x + totalRelativeOffset.y * totalRelativeOffset.y)
+                let distScreen = distWorld * childZoom
+                let cardRadiusWorld = sqrt(pow(card.size.x, 2) + pow(card.size.y, 2)) * 0.5
+                let cardRadiusScreen = cardRadiusWorld * childZoom
+
+                if (distScreen - cardRadiusScreen) > cullRadius {
+                    continue // Cull child card
+                }
 
                 // 2. Setup Transform
                 let relativeOffset = SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y))
@@ -501,7 +555,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                             rotationAngle: totalRot
                         )
 
-                        drawStroke(stroke, with: &strokeTrans, visibleRect: childVisibleRect, encoder: encoder)
+                        drawStroke(stroke, with: &strokeTrans, viewSize: viewSize, encoder: encoder)
                     }
                 }
 
@@ -524,10 +578,10 @@ class Coordinator: NSObject, MTKViewDelegate {
     /// Helper to draw a stroke with a given transform.
     /// Reduces code duplication across parent/current/child rendering.
     ///  OPTIMIZATION: Now uses cached vertex buffer and chunk-based culling
-    func drawStroke(_ stroke: Stroke, with transform: inout StrokeTransform, visibleRect: CGRect, encoder: MTLRenderCommandEncoder) {
+    func drawStroke(_ stroke: Stroke, with transform: inout StrokeTransform, viewSize: CGSize, encoder: MTLRenderCommandEncoder) {
         //  USE CACHED BUFFER
         // The stroke's buffer was created once in init, not 60 times per second here
-        guard let vertexBuffer = stroke.vertexBuffer else { return }
+        guard let vertexBuffer = stroke.vertexBuffer, let root = stroke.rootNode else { return }
 
         // Bind the cached vertex buffer once
         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -535,25 +589,83 @@ class Coordinator: NSObject, MTKViewDelegate {
         // Bind the transform once (small, can use setVertexBytes instead of makeBuffer)
         encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
-        // Calculate the stroke's offset in world space
+        // Bind the stroke color
+        var strokeColor = stroke.color
+        encoder.setFragmentBytes(&strokeColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
+        // Pre-calculate projection constants for Culling
+        let zoom = Double(transform.zoomScale)
         let offsetX = Double(transform.relativeOffset.x)
         let offsetY = Double(transform.relativeOffset.y)
+        let rotation = Double(transform.rotationAngle)
+        let c = cos(rotation)
+        let s = sin(rotation)
+        let halfScreenW = Double(viewSize.width) / 2.0
+        let halfScreenH = Double(viewSize.height) / 2.0
 
-        //  OPTIMIZATION: Chunk-based Culling
-        // Only render chunks that are visible on screen
-        for chunk in stroke.chunks {
-            // Transform chunk bounds to world space
-            let chunkWorldBounds = chunk.boundingBox.offsetBy(dx: offsetX, dy: offsetY)
+        let screenRect = CGRect(x: 0, y: 0, width: Double(viewSize.width), height: Double(viewSize.height))
 
-            // Only draw this chunk if it's visible
-            if visibleRect.intersects(chunkWorldBounds) {
-                encoder.drawPrimitives(
-                    type: .triangle,
-                    vertexStart: chunk.vertexStart,
-                    vertexCount: chunk.vertexCount
-                )
+        // DEBUG: Track BVH traversal
+        var nodesVisited = 0
+        var nodesCulled = 0
+        var leavesDrawn = 0
+
+        // Recursive BVH Traversal Function
+        func traverseAndDraw(_ node: StrokeBVHNode) {
+            nodesVisited += 1
+
+            // 1. CULLING: Check if this Node's bounds intersect the screen
+            // If the parent is off-screen, we skip ALL its children instantly.
+
+            // Project Node Center
+            let midX = node.bounds.midX + offsetX
+            let midY = node.bounds.midY + offsetY
+
+            // Rotate
+            let rotX = midX * c - midY * s
+            let rotY = midX * s + midY * c
+
+            // Screen Coords
+            let screenX = (rotX * zoom) + halfScreenW
+            let screenY = (-rotY * zoom) + halfScreenH
+
+            // Projected Size (AABB)
+            let w = node.bounds.width * zoom
+            let h = node.bounds.height * zoom
+            let boundsW = w * abs(c) + h * abs(s)
+            let boundsH = w * abs(s) + h * abs(c)
+
+            let nodeScreenRect = CGRect(
+                x: screenX - boundsW/2,
+                y: screenY - boundsH/2,
+                width: boundsW,
+                height: boundsH
+            )
+
+            // If NO intersection, STOP. (Prune this branch)
+            if !screenRect.intersects(nodeScreenRect) {
+                nodesCulled += 1
+                return
+            }
+
+            // 2. INTERSECTION: Node is visible
+            if let left = node.left, let right = node.right {
+                // Internal Node: Dig deeper
+                traverseAndDraw(left)
+                traverseAndDraw(right)
+            } else {
+                // Leaf Node: Draw it!
+                // We found a small chunk (32 verts) that is definitely on screen
+                leavesDrawn += 1
+                encoder.drawPrimitives(type: .triangle, vertexStart: node.vertexStart, vertexCount: node.vertexCount)
             }
         }
+
+        // Start traversal at Root
+        traverseAndDraw(root)
+
+        // DEBUG: Print BVH stats
+        print("    🌲 BVH: visited \(nodesVisited) nodes, culled \(nodesCulled) branches, drew \(leavesDrawn) leaves")
     }
 
     ///  CONSTANT SCREEN SIZE HANDLES
@@ -983,6 +1095,11 @@ class Coordinator: NSObject, MTKViewDelegate {
 
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+
+            // Bind the stroke color for live stroke
+            var liveStrokeColor = brushSettings.color
+            enc.setFragmentBytes(&liveStrokeColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: localVertices.count)
 
             // STEP 3: Clean up stencil if we used it

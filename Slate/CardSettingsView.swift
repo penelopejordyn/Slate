@@ -24,7 +24,7 @@ struct CardSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .padding()
-                .onChange(of: selectedTab) { newValue in
+                .onChange(of: selectedTab) { _, newValue in
                     updateCardType(for: newValue)
                 }
 
@@ -38,7 +38,7 @@ struct CardSettingsView: View {
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                             Slider(value: $spacing, in: 10...100, step: 5)
-                                .onChange(of: spacing) { _ in
+                                .onChange(of: spacing) {
                                     updateCardType(for: selectedTab)
                                 }
                         }
@@ -49,7 +49,7 @@ struct CardSettingsView: View {
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                             Slider(value: $lineWidth, in: 0.5...5.0, step: 0.5)
-                                .onChange(of: lineWidth) { _ in
+                                .onChange(of: lineWidth) {
                                     updateCardType(for: selectedTab)
                                 }
                         }
@@ -105,7 +105,7 @@ struct CardSettingsView: View {
         .sheet(isPresented: $showImagePicker) {
             ImagePicker(image: $uiImage)
         }
-        .onChange(of: uiImage) { newImage in
+        .onChange(of: uiImage) { _, newImage in
             guard let img = newImage else { return }
 
             // Load Texture

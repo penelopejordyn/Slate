@@ -11,7 +11,7 @@ struct MetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> MTKView {
         let mtkView = TouchableMTKView()
         mtkView.device = MTLCreateSystemDefaultDevice()
-        mtkView.clearColor = MTLClearColor(red: 0.1, green: 1.0, blue: 1.0, alpha: 1.0)
+        mtkView.clearColor = MTLClearColor(red: 30.0/255.0, green: 30.0/255.0, blue: 30.0/255.0, alpha: 1.0)
 
         // Enable Stencil Buffer for card clipping
         mtkView.depthStencilPixelFormat = .stencil8

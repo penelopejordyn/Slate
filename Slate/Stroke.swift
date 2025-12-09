@@ -2,13 +2,24 @@
 import SwiftUI
 import Metal
 
-/// A sub-section of a stroke for geometry chunking.
-/// Large strokes are divided into chunks to enable sub-stroke culling.
-/// Only visible chunks are sent to the GPU, reducing vertex processing overhead.
-struct StrokeChunk {
+/// A node in the Bounding Volume Hierarchy tree.
+/// Can be an Internal Node (has children) or a Leaf Node (has geometry).
+class StrokeBVHNode {
+    let bounds: CGRect
+    let left: StrokeBVHNode?
+    let right: StrokeBVHNode?
+
+    // Leaf properties (only if left/right are nil)
     let vertexStart: Int
     let vertexCount: Int
-    let boundingBox: CGRect
+
+    init(bounds: CGRect, left: StrokeBVHNode?, right: StrokeBVHNode?, vertexStart: Int = 0, vertexCount: Int = 0) {
+        self.bounds = bounds
+        self.left = left
+        self.right = right
+        self.vertexStart = vertexStart
+        self.vertexCount = vertexCount
+    }
 }
 
 /// A stroke on the infinite canvas using Floating Origin architecture.
@@ -44,10 +55,10 @@ class Stroke: Identifiable {
     // Calculated once in init, used to skip off-screen strokes
     var localBounds: CGRect = .zero
 
-    //  OPTIMIZATION: Geometry Chunking
-    // Large strokes are divided into chunks for sub-stroke culling
-    // Only visible chunks are rendered, drastically reducing GPU vertex processing
-    var chunks: [StrokeChunk] = []
+    //  OPTIMIZATION: BVH Tree for Hierarchical Culling
+    // Tree structure allows O(log N) culling instead of O(N)
+    // Root node contains the entire stroke, leaves are small 32-vertex chunks
+    var rootNode: StrokeBVHNode?
 
     /// Initialize stroke from screen-space points using direct delta calculation.
     /// This avoids Double precision loss at extreme zoom levels by calculating
@@ -137,61 +148,53 @@ class Stroke: Identifiable {
             )
         }
 
-        // 6.  OPTIMIZATION: Generate Chunks for Sub-Stroke Culling
-        // Break the stroke into smaller pieces so we can cull them individually
-        self.generateChunks()
-
-        // 7.  OPTIMIZATION: Calculate Global Bounding Box
-        // Union of all chunk bounding boxes
-        if !chunks.isEmpty {
-            self.localBounds = chunks.reduce(CGRect.null) { $0.union($1.boundingBox) }
+        // 6.  OPTIMIZATION: Build BVH Tree for Hierarchical Culling
+        // Recursively splits stroke into a tree structure for O(log N) culling
+        if !localVertices.isEmpty {
+            self.rootNode = buildBVH(start: 0, count: localVertices.count)
+            if let root = self.rootNode {
+                self.localBounds = root.bounds
+            }
         }
     }
 
-    /// Generate chunks for sub-stroke culling.
-    /// Large strokes are divided into blocks of vertices to enable fine-grained culling.
-    /// Only visible chunks are sent to the GPU, reducing vertex processing overhead.
-    private func generateChunks() {
-        guard !localVertices.isEmpty else { return }
-
-        // Chunk Size: How many vertices per chunk?
-        // Too small = Too many CPU draw calls
-        // Too big = Ineffective culling
-        // 192 vertices = 32 quads (64 triangles). Good balance.
-        let chunkSize = 192
-        var offset = 0
-
-        while offset < localVertices.count {
-            let count = min(chunkSize, localVertices.count - offset)
-
-            // Calculate Bounding Box for THIS chunk
-            var minX = Float.greatestFiniteMagnitude
-            var maxX = -Float.greatestFiniteMagnitude
-            var minY = Float.greatestFiniteMagnitude
-            var maxY = -Float.greatestFiniteMagnitude
-
-            for i in offset..<(offset + count) {
-                let v = localVertices[i]
-                if v.x < minX { minX = v.x }
-                if v.x > maxX { maxX = v.x }
-                if v.y < minY { minY = v.y }
-                if v.y > maxY { maxY = v.y }
-            }
-
-            let chunkBounds = CGRect(
-                x: Double(minX),
-                y: Double(minY),
-                width: Double(maxX - minX),
-                height: Double(maxY - minY)
-            )
-
-            chunks.append(StrokeChunk(
-                vertexStart: offset,
-                vertexCount: count,
-                boundingBox: chunkBounds
-            ))
-
-            offset += count
+    /// Recursive function to build the BVH Tree
+    /// Splits vertices in half until they fit into a leaf node (32 vertices)
+    /// This creates a logarithmic tree structure for efficient culling
+    private func buildBVH(start: Int, count: Int) -> StrokeBVHNode {
+        // LEAF CASE: Small enough to be a chunk
+        // 32 vertices = 16 triangles. Good granularity for culling.
+        if count <= 32 {
+            let bounds = calculateBounds(start: start, count: count)
+            return StrokeBVHNode(bounds: bounds, left: nil, right: nil, vertexStart: start, vertexCount: count)
         }
+
+        // INTERNAL CASE: Split in half
+        let mid = count / 2
+        let leftNode = buildBVH(start: start, count: mid)
+        let rightNode = buildBVH(start: start + mid, count: count - mid)
+
+        // Parent bounds is the union of children
+        let totalBounds = leftNode.bounds.union(rightNode.bounds)
+
+        return StrokeBVHNode(bounds: totalBounds, left: leftNode, right: rightNode)
+    }
+
+    private func calculateBounds(start: Int, count: Int) -> CGRect {
+        var minX = Float.greatestFiniteMagnitude
+        var maxX = -Float.greatestFiniteMagnitude
+        var minY = Float.greatestFiniteMagnitude
+        var maxY = -Float.greatestFiniteMagnitude
+
+        let end = min(start + count, localVertices.count)
+        for i in start..<end {
+            let v = localVertices[i]
+            if v.x < minX { minX = v.x }
+            if v.x > maxX { maxX = v.x }
+            if v.y < minY { minY = v.y }
+            if v.y > maxY { maxY = v.y }
+        }
+
+        return CGRect(x: Double(minX), y: Double(minY), width: Double(maxX - minX), height: Double(maxY - minY))
     }
 }

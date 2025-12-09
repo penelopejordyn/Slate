@@ -41,8 +41,9 @@ vertex float4 vertex_main(uint vertexID [[vertex_id]],
     return float4(ndcX, ndcY, 0.0, 1.0);
 }
 
-fragment float4 fragment_main(float4 in [[stage_in]]) {
-    return float4(0.0, 1.0, 0.0, 1.0);
+fragment float4 fragment_main(float4 in [[stage_in]],
+                              constant float4 &color [[buffer(0)]]) {
+    return color;
 }
 
 // MARK: - Card Rendering Shaders
