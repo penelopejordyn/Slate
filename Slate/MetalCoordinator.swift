@@ -62,6 +62,10 @@ class Coordinator: NSObject, MTKViewDelegate {
     // MARK: - Brush Settings
     let brushSettings = BrushSettings()
 
+    // MARK: - Debug Stats
+    var debugDrawnVerticesThisFrame: Int = 0
+    var debugDrawnNodesThisFrame: Int = 0
+
     override init() {
         super.init()
         device = MTLCreateSystemDefaultDevice()!
@@ -170,6 +174,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                 culledStrokes += 1
                 continue // CULL!
             }
+
+            debugDrawnVerticesThisFrame += stroke.localVertices.count
+            debugDrawnNodesThisFrame += stroke.flatNodes.count
 
             let relativeOffset = SIMD2<Float>(
                 Float(relativeOffsetDouble.x),
@@ -325,6 +332,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                     let strokeOffset = stroke.origin
                     let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
 
+                    debugDrawnVerticesThisFrame += stroke.localVertices.count
+                    debugDrawnNodesThisFrame += stroke.flatNodes.count
+
                     var strokeTransform = StrokeTransform(
                         relativeOffset: strokeRelativeOffset,
                         zoomScale: Float(currentZoom),
@@ -411,6 +421,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                 if (distScreen - strokeRadiusScreen) > cullRadius {
                     continue // Cull!
                 }
+
+                debugDrawnVerticesThisFrame += stroke.localVertices.count
+                debugDrawnNodesThisFrame += stroke.flatNodes.count
 
                 let childRelativeOffset = SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y))
                 var childTransform = StrokeTransform(
@@ -537,6 +550,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                     for stroke in card.strokes {
                         guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
 
+                        debugDrawnVerticesThisFrame += stroke.localVertices.count
+                        debugDrawnNodesThisFrame += stroke.flatNodes.count
+
                         // Transform Stroke Origin: Card Local -> Frame Local -> Camera Relative
                         let sx = stroke.origin.x
                         let sy = stroke.origin.y
@@ -662,6 +678,10 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        // Reset per-frame debug counters
+        debugDrawnVerticesThisFrame = 0
+        debugDrawnNodesThisFrame = 0
+
         // Calculate Camera Center in World Space (Double precision)
         // This is the "View Center" - where the center of the screen is in the infinite world.
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
@@ -1006,6 +1026,8 @@ class Coordinator: NSObject, MTKViewDelegate {
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&liveTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
+            debugDrawnVerticesThisFrame += liveStrokeVertices.count
+
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: liveStrokeVertices.count)
 
             // STEP 3: Clean up stencil if we used it
@@ -1139,6 +1161,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             Depth: \(depth) | Zoom: \(zoomText)
             Effective: \(effectiveText)
             Strokes: \(self.activeFrame.strokes.count)
+            Debug: Verts \(self.debugDrawnVerticesThisFrame) | Nodes \(self.debugDrawnNodesThisFrame)
             Camera: \(cameraPosText)
             """
         }
