@@ -28,20 +28,19 @@ struct VertexOut {
     float4 color;
 };
 
+inline float2 toScreen(float2 position, constant StrokeTransform *transform) {
+    float2 worldRelative = position + transform->relativeOffset;
+    float c = cos(transform->rotationAngle);
+    float s = sin(transform->rotationAngle);
+    float rotX = worldRelative.x * c - worldRelative.y * s;
+    float rotY = worldRelative.x * s + worldRelative.y * c;
+    return float2(rotX, rotY) * transform->zoomScale;
+}
+
 vertex VertexOut vertex_main(const device VertexIn *vertices [[buffer(0)]],
                              uint vid [[vertex_id]],
                              constant StrokeTransform *transform [[buffer(1)]]) {
     VertexIn in = vertices[vid];
-
-    // Helper to transform a centerline position into screen space (pixels)
-    auto toScreen = ^(float2 position) {
-        float2 worldRelative = position + transform->relativeOffset;
-        float c = cos(transform->rotationAngle);
-        float s = sin(transform->rotationAngle);
-        float rotX = worldRelative.x * c - worldRelative.y * s;
-        float rotY = worldRelative.x * s + worldRelative.y * c;
-        return float2(rotX, rotY) * transform->zoomScale;
-    };
 
     uint sampleIndex = vid / 2;              // Two vertices per center sample
     uint baseIndex = sampleIndex * 2;        // Even index stores the center position we need
@@ -49,9 +48,9 @@ vertex VertexOut vertex_main(const device VertexIn *vertices [[buffer(0)]],
     uint prevSample = sampleIndex > 0 ? sampleIndex - 1 : 0;
     uint nextSample = min(sampleIndex + 1, totalSamples - 1);
 
-    float2 prevPos = toScreen(vertices[prevSample * 2].position);
-    float2 currPos = toScreen(vertices[baseIndex].position);
-    float2 nextPos = toScreen(vertices[nextSample * 2].position);
+    float2 prevPos = toScreen(vertices[prevSample * 2].position, transform);
+    float2 currPos = toScreen(vertices[baseIndex].position, transform);
+    float2 nextPos = toScreen(vertices[nextSample * 2].position, transform);
 
     float2 tangent = nextPos - prevPos;
     float len = length(tangent);

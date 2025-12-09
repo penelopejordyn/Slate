@@ -201,21 +201,23 @@ func tessellateStrokeLocal(centerPoints: [SIMD2<Float>],
                            color: SIMD4<Float>) -> [StrokeVertex] {
     guard !centerPoints.isEmpty else { return [] }
 
-    _ = width // Width retained for potential future thickness-aware sampling
+    _ = width // Width reserved for potential sampling heuristics
 
     // Precompute cumulative lengths to populate uv.x
     var cumulativeDistances: [Float] = Array(repeating: 0, count: centerPoints.count)
-    var totalLength: Float = 0
-
     for i in 1..<centerPoints.count {
         let delta = centerPoints[i] - centerPoints[i - 1]
-        totalLength += length(delta)
-        cumulativeDistances[i] = totalLength
+        cumulativeDistances[i] = cumulativeDistances[i - 1] + length(delta)
     }
 
-    // 3) END CAP
-    let endCapVertices = createCircleLocal(at: centerPoints[centerPoints.count - 1], radius: halfWidth)
-    vertices.append(contentsOf: endCapVertices)
+    var vertices: [StrokeVertex] = []
+    vertices.reserveCapacity(centerPoints.count * 2)
+
+    for (index, center) in centerPoints.enumerated() {
+        let u = cumulativeDistances[index]
+        vertices.append(StrokeVertex(position: center, uv: SIMD2<Float>(u, -1), color: color))
+        vertices.append(StrokeVertex(position: center, uv: SIMD2<Float>(u, 1), color: color))
+    }
 
     return vertices
 }
@@ -229,50 +231,13 @@ func buildStrokeStripVertices(centerPoints: [SIMD2<Float>],
     guard !centerPoints.isEmpty else { return [] }
 
     // Fallback to a circle for a single point to avoid degenerate strips.
-    guard centerPoints.count > 1 else {
+    if centerPoints.count == 1 {
         return createCircleLocal(at: centerPoints[0], radius: width / 2.0).map {
             StrokeVertex(position: $0, uv: .zero, color: color)
         }
     }
 
-    let halfWidth = width * 0.5
-    let count = centerPoints.count
-
-    // Precompute tangents for each segment.
-    var tangents: [SIMD2<Float>] = Array(repeating: .zero, count: count - 1)
-    for i in 0..<(count - 1) {
-        let dir = centerPoints[i + 1] - centerPoints[i]
-        let len = max(length(dir), 0.0001)
-        tangents[i] = dir / len
-    }
-
-    // Build averaged normals per point.
-    var normals: [SIMD2<Float>] = Array(repeating: .zero, count: count)
-    for i in 0..<count {
-        let prevTangent = i == 0 ? tangents[0] : tangents[i - 1]
-        let nextTangent = i == count - 1 ? tangents[count - 2] : tangents[i]
-        var blended = prevTangent + nextTangent
-        if length(blended) < 0.0001 {
-            blended = nextTangent
-        }
-        let normal = SIMD2<Float>(-blended.y, blended.x)
-        let normalized = normal / max(length(normal), 0.0001)
-        normals[i] = normalized * halfWidth
-    }
-
-    // Emit two vertices per center point (left/right).
-    var vertices: [StrokeVertex] = []
-    vertices.reserveCapacity(count * 2)
-
-    for i in 0..<count {
-        let base = centerPoints[i]
-        let offset = normals[i]
-        // UV.x encodes side (0 = left, 1 = right) to keep future shading options open.
-        vertices.append(StrokeVertex(position: base + offset, uv: SIMD2<Float>(0, 0), color: color))
-        vertices.append(StrokeVertex(position: base - offset, uv: SIMD2<Float>(1, 0), color: color))
-    }
-
-    return vertices
+    return tessellateStrokeLocal(centerPoints: centerPoints, width: width, color: color)
 }
 
 /// Create circle cap in local space.
@@ -282,13 +247,18 @@ func createCircleLocal(at center: SIMD2<Float>,
                       segments: Int = 30) -> [SIMD2<Float>] {
     var vertices: [SIMD2<Float>] = []
 
-    var vertices: [StrokeVertex] = []
-    vertices.reserveCapacity(centerPoints.count * 2)
+    for i in 0..<segments {
+        let a1 = Float(i) * (2.0 * .pi / Float(segments))
+        let a2 = Float(i + 1) * (2.0 * .pi / Float(segments))
 
-    for (index, center) in centerPoints.enumerated() {
-        let u = cumulativeDistances[index] * scale
-        vertices.append(StrokeVertex(position: center, uv: SIMD2<Float>(u, -1), color: color))
-        vertices.append(StrokeVertex(position: center, uv: SIMD2<Float>(u, 1), color: color))
+        let p1 = SIMD2<Float>(center.x + cos(a1) * radius,
+                              center.y + sin(a1) * radius)
+        let p2 = SIMD2<Float>(center.x + cos(a2) * radius,
+                              center.y + sin(a2) * radius)
+
+        vertices.append(center)
+        vertices.append(p1)
+        vertices.append(p2)
     }
 
     return vertices
