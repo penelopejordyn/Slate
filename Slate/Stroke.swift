@@ -226,7 +226,8 @@ class Stroke: Identifiable {
     /// Leaf ranges are aligned to the two-vertex-per-point strip format for contiguous draws.
     func visibleVertexRanges(relativeOffset: SIMD2<Double>,
                              zoomScale: Double,
-                             cullRadius: Double) -> [(Int, Int)] {
+                             cullRadius: Double,
+                             onVisibleLeaf: ((Int) -> Void)? = nil) -> [(Int, Int)] {
         guard !localVertices.isEmpty else { return [] }
 
         // Early out using whole-stroke bounds
@@ -243,8 +244,12 @@ class Stroke: Identifiable {
         }
 
         guard let rootIndex = bvhRootIndex else {
-            // No BVH (likely a point stroke) - draw everything.
-            return localVertices.count >= 3 ? [(0, localVertices.count)] : []
+            // No BVH (likely a point stroke) - draw everything as a single leaf.
+            if localVertices.count >= 3 {
+                onVisibleLeaf?(localVertices.count)
+                return [(0, localVertices.count)]
+            }
+            return []
         }
 
         var ranges: [(Int, Int)] = []
@@ -268,6 +273,7 @@ class Stroke: Identifiable {
                 let vertexStart = node.segmentStart * 2
                 let vertexCount = (node.segmentCount + 1) * 2
                 if vertexCount >= 3 {
+                    onVisibleLeaf?(vertexCount)
                     ranges.append((vertexStart, vertexCount))
                 }
             } else {
