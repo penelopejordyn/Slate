@@ -10,6 +10,7 @@ struct StrokeTransform {
     float screenWidth;      // Screen dimensions for NDC conversion
     float screenHeight;
     float rotationAngle;    // Camera rotation
+    float halfPixelWidth;   // Half-width of stroke in screen pixels (for screen-space extrusion)
 };
 
 /// Vertex input for batched stroke rendering
@@ -28,31 +29,123 @@ struct VertexOut {
 
 vertex VertexOut vertex_main(VertexIn in [[stage_in]],
                              constant StrokeTransform *transform [[buffer(1)]]) {
-    // Step 1: Apply Floating Origin offset (GPU does the math now)
+    // SCREEN-SPACE EXTRUSION APPROACH
+    // Key innovation: Thickness is constant in pixels, not world units
+    // This prevents strokes from becoming blobs at high zoom
+
+    // 1. Centerline in camera-relative world space
     float2 worldRelative = in.position + transform->relativeOffset;
 
-    // Step 2: Rotation around camera center (0,0)
+    // 2. Rotate around camera center
     float c = cos(transform->rotationAngle);
     float s = sin(transform->rotationAngle);
-    float rotX = worldRelative.x * c - worldRelative.y * s;
-    float rotY = worldRelative.x * s + worldRelative.y * c;
+    float2 rot = float2(
+        worldRelative.x * c - worldRelative.y * s,
+        worldRelative.x * s + worldRelative.y * c
+    );
 
-    // Step 3: Zoom - Scale by zoom factor
-    float2 zoomed = float2(rotX, rotY) * transform->zoomScale;
+    // 3. Project centerline to NDC (no width yet)
+    float2 zoomed = rot * transform->zoomScale;
+    float2 ndcCenter = float2(
+        (zoomed.x / transform->screenWidth) * 2.0,
+        -(zoomed.y / transform->screenHeight) * 2.0
+    );
 
-    // Step 4: Projection - Convert to NDC [-1, 1]
-    float ndcX = (zoomed.x / transform->screenWidth) * 2.0;
-    float ndcY = -(zoomed.y / transform->screenHeight) * 2.0;
+    // 4. Calculate screen-space normal for extrusion
+    // We use a simple approximation: rotate the "up" vector by the camera rotation
+    // This gives us a consistent perpendicular direction in screen space
+    float2 localUp = float2(0.0, 1.0);
+    float2 rotUp = float2(
+        localUp.x * c - localUp.y * s,
+        localUp.x * s + localUp.y * c
+    );
+    float2 zoomedUp = rotUp * transform->zoomScale;
+    float2 ndcUp = float2(
+        (zoomedUp.x / transform->screenWidth) * 2.0,
+        -(zoomedUp.y / transform->screenHeight) * 2.0
+    );
+
+    // Perpendicular to "up" gives us the extrusion direction
+    float2 ndcNormal = normalize(float2(-ndcUp.y, ndcUp.x));
+
+    // 5. Convert pixel radius to NDC units
+    float pixelToNDC = 2.0 / transform->screenHeight;
+    float halfWidthNDC = transform->halfPixelWidth * pixelToNDC;
+
+    // 6. Extrude using side flag from uv.y (-1 or +1)
+    float side = in.uv.y;
+    float2 ndcPos = ndcCenter + ndcNormal * (side * halfWidthNDC);
 
     VertexOut out;
-    out.position = float4(ndcX, ndcY, 0.0, 1.0);
+    out.position = float4(ndcPos, 0.0, 1.0);
     out.uv = in.uv;
     out.color = in.color;
     return out;
 }
 
 fragment float4 fragment_main(VertexOut in [[stage_in]]) {
-    return in.color;
+    // SQUARE BRUSH WITH ROUND CAPS
+    // Local stroke coordinates:
+    // t: along stroke (0 at start, 1 at end)
+    // s: across stroke (-1 at one edge, +1 at the other)
+    float t = clamp(in.uv.x, 0.0, 1.0);
+    float s = in.uv.y;
+
+    // --- 1. Handle side edges (square brush) ---
+
+    // We want a hard edge at |s| = 1, maybe with a tiny feather.
+    float distSide = fabs(s); // 0 at center, 1 at edge
+
+    // Feather width in "s" space
+    float sideFeather = 0.02; // tune (0 = completely hard edge)
+    float alphaSide = 1.0 - smoothstep(1.0 - sideFeather, 1.0, distSide);
+    // Inside |s|<1-sideFeather -> alphaSide ~ 1
+    // Outside |s|>1 -> alphaSide ~ 0
+
+    // --- 2. Handle round caps (start & end) ---
+
+    // How much of the stroke length is used for rounded caps (normalized):
+    // e.g., 0.5 would mean caps cover 50% each = almost a circle for short strokes.
+    // Smaller = shorter caps.
+    float capFrac = 0.2;  // 20% of normalized length at each end, tune this
+
+    float alphaCap = 1.0;
+
+    // Start cap (t near 0)
+    if (t < capFrac) {
+        // Map t from [0, capFrac] -> [-1, 0]; center of cap at (-0.5, 0)
+        float x = (t / capFrac) - 1.0;  // -1 at start, 0 at cap boundary
+        float2 p = float2(x, s);       // local cap coords
+        float d = length(p);           // distance from cap center
+
+        // Radius = 1.0 in this local space (covers full width)
+        float capFeather = 0.02; // edge softness
+        alphaCap = 1.0 - smoothstep(1.0 - capFeather, 1.0, d);
+    }
+    // End cap (t near 1)
+    else if (t > 1.0 - capFrac) {
+        // Map t from [1-capFrac, 1] -> [0, 1]; center of cap at (0, 0) in local space
+        float u = (t - (1.0 - capFrac)) / capFrac; // 0 at junction, 1 at far end
+        float2 p = float2(u, s);                    // local cap coords
+        float d = length(p);                        // distance from cap center at origin
+
+        // Radius = 1.0 in this local space (covers full width)
+        float capFeather = 0.02;
+        alphaCap = 1.0 - smoothstep(1.0 - capFeather, 1.0, d);
+    }
+
+    // Combine side + caps:
+    // - In the middle section alphaCap stays ~1; near ends it's shaped by circle.
+    float alpha = alphaSide * alphaCap;
+
+    // Clamp for safety
+    alpha = clamp(alpha, 0.0, 1.0);
+
+    // Apply alpha to color
+    float4 color = in.color;
+    color.a *= alpha;
+
+    return color;
 }
 
 // MARK: - Card Rendering Shaders

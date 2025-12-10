@@ -22,6 +22,7 @@ struct StrokeTransform {
     var screenWidth: Float
     var screenHeight: Float
     var rotationAngle: Float
+    var halfPixelWidth: Float           // Half-width of stroke in screen pixels (for screen-space extrusion)
 }
 
 /// Transform for card rendering (not batched, includes offset)
@@ -182,6 +183,84 @@ func createCircle(at point: CGPoint,
         vertices.append(p1)
         vertices.append(p2)
     }
+    return vertices
+}
+
+// MARK: - Centerline Tessellation (Screen-Space Thickness)
+
+/// Compute normalized distance values (0..1) for each point along the stroke
+private func computeNormalizedU(points: [SIMD2<Float>]) -> [Float] {
+    guard points.count > 1 else { return points.map { _ in 0 } }
+
+    var lengths: [Float] = Array(repeating: 0, count: points.count)
+    var totalLength: Float = 0
+    var last = points[0]
+
+    for i in 1..<points.count {
+        let p = points[i]
+        let dx = p.x - last.x
+        let dy = p.y - last.y
+        let d = sqrt(dx*dx + dy*dy)
+        totalLength += d
+        lengths[i] = totalLength
+        last = p
+    }
+
+    // Avoid divide-by-zero
+    if totalLength <= 0 {
+        return points.map { _ in 0 }
+    }
+
+    // Normalize 0..1
+    return lengths.map { $0 / totalLength }
+}
+
+/// Build a centerline-based vertex array where each centerline sample
+/// produces two vertices: one for each side of the stroke band.
+/// The GPU will extrude these to screen-space thickness in the vertex shader.
+///
+/// - parameter points: centerline points in stroke-local/world units.
+/// - parameter color:  stroke color.
+/// - returns: vertices suitable for a TRIANGLE_STRIP draw.
+///
+/// **Key Change from Full Tessellation:**
+/// - Old: position = extruded vertex (includes width)
+/// - New: position = centerline point, uv.y = side flag (-1 or +1)
+/// - GPU uses uv.y to extrude in screen space, keeping thickness constant in pixels
+///
+/// **UV Coordinates:**
+/// - uv.x: normalized position along stroke (0 at start, 1 at end) for round caps
+/// - uv.y: side flag (-1 or +1) for extrusion direction
+func tessellateCenterlineVertices(
+    points: [SIMD2<Float>],
+    color: SIMD4<Float>
+) -> [StrokeVertex] {
+    guard points.count >= 2 else { return [] }
+
+    let uNorm = computeNormalizedU(points: points)
+
+    var vertices: [StrokeVertex] = []
+    vertices.reserveCapacity(points.count * 2)
+
+    for i in 0..<points.count {
+        let p = points[i]
+        let u = uNorm[i] // 0 at start, 1 at end
+
+        // side -1
+        vertices.append(StrokeVertex(
+            position: p,
+            uv: SIMD2<Float>(u, -1),
+            color: color
+        ))
+
+        // side +1
+        vertices.append(StrokeVertex(
+            position: p,
+            uv: SIMD2<Float>(u, +1),
+            color: color
+        ))
+    }
+
     return vertices
 }
 

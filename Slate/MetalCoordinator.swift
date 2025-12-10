@@ -62,6 +62,10 @@ class Coordinator: NSObject, MTKViewDelegate {
     // MARK: - Brush Settings
     let brushSettings = BrushSettings()
 
+    // MARK: - Debug Metrics
+    var debugDrawnVerticesThisFrame: Int = 0
+    var debugDrawnNodesThisFrame: Int = 0
+
     override init() {
         super.init()
         device = MTLCreateSystemDefaultDevice()!
@@ -97,6 +101,12 @@ class Coordinator: NSObject, MTKViewDelegate {
                      currentRotation: Float,
                      encoder: MTLRenderCommandEncoder,
                      excludedChild: Frame? = nil) { //  NEW: Prevent double-rendering
+
+        // Reset debug metrics at the start of each frame (only for root call)
+        if frame === activeFrame && excludedChild == nil {
+            debugDrawnVerticesThisFrame = 0
+            debugDrawnNodesThisFrame = 0
+        }
 
         // LAYER 1: RENDER PARENT (Background - Depth -1) -------------------------------
         if let parent = frame.parent {
@@ -176,17 +186,27 @@ class Coordinator: NSObject, MTKViewDelegate {
                 Float(relativeOffsetDouble.y)
             )
 
+            // Calculate screen-space thickness (clamped to reasonable pixel range)
+            let basePixelWidth = Float(stroke.worldWidth * currentZoom)
+            let clampedPixelWidth = min(basePixelWidth, 10000.0)  // Max 1000px thickness
+            let halfPixelWidth = max(clampedPixelWidth * 0.5, 0.5)  // Min 0.5px half-width
+
             var transform = StrokeTransform(
                 relativeOffset: relativeOffset,
                 zoomScale: Float(currentZoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
-                rotationAngle: currentRotation
+                rotationAngle: currentRotation,
+                halfPixelWidth: halfPixelWidth
             )
 
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+
+            // Track debug metrics
+            debugDrawnVerticesThisFrame += stroke.localVertices.count
+            debugDrawnNodesThisFrame += 1
         }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
@@ -325,17 +345,23 @@ class Coordinator: NSObject, MTKViewDelegate {
                     let strokeOffset = stroke.origin
                     let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
 
+                    // Calculate screen-space thickness for card strokes
+                    let basePixelWidth = Float(stroke.worldWidth * currentZoom)
+                    let clampedPixelWidth = min(basePixelWidth, 1000.0)
+                    let halfPixelWidth = max(clampedPixelWidth * 0.5, 0.5)
+
                     var strokeTransform = StrokeTransform(
                         relativeOffset: strokeRelativeOffset,
                         zoomScale: Float(currentZoom),
                         screenWidth: Float(viewSize.width),
                         screenHeight: Float(viewSize.height),
-                        rotationAngle: totalRotation
+                        rotationAngle: totalRotation,
+                        halfPixelWidth: halfPixelWidth
                     )
 
                     encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                     encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                    encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
                 }
             }
 
@@ -412,18 +438,28 @@ class Coordinator: NSObject, MTKViewDelegate {
                     continue // Cull!
                 }
 
+                // Calculate screen-space thickness for child strokes
+                let basePixelWidth = Float(stroke.worldWidth * childZoom)
+                let clampedPixelWidth = min(basePixelWidth, 1000.0)
+                let halfPixelWidth = max(clampedPixelWidth * 0.5, 0.5)
+
                 let childRelativeOffset = SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y))
                 var childTransform = StrokeTransform(
                     relativeOffset: childRelativeOffset,
                     zoomScale: Float(childZoom),
                     screenWidth: Float(viewSize.width),
                     screenHeight: Float(viewSize.height),
-                    rotationAngle: currentRotation
+                    rotationAngle: currentRotation,
+                    halfPixelWidth: halfPixelWidth
                 )
 
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&childTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+
+                // Track debug metrics
+                debugDrawnVerticesThisFrame += stroke.localVertices.count
+                debugDrawnNodesThisFrame += 1
             }
 
             // 5. Render Child Cards (Same logic as Layer 2, but with childZoom)
@@ -547,17 +583,23 @@ class Coordinator: NSObject, MTKViewDelegate {
                         let strokePos = totalRelativeOffset + SIMD2<Double>(rotX, rotY)
                         let strokeRelativeOffset = SIMD2<Float>(Float(strokePos.x), Float(strokePos.y))
 
+                        // Calculate screen-space thickness for child card strokes
+                        let basePixelWidth = Float(stroke.worldWidth * childZoom)
+                        let clampedPixelWidth = min(basePixelWidth, 1000.0)
+                        let halfPixelWidth = max(clampedPixelWidth * 0.5, 0.5)
+
                         var strokeTrans = StrokeTransform(
                             relativeOffset: strokeRelativeOffset,
                             zoomScale: Float(childZoom),
                             screenWidth: Float(viewSize.width),
                             screenHeight: Float(viewSize.height),
-                            rotationAngle: totalRot
+                            rotationAngle: totalRot,
+                            halfPixelWidth: halfPixelWidth
                         )
 
                         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                         encoder.setVertexBytes(&strokeTrans, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
                     }
                 }
 
@@ -648,7 +690,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                 zoomScale: Float(zoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
-                rotationAngle: rotation
+                rotationAngle: rotation,
+                halfPixelWidth: 1.0  // Handles don't use thickness, but field is required
             )
 
             // Create buffer and draw
@@ -848,13 +891,19 @@ class Coordinator: NSObject, MTKViewDelegate {
                     renderZoom = zoomScale
                 }
 
+                // Calculate screen-space thickness for live card stroke
+                let liveBasePixelWidth = Float(worldWidth * renderZoom)
+                let liveClampedPixelWidth = min(liveBasePixelWidth, 1000.0)
+                let liveHalfPixelWidth = max(liveClampedPixelWidth * 0.5, 0.5)
+
                 liveRelativeOffset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
                 liveTransform = StrokeTransform(
                     relativeOffset: liveRelativeOffset,
                     zoomScale: Float(renderZoom),  // Use effective zoom for the card's frame!
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
-                    rotationAngle: rotationAngle + card.rotation
+                    rotationAngle: rotationAngle + card.rotation,
+                    halfPixelWidth: liveHalfPixelWidth
                 )
             } else {
                 // CANVAS DRAWING: Use original approach
@@ -876,6 +925,11 @@ class Coordinator: NSObject, MTKViewDelegate {
                     return SIMD2<Float>(Float(worldDx), Float(worldDy))
                 }
 
+                // Calculate screen-space thickness for live canvas stroke
+                let liveBasePixelWidth = Float(worldWidth * zoom)
+                let liveClampedPixelWidth = min(liveBasePixelWidth, 10000.0)
+                let liveHalfPixelWidth = max(liveClampedPixelWidth * 0.5, 0.5)
+
                 let relativeOffsetDouble = tempOrigin - cameraCenterWorld
                 liveRelativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x),
                                                    Float(relativeOffsetDouble.y))
@@ -884,17 +938,19 @@ class Coordinator: NSObject, MTKViewDelegate {
                     zoomScale: Float(zoomScale),
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
-                    rotationAngle: rotationAngle
+                    rotationAngle: rotationAngle,
+                    halfPixelWidth: liveHalfPixelWidth
                 )
             }
 
-            // Tessellate in LOCAL space
-            let localVertices = tessellateStrokeLocal(
-                centerPoints: localPoints,
-                width: Float(worldWidth)
+            // Tessellate in LOCAL space using CENTERLINE approach
+            // This matches committed strokes for consistent rendering
+            let liveVertices = tessellateCenterlineVertices(
+                points: localPoints,
+                color: brushSettings.color
             )
 
-            guard !localVertices.isEmpty else {
+            guard !liveVertices.isEmpty else {
                 enc.endEncoding()
                 commandBuffer.present(view.currentDrawable!)
                 commandBuffer.commit()
@@ -988,25 +1044,17 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             // Create buffers and render live stroke (GPU applies offset)
-            // Convert positions to StrokeVertex with color baked in
-            let liveStrokeVertices = localVertices.map { pos in
-                StrokeVertex(
-                    position: pos,  // GPU will apply offset via transform
-                    uv: .zero,
-                    color: brushSettings.color
-                )
-            }
-
+            // liveVertices already contains StrokeVertex with centerline positions and side flags
             let vertexBuffer = device.makeBuffer(
-                bytes: liveStrokeVertices,
-                length: liveStrokeVertices.count * MemoryLayout<StrokeVertex>.stride,
+                bytes: liveVertices,
+                length: liveVertices.count * MemoryLayout<StrokeVertex>.stride,
                 options: .storageModeShared
             )
 
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&liveTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: liveStrokeVertices.count)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: liveVertices.count)
 
             // STEP 3: Clean up stencil if we used it
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -1140,6 +1188,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             Effective: \(effectiveText)
             Strokes: \(self.activeFrame.strokes.count)
             Camera: \(cameraPosText)
+            Vertices: \(self.debugDrawnVerticesThisFrame) | Draws: \(self.debugDrawnNodesThisFrame)
             """
         }
     }
@@ -1171,6 +1220,17 @@ class Coordinator: NSObject, MTKViewDelegate {
         desc.vertexFunction   = library.makeFunction(name: "vertex_main")
         desc.fragmentFunction = library.makeFunction(name: "fragment_main")
         desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+
+        // Enable blending for round caps (alpha masking in fragment shader)
+        let attachment = desc.colorAttachments[0]!
+        attachment.isBlendingEnabled = true
+        attachment.rgbBlendOperation = .add
+        attachment.alphaBlendOperation = .add
+        attachment.sourceRGBBlendFactor = .sourceAlpha
+        attachment.sourceAlphaBlendFactor = .sourceAlpha
+        attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
         desc.vertexDescriptor = strokeVertexDesc
         desc.stencilAttachmentPixelFormat = .stencil8 //  Required for stencil buffer
         pipelineState = try? device.makeRenderPipelineState(descriptor: desc)
@@ -1367,6 +1427,65 @@ class Coordinator: NSObject, MTKViewDelegate {
                                               rotationAngle: rotationAngle)
     }
 
+    // MARK: - Stroke Simplification
+
+    /// Simplify a stroke in screen space by removing points that are too close
+    /// or nearly collinear with neighbors.
+    /// This prevents vertex explosion and reduces overdraw without noticeable quality loss.
+    ///
+    /// - Parameters:
+    ///   - points: Input stroke points in screen space
+    ///   - minScreenDist: Minimum distance between points in screen pixels (default: 1.5)
+    ///   - minAngleDeg: Minimum angle change to keep a point in degrees (default: 5.0)
+    /// - Returns: Simplified array of points
+    func simplifyStroke(
+        _ points: [CGPoint],
+        minScreenDist: CGFloat = 1.5,
+        minAngleDeg: CGFloat = 5.0
+    ) -> [CGPoint] {
+        guard points.count > 2 else { return points }
+
+        var result: [CGPoint] = [points[0]]
+
+        for i in 1..<(points.count - 1) {
+            let prev = result.last!
+            let cur  = points[i]
+            let next = points[i + 1]
+
+            // Distance filter
+            let dx = cur.x - prev.x
+            let dy = cur.y - prev.y
+            let dist2 = dx*dx + dy*dy
+            if dist2 < minScreenDist * minScreenDist {
+                continue
+            }
+
+            // Angle filter
+            let v1 = CGPoint(x: cur.x - prev.x, y: cur.y - prev.y)
+            let v2 = CGPoint(x: next.x - cur.x, y: next.y - cur.y)
+            let len1 = hypot(v1.x, v1.y)
+            let len2 = hypot(v2.x, v2.y)
+            if len1 > 0, len2 > 0 {
+                let dot = (v1.x * v2.x + v1.y * v2.y) / (len1 * len2)
+                let clampedDot = max(-1.0, min(1.0, dot))
+                let angle = acos(clampedDot) * 180.0 / .pi
+
+                if angle < minAngleDeg {
+                    // Almost straight line – skip
+                    continue
+                }
+            }
+
+            result.append(cur)
+        }
+
+        if let last = points.last, last != result.last {
+            result.append(last)
+        }
+
+        return result
+    }
+
     // MARK: - Touch Handling
 
     func handleTouchBegan(at point: CGPoint, touchType: UITouch.TouchType) {
@@ -1495,6 +1614,13 @@ class Coordinator: NSObject, MTKViewDelegate {
                                                   closed: false,
                                                   alpha: 0.5,
                                                   segmentsPerCurve: 20)
+
+            // Apply simplification to reduce vertex count
+            smoothScreenPoints = simplifyStroke(
+                smoothScreenPoints,
+                minScreenDist: 1.5,
+                minAngleDeg: 5.0
+            )
         }
 
         //  MODAL INPUT: Route stroke to correct target

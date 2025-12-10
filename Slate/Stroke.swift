@@ -117,21 +117,48 @@ class Stroke: Identifiable {
             return SIMD2<Float>(Float(worldDx), Float(worldDy))
         }
 
+        // 2.5. Clamp center points to prevent excessive vertex counts
+        var centerPoints = relativePoints
+
+        let maxCenterPoints = 1000  // Maximum number of centerline points per stroke
+        if centerPoints.count > maxCenterPoints {
+            let step = max(1, centerPoints.count / maxCenterPoints)
+            var downsampled: [SIMD2<Float>] = []
+            downsampled.reserveCapacity(maxCenterPoints + 1)
+
+            for i in stride(from: 0, to: centerPoints.count, by: step) {
+                downsampled.append(centerPoints[i])
+            }
+            if let last = centerPoints.last, last != downsampled.last {
+                downsampled.append(last)
+            }
+
+            centerPoints = downsampled
+        }
+
         // 3. World width is the base width divided by zoom
         let worldWidth = baseWidth / zoom
         self.worldWidth = worldWidth
 
-        // 4. Tessellate in LOCAL space (no view-specific transforms)
-        // Tessellator returns positions, we map them to full vertices with color
-        let positions = tessellateStrokeLocal(
-            centerPoints: relativePoints,
-            width: Float(worldWidth)
+        // 4. Tessellate in LOCAL space using CENTERLINE approach
+        // New: GPU will extrude to screen-space thickness, keeping strokes sharp at all zoom levels
+        let vertices = tessellateCenterlineVertices(
+            points: centerPoints,
+            color: color
         )
 
-        // 4.5. Bake color into vertices for batched rendering
-        self.localVertices = positions.map { pos in
-            StrokeVertex(position: pos, uv: .zero, color: color)
+        // 4.5. Safety net: prevent excessive vertex counts
+        let maxVertices = 60_000
+        if vertices.count > maxVertices {
+            // Drop stroke if it would be too expensive to render
+            self.localVertices = []
+            self.vertexBuffer = nil
+            self.localBounds = .null
+            self.flatNodes = []
+            return
         }
+
+        self.localVertices = vertices
 
         // 5.  OPTIMIZATION: Create Cached Buffer
         // This is done ONCE here, not 60 times per second in drawStroke
@@ -198,6 +225,15 @@ class Stroke: Identifiable {
             if pos.y < minY { minY = pos.y }
             if pos.y > maxY { maxY = pos.y }
         }
+
+        // Expand bounds by stroke half-width (centerline vertices need expansion for GPU extrusion)
+        // Since we're using centerline vertices, the positions are at the centerline
+        // We need to expand by the maximum stroke radius for accurate culling
+        let halfWidth = Float(worldWidth) * 0.5
+        minX -= halfWidth
+        maxX += halfWidth
+        minY -= halfWidth
+        maxY += halfWidth
 
         return CGRect(x: Double(minX), y: Double(minY), width: Double(maxX - minX), height: Double(maxY - minY))
     }
