@@ -6,10 +6,52 @@ import MetalKit
 
 // MARK: - Vertex Structures
 
-/// Vertex structure with position and UV coordinates for textured rendering
+/// Vertex structure with position, UV coordinates, and color for batched rendering
 struct StrokeVertex {
     var position: SIMD2<Float>  // Position in local space
     var uv: SIMD2<Float>         // Texture coordinate (U = along stroke, V = across width)
+    var color: SIMD4<Float>      // Vertex color (baked for batching)
+}
+
+/// Instance data for distance-field stroke segments
+struct StrokeSegmentInstance {
+    var p0: SIMD2<Float>      // Stroke-local centerline point 0
+    var p1: SIMD2<Float>      // Stroke-local centerline point 1
+    var color: SIMD4<Float>   // RGBA
+}
+
+/// Vertex for the reusable unit quad used by instanced segment rendering
+struct QuadVertex {
+    var corner: SIMD2<Float>
+}
+
+/// Simple position/UV vertex for card/tile quads
+struct CardQuadVertex {
+    var position: SIMD2<Float>
+    var uv: SIMD2<Float>
+}
+
+// MARK: - Transform Structures
+
+/// Transform for ICB stroke rendering (position offset calculated on GPU)
+struct StrokeTransform {
+    var relativeOffset: SIMD2<Float>  // Stroke position relative to camera
+    var rotatedOffsetScreen: SIMD2<Float> // Relative offset rotated and scaled to screen pixels
+    var zoomScale: Float
+    var screenWidth: Float
+    var screenHeight: Float
+    var rotationAngle: Float
+    var halfPixelWidth: Float           // Half-width of stroke in screen pixels (for screen-space extrusion)
+    var featherPx: Float                // Feather amount in pixels for SDF edge
+}
+
+/// Transform for card rendering (not batched, includes offset)
+struct CardTransform {
+    var relativeOffset: SIMD2<Float>
+    var zoomScale: Float
+    var screenWidth: Float
+    var screenHeight: Float
+    var rotationAngle: Float
 }
 
 // MARK: - Geometry / Tessellation
@@ -161,6 +203,84 @@ func createCircle(at point: CGPoint,
         vertices.append(p1)
         vertices.append(p2)
     }
+    return vertices
+}
+
+// MARK: - Centerline Tessellation (Screen-Space Thickness)
+
+/// Compute normalized distance values (0..1) for each point along the stroke
+private func computeNormalizedU(points: [SIMD2<Float>]) -> [Float] {
+    guard points.count > 1 else { return points.map { _ in 0 } }
+
+    var lengths: [Float] = Array(repeating: 0, count: points.count)
+    var totalLength: Float = 0
+    var last = points[0]
+
+    for i in 1..<points.count {
+        let p = points[i]
+        let dx = p.x - last.x
+        let dy = p.y - last.y
+        let d = sqrt(dx*dx + dy*dy)
+        totalLength += d
+        lengths[i] = totalLength
+        last = p
+    }
+
+    // Avoid divide-by-zero
+    if totalLength <= 0 {
+        return points.map { _ in 0 }
+    }
+
+    // Normalize 0..1
+    return lengths.map { $0 / totalLength }
+}
+
+/// Build a centerline-based vertex array where each centerline sample
+/// produces two vertices: one for each side of the stroke band.
+/// The GPU will extrude these to screen-space thickness in the vertex shader.
+///
+/// - parameter points: centerline points in stroke-local/world units.
+/// - parameter color:  stroke color.
+/// - returns: vertices suitable for a TRIANGLE_STRIP draw.
+///
+/// **Key Change from Full Tessellation:**
+/// - Old: position = extruded vertex (includes width)
+/// - New: position = centerline point, uv.y = side flag (-1 or +1)
+/// - GPU uses uv.y to extrude in screen space, keeping thickness constant in pixels
+///
+/// **UV Coordinates:**
+/// - uv.x: normalized position along stroke (0 at start, 1 at end) for round caps
+/// - uv.y: side flag (-1 or +1) for extrusion direction
+func tessellateCenterlineVertices(
+    points: [SIMD2<Float>],
+    color: SIMD4<Float>
+) -> [StrokeVertex] {
+    guard points.count >= 2 else { return [] }
+
+    let uNorm = computeNormalizedU(points: points)
+
+    var vertices: [StrokeVertex] = []
+    vertices.reserveCapacity(points.count * 2)
+
+    for i in 0..<points.count {
+        let p = points[i]
+        let u = uNorm[i] // 0 at start, 1 at end
+
+        // side -1
+        vertices.append(StrokeVertex(
+            position: p,
+            uv: SIMD2<Float>(u, -1),
+            color: color
+        ))
+
+        // side +1
+        vertices.append(StrokeVertex(
+            position: p,
+            uv: SIMD2<Float>(u, +1),
+            color: color
+        ))
+    }
+
     return vertices
 }
 
@@ -743,16 +863,6 @@ func solvePanOffsetForAnchor_Double(anchorWorld: SIMD2<Double>,
 
 // MARK: - GPU Transform Struct (Floating Origin Architecture)
 
-/// Per-stroke transform using relative coordinates.
-/// The GPU never sees absolute world coordinates - only small relative offsets.
-struct StrokeTransform {
-    var relativeOffset: SIMD2<Float>  // Stroke origin - Camera center (in world units)
-    var zoomScale: Float              // Current zoom level
-    var screenWidth: Float            // Screen dimensions
-    var screenHeight: Float
-    var rotationAngle: Float          // Camera rotation
-}
-
 /// Legacy global transform (for reference, not used in floating origin system)
 struct GPUTransform {
     var panOffset: SIMD2<Float>
@@ -761,4 +871,3 @@ struct GPUTransform {
     var screenHeight: Float
     var rotationAngle: Float
 }
-

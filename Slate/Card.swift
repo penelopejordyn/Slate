@@ -90,10 +90,11 @@ class Card: Identifiable {
         // TR: ( W, -H) -> Should map to Image Top-Right UV(1, 1)
         // BR: ( W,  H) -> Should map to Image Bottom-Right UV(1, 0)
 
-        let v1 = StrokeVertex(position: SIMD2<Float>(-halfW, -halfH), uv: SIMD2<Float>(0, 1)) // Top-Left
-        let v2 = StrokeVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(0, 0)) // Bot-Left
-        let v3 = StrokeVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1, 1)) // Top-Right
-        let v4 = StrokeVertex(position: SIMD2<Float>( halfW,  halfH), uv: SIMD2<Float>(1, 0)) // Bot-Right
+        let white = SIMD4<Float>(1, 1, 1, 1) // Cards don't use vertex color
+        let v1 = StrokeVertex(position: SIMD2<Float>(-halfW, -halfH), uv: SIMD2<Float>(0, 1), color: white) // Top-Left
+        let v2 = StrokeVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(0, 0), color: white) // Bot-Left
+        let v3 = StrokeVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1, 1), color: white) // Top-Right
+        let v4 = StrokeVertex(position: SIMD2<Float>( halfW,  halfH), uv: SIMD2<Float>(1, 0), color: white) // Bot-Right
 
         // Triangle Strip or List (List is safer for mixed geometry)
         // Tri 1: TL -> BL -> TR

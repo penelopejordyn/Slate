@@ -1,15 +1,6 @@
-// Stroke.swift models pen and pencil strokes, including coordinate transforms and tessellation helpers.
+// Stroke.swift models pen and pencil strokes using distance-to-segment SDF instancing.
 import SwiftUI
 import Metal
-
-/// A sub-section of a stroke for geometry chunking.
-/// Large strokes are divided into chunks to enable sub-stroke culling.
-/// Only visible chunks are sent to the GPU, reducing vertex processing overhead.
-struct StrokeChunk {
-    let vertexStart: Int
-    let vertexCount: Int
-    let boundingBox: CGRect
-}
 
 /// A stroke on the infinite canvas using Floating Origin architecture.
 ///
@@ -20,34 +11,22 @@ struct StrokeChunk {
 /// **Key Concept:** Instead of storing absolute world coordinates (which cause precision
 /// issues at high zoom), we store:
 /// - An `origin` (anchor point) within the current Frame (Double precision, but always small)
-/// - All vertices as Float offsets from that origin (local coords)
-///
-/// This ensures the GPU only ever receives small Float values, eliminating precision gaps.
-/// The stroke never needs to know if it exists at 10^100 zoom or 10^-50 zoom.
-///
-/// ** OPTIMIZATION: Buffer Caching**
-/// Changed from struct to class to cache the GPU vertex buffer.
-/// The buffer is created ONCE when the stroke is committed, eliminating
-/// the CPU overhead of creating new buffers 60 times per second.
+/// - All segment endpoints as Float offsets from that origin (local coords)
 class Stroke: Identifiable {
     let id: UUID
     let origin: SIMD2<Double>           // Anchor point within the Frame (Double precision, always small)
-    let localVertices: [SIMD2<Float>]   // Vertices relative to origin (Float precision)
     let worldWidth: Double              // Width in world units
     let color: SIMD4<Float>
+    let zoomEffectiveAtCreation: Float  // Effective zoom when the stroke was committed
 
-    //  OPTIMIZATION: Cached GPU Buffer
-    // Created once in init, reused every frame
-    var vertexBuffer: MTLBuffer?
+    /// GPU segment instances for SDF rendering
+    let segments: [StrokeSegmentInstance]
+    var segmentBuffer: MTLBuffer?
 
-    //  OPTIMIZATION: Bounding Box for Culling
-    // Calculated once in init, used to skip off-screen strokes
+    /// Bounding box in local space for culling
     var localBounds: CGRect = .zero
-
-    //  OPTIMIZATION: Geometry Chunking
-    // Large strokes are divided into chunks for sub-stroke culling
-    // Only visible chunks are rendered, drastically reducing GPU vertex processing
-    var chunks: [StrokeChunk] = []
+    /// Optional duplicate for future BVH/tiling
+    var segmentBounds: CGRect = .zero
 
     /// Initialize stroke from screen-space points using direct delta calculation.
     /// This avoids Double precision loss at extreme zoom levels by calculating
@@ -62,9 +41,10 @@ class Stroke: Identifiable {
     ///   - rotationAngle: Camera rotation angle
     ///   - color: Stroke color
     ///   - baseWidth: Base stroke width in world units (before zoom adjustment)
+    ///   - zoomEffectiveAtCreation: Effective zoom at commit time for disappearance logic
     ///   - device: MTLDevice for creating cached vertex buffer
     ///  UPGRADED: Now accepts Double for zoom and pan to maintain precision
-    ///  OPTIMIZATION: Now caches vertex buffer and bounding box in init
+    ///  OPTIMIZATION: Now caches GPU segment buffer in init
     init(screenPoints: [CGPoint],
          zoomAtCreation: Double,
          panAtCreation: SIMD2<Double>,
@@ -72,31 +52,32 @@ class Stroke: Identifiable {
          rotationAngle: Float,
          color: SIMD4<Float>,
          baseWidth: Double = 10.0,
+         zoomEffectiveAtCreation: Float,
          device: MTLDevice?) {
         self.id = UUID()
         self.color = color
+        let safeZoom = max(zoomAtCreation, 1e-6)
+        self.zoomEffectiveAtCreation = max(zoomEffectiveAtCreation, 1e-6)
 
         guard let firstScreenPt = screenPoints.first else {
             self.origin = .zero
-            self.localVertices = []
+            self.segments = []
             self.worldWidth = 0
+            self.localBounds = .null
+            self.segmentBounds = .null
             return
         }
 
         // 1. CALCULATE ORIGIN (ABSOLUTE) -  HIGH PRECISION FIX
-        // We still need the absolute world position for the anchor, so we know WHERE the stroke is.
-        // Only convert the FIRST point to world coordinates.
-        // Use the Pure Double helper so the anchor is precise at 1,000,000x zoom
         self.origin = screenToWorldPixels_PureDouble(firstScreenPt,
                                                      viewSize: viewSize,
                                                      panOffset: panAtCreation,
-                                                     zoomScale: zoomAtCreation,
+                                                     zoomScale: safeZoom,
                                                      rotationAngle: rotationAngle)
 
         // 2. CALCULATE GEOMETRY (RELATIVE) - THE FIX for Double precision
         //  Calculate shape directly from screen deltas: (ScreenPoint - FirstScreenPoint) / Zoom
-        // This preserves perfect smoothness regardless of world coordinates.
-        let zoom = zoomAtCreation
+        let zoom = safeZoom
         let angle = Double(rotationAngle)
         let c = cos(angle)
         let s = sin(angle)
@@ -117,81 +98,91 @@ class Stroke: Identifiable {
             return SIMD2<Float>(Float(worldDx), Float(worldDy))
         }
 
+        // 2.5. Clamp center points to prevent excessive counts
+        var centerPoints = relativePoints
+
+        let maxCenterPoints = 1000  // Maximum number of centerline points per stroke
+        if centerPoints.count > maxCenterPoints {
+            let step = max(1, centerPoints.count / maxCenterPoints)
+            var downsampled: [SIMD2<Float>] = []
+            downsampled.reserveCapacity(maxCenterPoints + 1)
+
+            for i in stride(from: 0, to: centerPoints.count, by: step) {
+                downsampled.append(centerPoints[i])
+            }
+            if let last = centerPoints.last, last != downsampled.last {
+                downsampled.append(last)
+            }
+
+            centerPoints = downsampled
+        }
+
         // 3. World width is the base width divided by zoom
         let worldWidth = baseWidth / zoom
         self.worldWidth = worldWidth
 
-        // 4. Tessellate in LOCAL space (no view-specific transforms)
-        self.localVertices = tessellateStrokeLocal(
-            centerPoints: relativePoints,
-            width: Float(worldWidth)
-        )
+        // 4. Build segment instances
+        let builtSegments = Stroke.buildSegments(from: centerPoints, color: color)
+        self.segments = builtSegments
 
-        // 5.  OPTIMIZATION: Create Cached Buffer
-        // This is done ONCE here, not 60 times per second in drawStroke
-        if let device = device, !localVertices.isEmpty {
-            self.vertexBuffer = device.makeBuffer(
-                bytes: localVertices,
-                length: localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
+        // 5. Calculate bounds expanded by stroke radius for culling
+        let bounds = Stroke.calculateBounds(for: centerPoints, radius: Float(worldWidth) * 0.5)
+        self.localBounds = bounds
+        self.segmentBounds = bounds
+
+        // 6. Create cached segment buffer
+        if let device = device, !builtSegments.isEmpty {
+            self.segmentBuffer = device.makeBuffer(
+                bytes: builtSegments,
+                length: builtSegments.count * MemoryLayout<StrokeSegmentInstance>.stride,
                 options: .storageModeShared
             )
         }
+    }
+}
 
-        // 6.  OPTIMIZATION: Generate Chunks for Sub-Stroke Culling
-        // Break the stroke into smaller pieces so we can cull them individually
-        self.generateChunks()
+// MARK: - Helpers
+extension Stroke {
+    static func buildSegments(from points: [SIMD2<Float>], color: SIMD4<Float>) -> [StrokeSegmentInstance] {
+        guard !points.isEmpty else { return [] }
 
-        // 7.  OPTIMIZATION: Calculate Global Bounding Box
-        // Union of all chunk bounding boxes
-        if !chunks.isEmpty {
-            self.localBounds = chunks.reduce(CGRect.null) { $0.union($1.boundingBox) }
+        if points.count == 1 {
+            let p = points[0]
+            return [StrokeSegmentInstance(p0: p, p1: p, color: color)]
         }
+
+        var segments: [StrokeSegmentInstance] = []
+        segments.reserveCapacity(points.count - 1)
+
+        for i in 0..<(points.count - 1) {
+            let p0 = points[i]
+            let p1 = points[i + 1]
+            segments.append(StrokeSegmentInstance(p0: p0, p1: p1, color: color))
+        }
+
+        return segments
     }
 
-    /// Generate chunks for sub-stroke culling.
-    /// Large strokes are divided into blocks of vertices to enable fine-grained culling.
-    /// Only visible chunks are sent to the GPU, reducing vertex processing overhead.
-    private func generateChunks() {
-        guard !localVertices.isEmpty else { return }
+    static func calculateBounds(for points: [SIMD2<Float>], radius: Float) -> CGRect {
+        guard let first = points.first else { return .null }
 
-        // Chunk Size: How many vertices per chunk?
-        // Too small = Too many CPU draw calls
-        // Too big = Ineffective culling
-        // 192 vertices = 32 quads (64 triangles). Good balance.
-        let chunkSize = 192
-        var offset = 0
+        var minX = first.x
+        var maxX = first.x
+        var minY = first.y
+        var maxY = first.y
 
-        while offset < localVertices.count {
-            let count = min(chunkSize, localVertices.count - offset)
-
-            // Calculate Bounding Box for THIS chunk
-            var minX = Float.greatestFiniteMagnitude
-            var maxX = -Float.greatestFiniteMagnitude
-            var minY = Float.greatestFiniteMagnitude
-            var maxY = -Float.greatestFiniteMagnitude
-
-            for i in offset..<(offset + count) {
-                let v = localVertices[i]
-                if v.x < minX { minX = v.x }
-                if v.x > maxX { maxX = v.x }
-                if v.y < minY { minY = v.y }
-                if v.y > maxY { maxY = v.y }
-            }
-
-            let chunkBounds = CGRect(
-                x: Double(minX),
-                y: Double(minY),
-                width: Double(maxX - minX),
-                height: Double(maxY - minY)
-            )
-
-            chunks.append(StrokeChunk(
-                vertexStart: offset,
-                vertexCount: count,
-                boundingBox: chunkBounds
-            ))
-
-            offset += count
+        for p in points.dropFirst() {
+            minX = min(minX, p.x)
+            maxX = max(maxX, p.x)
+            minY = min(minY, p.y)
+            maxY = max(maxY, p.y)
         }
+
+        minX -= radius
+        maxX += radius
+        minY -= radius
+        maxY += radius
+
+        return CGRect(x: Double(minX), y: Double(minY), width: Double(maxX - minX), height: Double(maxY - minY))
     }
 }

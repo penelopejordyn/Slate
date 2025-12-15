@@ -50,9 +50,9 @@ func catmullRomPoints(points: [CGPoint],
         // Rule: 1 segment per 2 pixels of length
         // This prevents vertex explosion for slow strokes where points are close together
         // Min: 1 segment (don't generate zero segments)
-        // Max: 20 segments (don't over-smooth long lines)
+        // Max: 4 segments (reduced from 20 for GPU performance - offset math happens in shader now)
         let estimatedSegments = Int(segmentDistance / 2.0)
-        let adaptiveSegments = min(max(1, estimatedSegments), 20)
+        let adaptiveSegments = min(max(1, estimatedSegments), 4)
 
         // Subdivide using the adaptive segment count
         for j in 1...adaptiveSegments {
