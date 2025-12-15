@@ -28,6 +28,17 @@ private class DragContext {
 
 // MARK: - TouchableMTKView
 class TouchableMTKView: MTKView {
+    private var isRunningOnMac: Bool {
+        #if targetEnvironment(macCatalyst)
+        return true
+        #else
+        if #available(iOS 14.0, *) {
+            return ProcessInfo.processInfo.isiOSAppOnMac
+        }
+        return false
+        #endif
+    }
+
     weak var coordinator: Coordinator?
 
     var panGesture: UIPanGestureRecognizer!
@@ -299,13 +310,29 @@ class TouchableMTKView: MTKView {
         panGesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         panGesture.minimumNumberOfTouches = 1
         panGesture.maximumNumberOfTouches = 1
-        // Crucial: Ignore Apple Pencil for panning/dragging
-        panGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        // Crucial: Ignore Apple Pencil for panning/dragging.
+        // On Mac Catalyst, prefer two-finger trackpad scrolling for panning so click-drag can be used for drawing.
+        if isRunningOnMac {
+            panGesture.allowedTouchTypes = []
+            if #available(iOS 13.4, macCatalyst 13.4, *) {
+                panGesture.allowedScrollTypesMask = [.continuous, .discrete]
+            }
+        } else {
+            panGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        }
         addGestureRecognizer(panGesture)
 
         //  MODAL INPUT: TAP (Finger Only - Select/Edit Cards)
         let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
-        tapGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        if isRunningOnMac {
+            var tapTouchTypes: [NSNumber] = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+            if #available(iOS 13.4, macCatalyst 13.4, *) {
+                tapTouchTypes.append(NSNumber(value: UITouch.TouchType.indirectPointer.rawValue))
+            }
+            tapGesture.allowedTouchTypes = tapTouchTypes
+        } else {
+            tapGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        }
         addGestureRecognizer(tapGesture)
 
         pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
@@ -323,7 +350,15 @@ class TouchableMTKView: MTKView {
         cardLongPressGesture = UILongPressGestureRecognizer(target: self, action: #selector(handleCardLongPress(_:)))
         cardLongPressGesture.minimumPressDuration = 0.5
         cardLongPressGesture.numberOfTouchesRequired = 1
-        cardLongPressGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)] // Finger only
+        if isRunningOnMac {
+            var longPressTouchTypes: [NSNumber] = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+            if #available(iOS 13.4, macCatalyst 13.4, *) {
+                longPressTouchTypes.append(NSNumber(value: UITouch.TouchType.indirectPointer.rawValue))
+            }
+            cardLongPressGesture.allowedTouchTypes = longPressTouchTypes
+        } else {
+            cardLongPressGesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)] // Finger only
+        }
         addGestureRecognizer(cardLongPressGesture)
 
         panGesture.delegate = self
@@ -409,7 +444,7 @@ class TouchableMTKView: MTKView {
             }
             dragContext = nil // Pan Canvas
 
-        case .changed:
+	        case .changed:
             let translation = gesture.translation(in: self)
 
             if let context = dragContext {
@@ -480,9 +515,20 @@ class TouchableMTKView: MTKView {
                 return
             }
 
-            // Normal incremental zoom (always relative)
-            coord.zoomScale *= Double(gesture.scale)
-            gesture.scale = 1.0
+	            // Normal incremental zoom (always relative).
+	            //
+	            // On Mac (Catalyst / iOS app on Mac), trackpad pinch deltas are much more aggressive than iPad,
+	            // so we dampen the gesture scale to slow zoom down.
+	            let rawScale = max(Double(gesture.scale), 1e-6)
+	            let appliedScale: Double
+	            if isRunningOnMac {
+	                let macZoomSensitivity = 0.25
+	                appliedScale = pow(rawScale, macZoomSensitivity)
+	            } else {
+	                appliedScale = rawScale
+	            }
+	            coord.zoomScale *= appliedScale
+	            gesture.scale = 1.0
 
             // 🔑 IMPORTANT: depth switches are driven by the *shared anchor*,
             // not by re-sampling world from the current centroid.
@@ -591,12 +637,18 @@ class TouchableMTKView: MTKView {
 
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard event?.allTouches?.count == 1, let touch = touches.first else { return }
+        guard let touch = touches.first else { return }
+        if !isRunningOnMac {
+            guard event?.allTouches?.count == 1 else { return }
+        }
         let location = touch.location(in: self)
         coordinator?.handleTouchBegan(at: location, touchType: touch.type)
     }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard event?.allTouches?.count == 1, let touch = touches.first else { return }
+        guard let touch = touches.first else { return }
+        if !isRunningOnMac {
+            guard event?.allTouches?.count == 1 else { return }
+        }
         let location = touch.location(in: self)
 
         //  GET PREDICTED TOUCHES
@@ -615,12 +667,18 @@ class TouchableMTKView: MTKView {
                                     touchType: touch.type)
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard event?.allTouches?.count == 1, let touch = touches.first else { return }
+        guard let touch = touches.first else { return }
+        if !isRunningOnMac {
+            guard event?.allTouches?.count == 1 else { return }
+        }
         let location = touch.location(in: self)
         coordinator?.handleTouchEnded(at: location, touchType: touch.type)
     }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard event?.allTouches?.count == 1, let touch = touches.first else { return }
+        guard let touch = touches.first else { return }
+        if !isRunningOnMac {
+            guard event?.allTouches?.count == 1 else { return }
+        }
         coordinator?.handleTouchCancelled(touchType: touch.type)
     }
 }

@@ -25,6 +25,7 @@ fileprivate struct TileKey: Hashable {
 fileprivate struct TileEntry {
     var texture: MTLTexture
     var isDirty: Bool
+    var hasContent: Bool
     var lastUsedFrame: Int
 }
 
@@ -219,7 +220,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         desc.usage = [.renderTarget, .shaderRead]
         desc.storageMode = .private
         guard let tex = device.makeTexture(descriptor: desc) else { return nil }
-        let entry = TileEntry(texture: tex, isDirty: true, lastUsedFrame: frameCounter)
+        let entry = TileEntry(texture: tex, isDirty: true, hasContent: false, lastUsedFrame: frameCounter)
         tileCache[key] = entry
         touchTileLRU(key)
         return tex
@@ -306,6 +307,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         encoder.endEncoding()
 
         entry.isDirty = false
+        entry.hasContent = true
         entry.lastUsedFrame = frameCounter
         tileCache[key] = entry
         touchTileLRU(key)
@@ -397,62 +399,108 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         // Convert cullRadius from screen pixels to world units for inverse culling
 
-        let level = tileLevel(for: currentZoom)
-        let (keys, levelUsed) = visibleTiles(for: frame.id, level: level, cameraCenter: cameraCenterInThisFrame, viewSize: viewSize, zoom: currentZoom)
+        let targetLevelRequested = tileLevel(for: currentZoom)
+        let (targetKeys, targetLevelUsed) = visibleTiles(for: frame.id,
+                                                         level: targetLevelRequested,
+                                                         cameraCenter: cameraCenterInThisFrame,
+                                                         viewSize: viewSize,
+                                                         zoom: currentZoom)
 
-        encoder.setRenderPipelineState(tilePipelineState)
-        encoder.setDepthStencilState(stencilStateDefault)
+        // Dual-layer rendering: draw a coarser parent level first as fallback, then draw the target level on top.
+        // This prevents holes/flicker while higher-res tiles are being baked/throttled.
+        let fallbackLevelRequested = targetLevelUsed - 1
+        let (fallbackKeys, fallbackLevelUsed) = visibleTiles(for: frame.id,
+                                                             level: fallbackLevelRequested,
+                                                             cameraCenter: cameraCenterInThisFrame,
+                                                             viewSize: viewSize,
+                                                             zoom: currentZoom)
 
-        // All tiles for `levelUsed` share the same world size and texture padding.
-        let tileWorldSide = tileWorldSize(for: levelUsed)
-        let halfW = Float(tileWorldSide * 0.5)
-        let halfH = Float(tileWorldSide * 0.5)
-        let tileTexSide = Float(TILE_SIZE_PX + TILE_PAD_PX * 2)
-        let padU = Float(TILE_PAD_PX) / tileTexSide
-        let padV = Float(TILE_PAD_PX) / tileTexSide
-        // NOTE: Tile textures are render targets; their sampling orientation differs from image cards.
-        // Use v=0 at top (like the original tile path) to avoid vertical flipping.
-        let tileVertices: [CardQuadVertex] = [
-            CardQuadVertex(position: SIMD2<Float>(-halfW, -halfH), uv: SIMD2<Float>(padU, padV)),             // Top-Left
-            CardQuadVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(padU, 1 - padV)),         // Bottom-Left
-            CardQuadVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1 - padU, padV)),         // Top-Right
-            CardQuadVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(padU, 1 - padV)),         // Bottom-Left
-            CardQuadVertex(position: SIMD2<Float>( halfW,  halfH), uv: SIMD2<Float>(1 - padU, 1 - padV)),     // Bottom-Right
-            CardQuadVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1 - padU, padV))          // Top-Right
-        ]
-        guard let tileVertexBuffer = device.makeBuffer(bytes: tileVertices,
-                                                       length: tileVertices.count * MemoryLayout<CardQuadVertex>.stride,
-                                                       options: .storageModeShared) else { return }
-        encoder.setVertexBuffer(tileVertexBuffer, offset: 0, index: 0)
+        func drawTileSet(keys: [TileKey], levelUsed: Int, allowBake: Bool) {
+            guard !keys.isEmpty else { return }
 
-        for key in keys {
-            _ = bakeTileIfNeeded(key: key, frame: frame, level: levelUsed, strokes: frame.strokes, bakeCommandBuffer: bakeCommandBuffer)
-            guard let entry = tileCache[key] else { continue }
-            var updatedEntry = entry
-            updatedEntry.lastUsedFrame = frameCounter
-            tileCache[key] = updatedEntry
-            touchTileLRU(key)
-
-            let tileRect = self.tileRect(for: key)
-            let centerX = tileRect.midX
-            let centerY = tileRect.midY
-
-            let relativeOffset = SIMD2<Float>(Float(centerX - cameraCenterInThisFrame.x),
-                                              Float(centerY - cameraCenterInThisFrame.y))
-
-            var transform = CardTransform(
-                relativeOffset: relativeOffset,
-                zoomScale: Float(currentZoom),
-                screenWidth: Float(viewSize.width),
-                screenHeight: Float(viewSize.height),
-                rotationAngle: currentRotation
-            )
-
-            encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
-            encoder.setFragmentTexture(entry.texture, index: 0)
+            encoder.setRenderPipelineState(tilePipelineState)
+            encoder.setDepthStencilState(stencilStateDefault)
             encoder.setFragmentSamplerState(samplerState, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+            let tileWorldSide = tileWorldSize(for: levelUsed)
+            let tileHalfSide = tileWorldSide * 0.5
+
+            // All tiles for a given level share the same world size and texture padding.
+            let halfW = Float(tileHalfSide)
+            let halfH = Float(tileHalfSide)
+            let tileTexSide = Float(TILE_SIZE_PX + TILE_PAD_PX * 2)
+            let padU = Float(TILE_PAD_PX) / tileTexSide
+            let padV = Float(TILE_PAD_PX) / tileTexSide
+
+            // NOTE: Tile textures are render targets; their sampling orientation differs from image cards.
+            // Use v=0 at top (like the original tile path) to avoid vertical flipping.
+            let tileVertices: [CardQuadVertex] = [
+                CardQuadVertex(position: SIMD2<Float>(-halfW, -halfH), uv: SIMD2<Float>(padU, padV)),             // Top-Left
+                CardQuadVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(padU, 1 - padV)),         // Bottom-Left
+                CardQuadVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1 - padU, padV)),         // Top-Right
+                CardQuadVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(padU, 1 - padV)),         // Bottom-Left
+                CardQuadVertex(position: SIMD2<Float>( halfW,  halfH), uv: SIMD2<Float>(1 - padU, 1 - padV)),     // Bottom-Right
+                CardQuadVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1 - padU, padV))          // Top-Right
+            ]
+            guard let tileVertexBuffer = device.makeBuffer(bytes: tileVertices,
+                                                           length: tileVertices.count * MemoryLayout<CardQuadVertex>.stride,
+                                                           options: .storageModeShared) else { return }
+            encoder.setVertexBuffer(tileVertexBuffer, offset: 0, index: 0)
+
+            let orderedKeys: [TileKey]
+            if allowBake {
+                // Prioritize tiles closest to the camera so throttling doesn't leave holes on-screen.
+                orderedKeys = keys.sorted { a, b in
+                    let ax = (Double(a.x) * tileWorldSide + tileHalfSide) - cameraCenterInThisFrame.x
+                    let ay = (Double(a.y) * tileWorldSide + tileHalfSide) - cameraCenterInThisFrame.y
+                    let bx = (Double(b.x) * tileWorldSide + tileHalfSide) - cameraCenterInThisFrame.x
+                    let by = (Double(b.y) * tileWorldSide + tileHalfSide) - cameraCenterInThisFrame.y
+                    return (ax * ax + ay * ay) < (bx * bx + by * by)
+                }
+            } else {
+                orderedKeys = keys
+            }
+
+            for key in orderedKeys {
+                if allowBake {
+                    _ = bakeTileIfNeeded(key: key,
+                                         frame: frame,
+                                         level: levelUsed,
+                                         strokes: frame.strokes,
+                                         bakeCommandBuffer: bakeCommandBuffer)
+                }
+
+                guard var entry = tileCache[key] else { continue }
+                // Never draw unbaked textures (they may contain undefined memory); rely on fallback instead.
+                guard entry.hasContent else { continue }
+
+                entry.lastUsedFrame = frameCounter
+                tileCache[key] = entry
+                touchTileLRU(key)
+
+                let centerX = Double(key.x) * tileWorldSide + tileHalfSide
+                let centerY = Double(key.y) * tileWorldSide + tileHalfSide
+                let relativeOffset = SIMD2<Float>(Float(centerX - cameraCenterInThisFrame.x),
+                                                  Float(centerY - cameraCenterInThisFrame.y))
+
+                var transform = CardTransform(
+                    relativeOffset: relativeOffset,
+                    zoomScale: Float(currentZoom),
+                    screenWidth: Float(viewSize.width),
+                    screenHeight: Float(viewSize.height),
+                    rotationAngle: currentRotation
+                )
+
+                encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+                encoder.setFragmentTexture(entry.texture, index: 0)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            }
         }
+
+        // Fallback layer (low-res) first.
+        drawTileSet(keys: fallbackKeys, levelUsed: fallbackLevelUsed, allowBake: false)
+        // Target layer (high-res) on top.
+        drawTileSet(keys: targetKeys, levelUsed: targetLevelUsed, allowBake: true)
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
         for card in frame.cards {
@@ -1367,13 +1415,35 @@ class Coordinator: NSObject, MTKViewDelegate {
         return result
     }
 
-    // MARK: - Touch Handling
+	    // MARK: - Touch Handling
 
-    func handleTouchBegan(at point: CGPoint, touchType: UITouch.TouchType) {
-        //  MODAL INPUT: Only allow Pencil for drawing
-        guard touchType == .pencil else { return }
+	    private var isRunningOnMac: Bool {
+	#if targetEnvironment(macCatalyst)
+	        return true
+	#else
+	        if #available(iOS 14.0, *) {
+	            return ProcessInfo.processInfo.isiOSAppOnMac
+	        }
+	        return false
+	#endif
+	    }
 
-        guard let view = metalView else { return }
+	    private func isDrawingTouchType(_ touchType: UITouch.TouchType) -> Bool {
+	        if touchType == .pencil { return true }
+	        guard isRunningOnMac else { return false }
+
+	        // iOS app on Mac / Mac Catalyst: allow mouse/trackpad drawing.
+	        if #available(iOS 13.4, macCatalyst 13.4, *) {
+	            return touchType == .indirectPointer || touchType == .direct
+	        }
+	        return touchType == .direct
+	    }
+	
+	    func handleTouchBegan(at point: CGPoint, touchType: UITouch.TouchType) {
+	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
+	        guard isDrawingTouchType(touchType) else { return }
+	
+	        guard let view = metalView else { return }
 
         // USE NEW HIERARCHICAL HIT TEST
         // This checks children (foreground), active frame (middle), and parent (background)
@@ -1408,9 +1478,9 @@ class Coordinator: NSObject, MTKViewDelegate {
         currentTouchPoints = [point]
     }
 
-    func handleTouchMoved(at point: CGPoint, predicted: [CGPoint], touchType: UITouch.TouchType) {
-        //  MODAL INPUT: Only allow Pencil for drawing
-        guard touchType == .pencil else { return }
+	    func handleTouchMoved(at point: CGPoint, predicted: [CGPoint], touchType: UITouch.TouchType) {
+	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
+	        guard isDrawingTouchType(touchType) else { return }
 
         //  OPTIMIZATION: Distance Filter
         // Only add the point if it's far enough from the last one (e.g., 2.0 pixels)
@@ -1436,9 +1506,9 @@ class Coordinator: NSObject, MTKViewDelegate {
         predictedTouchPoints = predicted
     }
 
-    func handleTouchEnded(at point: CGPoint, touchType: UITouch.TouchType) {
-        //  MODAL INPUT: Only allow Pencil for drawing
-        guard touchType == .pencil, let target = currentDrawingTarget else { return }
+	    func handleTouchEnded(at point: CGPoint, touchType: UITouch.TouchType) {
+	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
+	        guard isDrawingTouchType(touchType), let target = currentDrawingTarget else { return }
 
         guard let view = metalView else { return }
 
@@ -1538,9 +1608,9 @@ class Coordinator: NSObject, MTKViewDelegate {
         lastSavedPoint = nil  // Clear for next stroke
     }
 
-    func handleTouchCancelled(touchType: UITouch.TouchType) {
-        //  MODAL INPUT: Only allow Pencil for drawing
-        guard touchType == .pencil else { return }
+	    func handleTouchCancelled(touchType: UITouch.TouchType) {
+	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
+	        guard isDrawingTouchType(touchType) else { return }
         predictedTouchPoints = []  // Clear predictions
         currentTouchPoints = []
         liveStrokeOrigin = nil  // Clear temporary origin
