@@ -13,16 +13,36 @@ struct StrokeVertex {
     var color: SIMD4<Float>      // Vertex color (baked for batching)
 }
 
+/// Instance data for distance-field stroke segments
+struct StrokeSegmentInstance {
+    var p0: SIMD2<Float>      // Stroke-local centerline point 0
+    var p1: SIMD2<Float>      // Stroke-local centerline point 1
+    var color: SIMD4<Float>   // RGBA
+}
+
+/// Vertex for the reusable unit quad used by instanced segment rendering
+struct QuadVertex {
+    var corner: SIMD2<Float>
+}
+
+/// Simple position/UV vertex for card/tile quads
+struct CardQuadVertex {
+    var position: SIMD2<Float>
+    var uv: SIMD2<Float>
+}
+
 // MARK: - Transform Structures
 
 /// Transform for ICB stroke rendering (position offset calculated on GPU)
 struct StrokeTransform {
     var relativeOffset: SIMD2<Float>  // Stroke position relative to camera
+    var rotatedOffsetScreen: SIMD2<Float> // Relative offset rotated and scaled to screen pixels
     var zoomScale: Float
     var screenWidth: Float
     var screenHeight: Float
     var rotationAngle: Float
     var halfPixelWidth: Float           // Half-width of stroke in screen pixels (for screen-space extrusion)
+    var featherPx: Float                // Feather amount in pixels for SDF edge
 }
 
 /// Transform for card rendering (not batched, includes offset)
@@ -851,4 +871,3 @@ struct GPUTransform {
     var screenHeight: Float
     var rotationAngle: Float
 }
-

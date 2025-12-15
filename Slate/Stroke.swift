@@ -1,15 +1,6 @@
-// Stroke.swift models pen and pencil strokes, including coordinate transforms and tessellation helpers.
+// Stroke.swift models pen and pencil strokes using distance-to-segment SDF instancing.
 import SwiftUI
 import Metal
-
-/// A compact, value-type node for cache-friendly traversal
-struct FlatBVHNode {
-    let bounds: CGRect
-    let vertexStart: Int
-    let vertexCount: Int
-    let leftIndex: Int // Index in the flat array (-1 if leaf)
-    let rightIndex: Int // Index in the flat array (-1 if leaf)
-}
 
 /// A stroke on the infinite canvas using Floating Origin architecture.
 ///
@@ -20,34 +11,22 @@ struct FlatBVHNode {
 /// **Key Concept:** Instead of storing absolute world coordinates (which cause precision
 /// issues at high zoom), we store:
 /// - An `origin` (anchor point) within the current Frame (Double precision, but always small)
-/// - All vertices as Float offsets from that origin (local coords)
-///
-/// This ensures the GPU only ever receives small Float values, eliminating precision gaps.
-/// The stroke never needs to know if it exists at 10^100 zoom or 10^-50 zoom.
-///
-/// ** OPTIMIZATION: Buffer Caching**
-/// Changed from struct to class to cache the GPU vertex buffer.
-/// The buffer is created ONCE when the stroke is committed, eliminating
-/// the CPU overhead of creating new buffers 60 times per second.
+/// - All segment endpoints as Float offsets from that origin (local coords)
 class Stroke: Identifiable {
     let id: UUID
     let origin: SIMD2<Double>           // Anchor point within the Frame (Double precision, always small)
-    let localVertices: [StrokeVertex]   // Vertices with color baked in for batching
     let worldWidth: Double              // Width in world units
     let color: SIMD4<Float>
+    let zoomEffectiveAtCreation: Float  // Effective zoom when the stroke was committed
 
-    //  OPTIMIZATION: Cached GPU Buffer
-    // Created once in init, reused every frame
-    var vertexBuffer: MTLBuffer?
+    /// GPU segment instances for SDF rendering
+    let segments: [StrokeSegmentInstance]
+    var segmentBuffer: MTLBuffer?
 
-    //  OPTIMIZATION: Bounding Box for Culling
-    // Calculated once in init, used to skip off-screen strokes
+    /// Bounding box in local space for culling
     var localBounds: CGRect = .zero
-
-    //  OPTIMIZATION: Flat Array BVH for Cache-Friendly Culling
-    // Linear memory layout allows CPU pre-fetching, drastically reducing frame time
-    // Root is at the end of the array, leaves are 32-vertex chunks
-    var flatNodes: [FlatBVHNode] = []
+    /// Optional duplicate for future BVH/tiling
+    var segmentBounds: CGRect = .zero
 
     /// Initialize stroke from screen-space points using direct delta calculation.
     /// This avoids Double precision loss at extreme zoom levels by calculating
@@ -62,9 +41,10 @@ class Stroke: Identifiable {
     ///   - rotationAngle: Camera rotation angle
     ///   - color: Stroke color
     ///   - baseWidth: Base stroke width in world units (before zoom adjustment)
+    ///   - zoomEffectiveAtCreation: Effective zoom at commit time for disappearance logic
     ///   - device: MTLDevice for creating cached vertex buffer
     ///  UPGRADED: Now accepts Double for zoom and pan to maintain precision
-    ///  OPTIMIZATION: Now caches vertex buffer and bounding box in init
+    ///  OPTIMIZATION: Now caches GPU segment buffer in init
     init(screenPoints: [CGPoint],
          zoomAtCreation: Double,
          panAtCreation: SIMD2<Double>,
@@ -72,31 +52,32 @@ class Stroke: Identifiable {
          rotationAngle: Float,
          color: SIMD4<Float>,
          baseWidth: Double = 10.0,
+         zoomEffectiveAtCreation: Float,
          device: MTLDevice?) {
         self.id = UUID()
         self.color = color
+        let safeZoom = max(zoomAtCreation, 1e-6)
+        self.zoomEffectiveAtCreation = max(zoomEffectiveAtCreation, 1e-6)
 
         guard let firstScreenPt = screenPoints.first else {
             self.origin = .zero
-            self.localVertices = []
+            self.segments = []
             self.worldWidth = 0
+            self.localBounds = .null
+            self.segmentBounds = .null
             return
         }
 
         // 1. CALCULATE ORIGIN (ABSOLUTE) -  HIGH PRECISION FIX
-        // We still need the absolute world position for the anchor, so we know WHERE the stroke is.
-        // Only convert the FIRST point to world coordinates.
-        // Use the Pure Double helper so the anchor is precise at 1,000,000x zoom
         self.origin = screenToWorldPixels_PureDouble(firstScreenPt,
                                                      viewSize: viewSize,
                                                      panOffset: panAtCreation,
-                                                     zoomScale: zoomAtCreation,
+                                                     zoomScale: safeZoom,
                                                      rotationAngle: rotationAngle)
 
         // 2. CALCULATE GEOMETRY (RELATIVE) - THE FIX for Double precision
         //  Calculate shape directly from screen deltas: (ScreenPoint - FirstScreenPoint) / Zoom
-        // This preserves perfect smoothness regardless of world coordinates.
-        let zoom = zoomAtCreation
+        let zoom = safeZoom
         let angle = Double(rotationAngle)
         let c = cos(angle)
         let s = sin(angle)
@@ -117,7 +98,7 @@ class Stroke: Identifiable {
             return SIMD2<Float>(Float(worldDx), Float(worldDy))
         }
 
-        // 2.5. Clamp center points to prevent excessive vertex counts
+        // 2.5. Clamp center points to prevent excessive counts
         var centerPoints = relativePoints
 
         let maxCenterPoints = 1000  // Maximum number of centerline points per stroke
@@ -140,100 +121,67 @@ class Stroke: Identifiable {
         let worldWidth = baseWidth / zoom
         self.worldWidth = worldWidth
 
-        // 4. Tessellate in LOCAL space using CENTERLINE approach
-        // New: GPU will extrude to screen-space thickness, keeping strokes sharp at all zoom levels
-        let vertices = tessellateCenterlineVertices(
-            points: centerPoints,
-            color: color
-        )
+        // 4. Build segment instances
+        let builtSegments = Stroke.buildSegments(from: centerPoints, color: color)
+        self.segments = builtSegments
 
-        // 4.5. Safety net: prevent excessive vertex counts
-        let maxVertices = 60_000
-        if vertices.count > maxVertices {
-            // Drop stroke if it would be too expensive to render
-            self.localVertices = []
-            self.vertexBuffer = nil
-            self.localBounds = .null
-            self.flatNodes = []
-            return
-        }
+        // 5. Calculate bounds expanded by stroke radius for culling
+        let bounds = Stroke.calculateBounds(for: centerPoints, radius: Float(worldWidth) * 0.5)
+        self.localBounds = bounds
+        self.segmentBounds = bounds
 
-        self.localVertices = vertices
-
-        // 5.  OPTIMIZATION: Create Cached Buffer
-        // This is done ONCE here, not 60 times per second in drawStroke
-        if let device = device, !localVertices.isEmpty {
-            self.vertexBuffer = device.makeBuffer(
-                bytes: localVertices,
-                length: localVertices.count * MemoryLayout<StrokeVertex>.stride,
+        // 6. Create cached segment buffer
+        if let device = device, !builtSegments.isEmpty {
+            self.segmentBuffer = device.makeBuffer(
+                bytes: builtSegments,
+                length: builtSegments.count * MemoryLayout<StrokeSegmentInstance>.stride,
                 options: .storageModeShared
             )
         }
+    }
+}
 
-        // 6.  OPTIMIZATION: Build Linear BVH for Cache-Friendly Culling
-        // Flat array structure eliminates pointer chasing and fits in CPU cache
-        if !localVertices.isEmpty {
-            // Reserve capacity to avoid allocations during build
-            // A binary tree has approx 2*N nodes where N is number of leaves
-            let leafCount = (localVertices.count / 32) + 1
-            flatNodes.reserveCapacity(leafCount * 2)
+// MARK: - Helpers
+extension Stroke {
+    static func buildSegments(from points: [SIMD2<Float>], color: SIMD4<Float>) -> [StrokeSegmentInstance] {
+        guard !points.isEmpty else { return [] }
 
-            let rootIndex = buildLinearBVH(start: 0, count: localVertices.count)
-            if rootIndex >= 0 {
-                self.localBounds = flatNodes[rootIndex].bounds
-            }
+        if points.count == 1 {
+            let p = points[0]
+            return [StrokeSegmentInstance(p0: p, p1: p, color: color)]
         }
+
+        var segments: [StrokeSegmentInstance] = []
+        segments.reserveCapacity(points.count - 1)
+
+        for i in 0..<(points.count - 1) {
+            let p0 = points[i]
+            let p1 = points[i + 1]
+            segments.append(StrokeSegmentInstance(p0: p0, p1: p1, color: color))
+        }
+
+        return segments
     }
 
-    /// Recursive builder that populates the flat array
-    /// Returns the index of the node created
-    /// Uses 32-vertex leaves for balanced performance between culling precision and tree depth
-    private func buildLinearBVH(start: Int, count: Int) -> Int {
-        // LEAF CASE (32 vertices = 16 triangles)
-        // Larger leaves reduce tree depth and traversal overhead
-        if count <= 32 {
-            let bounds = calculateBounds(start: start, count: count)
-            let node = FlatBVHNode(bounds: bounds, vertexStart: start, vertexCount: count, leftIndex: -1, rightIndex: -1)
-            flatNodes.append(node)
-            return flatNodes.count - 1
+    static func calculateBounds(for points: [SIMD2<Float>], radius: Float) -> CGRect {
+        guard let first = points.first else { return .null }
+
+        var minX = first.x
+        var maxX = first.x
+        var minY = first.y
+        var maxY = first.y
+
+        for p in points.dropFirst() {
+            minX = min(minX, p.x)
+            maxX = max(maxX, p.x)
+            minY = min(minY, p.y)
+            maxY = max(maxY, p.y)
         }
 
-        // INTERNAL CASE: Split in half
-        // Children must be created first so their indices are valid
-        let mid = count / 2
-        let leftIdx = buildLinearBVH(start: start, count: mid)
-        let rightIdx = buildLinearBVH(start: start + mid, count: count - mid)
-
-        // Parent bounds is the union of children
-        let totalBounds = flatNodes[leftIdx].bounds.union(flatNodes[rightIdx].bounds)
-        let node = FlatBVHNode(bounds: totalBounds, vertexStart: 0, vertexCount: 0, leftIndex: leftIdx, rightIndex: rightIdx)
-        flatNodes.append(node)
-        return flatNodes.count - 1
-    }
-
-    private func calculateBounds(start: Int, count: Int) -> CGRect {
-        var minX = Float.greatestFiniteMagnitude
-        var maxX = -Float.greatestFiniteMagnitude
-        var minY = Float.greatestFiniteMagnitude
-        var maxY = -Float.greatestFiniteMagnitude
-
-        let end = min(start + count, localVertices.count)
-        for i in start..<end {
-            let pos = localVertices[i].position
-            if pos.x < minX { minX = pos.x }
-            if pos.x > maxX { maxX = pos.x }
-            if pos.y < minY { minY = pos.y }
-            if pos.y > maxY { maxY = pos.y }
-        }
-
-        // Expand bounds by stroke half-width (centerline vertices need expansion for GPU extrusion)
-        // Since we're using centerline vertices, the positions are at the centerline
-        // We need to expand by the maximum stroke radius for accurate culling
-        let halfWidth = Float(worldWidth) * 0.5
-        minX -= halfWidth
-        maxX += halfWidth
-        minY -= halfWidth
-        maxY += halfWidth
+        minX -= radius
+        maxX += radius
+        minY -= radius
+        maxY += radius
 
         return CGRect(x: Double(minX), y: Double(minY), width: Double(maxX - minX), height: Double(maxY - minY))
     }

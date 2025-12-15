@@ -6,11 +6,20 @@ using namespace metal;
 /// Position offset is applied in the vertex shader, not on CPU
 struct StrokeTransform {
     float2 relativeOffset;  // Stroke position relative to camera (Floating Origin)
+    float2 rotatedOffsetScreen; // Relative offset rotated and scaled to screen pixels
     float zoomScale;        // Current zoom level
     float screenWidth;      // Screen dimensions for NDC conversion
     float screenHeight;
     float rotationAngle;    // Camera rotation
     float halfPixelWidth;   // Half-width of stroke in screen pixels (for screen-space extrusion)
+    float featherPx;        // Feather amount in pixels for SDF edge
+};
+
+/// GPU segment instance data for SDF strokes
+struct SegmentInstance {
+    float2 p0;      // stroke-local world
+    float2 p1;      // stroke-local world
+    float4 color;
 };
 
 /// Vertex input for batched stroke rendering
@@ -26,6 +35,96 @@ struct VertexOut {
     float2 uv;
     float4 color;
 };
+
+// MARK: - SDF Segment Rendering
+
+struct QuadIn {
+    float2 corner [[attribute(0)]]; // (0..1, 0..1)
+};
+
+struct SegmentOut {
+    float4 position [[position]];
+    float2 fragScreen;    // pixel coords of this fragment
+    float2 p0Screen;      // segment endpoint in pixels
+    float2 p1Screen;
+    float4 color;
+};
+
+vertex SegmentOut vertex_segment_sdf(
+    QuadIn vin [[stage_in]],
+    constant StrokeTransform *t [[buffer(1)]],
+    const device SegmentInstance *instances [[buffer(2)]],
+    uint iid [[instance_id]]
+) {
+    SegmentInstance seg = instances[iid];
+
+    // 1) Rotate local points
+    float c = cos(t->rotationAngle);
+    float s = sin(t->rotationAngle);
+
+    float2 r0 = float2(seg.p0.x * c - seg.p0.y * s, seg.p0.x * s + seg.p0.y * c);
+    float2 r1 = float2(seg.p1.x * c - seg.p1.y * s, seg.p1.x * s + seg.p1.y * c);
+
+    // 2) Convert to screen pixel space using pre-rotated stroke offset
+    float2 p0 = r0 * t->zoomScale + t->rotatedOffsetScreen;
+    float2 p1 = r1 * t->zoomScale + t->rotatedOffsetScreen;
+
+    float2 d = p1 - p0;
+    float len = length(d);
+    float2 dir = (len > 0.0) ? (d / len) : float2(1.0, 0.0);
+    float2 nrm = float2(-dir.y, dir.x);
+
+    float R = t->halfPixelWidth;
+
+    // 4) Build rectangle around capsule in screen space
+    // x in [-R, len+R], y in [-R, +R]
+    float x = mix(-R, len + R, vin.corner.x);
+    float y = mix(-R, +R,        vin.corner.y);
+
+    float2 screenPos = p0 + dir * x + nrm * y;
+
+    // 5) Convert screen pixels to NDC
+    float ndcX = (screenPos.x / t->screenWidth) * 2.0;
+    float ndcY = -(screenPos.y / t->screenHeight) * 2.0;
+
+    SegmentOut out;
+    out.position = float4(ndcX, ndcY, 0.0, 1.0);
+    out.fragScreen = screenPos;
+    out.p0Screen = p0;
+    out.p1Screen = p1;
+    out.color = seg.color;
+    return out;
+}
+
+fragment float4 fragment_segment_sdf(
+    SegmentOut in [[stage_in]],
+    constant StrokeTransform *t [[buffer(1)]]
+) {
+    float2 p = in.fragScreen;
+    float2 a = in.p0Screen;
+    float2 b = in.p1Screen;
+
+    float2 ab = b - a;
+    float denom = dot(ab, ab);
+
+    float h = 0.0;
+    if (denom > 0.0) {
+        h = dot(p - a, ab) / denom;
+        h = clamp(h, 0.0, 1.0);
+    }
+
+    float2 closest = a + h * ab;
+    float dist = length(p - closest);
+
+    float R = t->halfPixelWidth;
+    float f = max(t->featherPx, 0.5);
+
+    float alpha = 1.0 - smoothstep(R - f, R + f, dist);
+
+    float4 color = in.color;
+    color.a *= alpha;
+    return color;
+}
 
 vertex VertexOut vertex_main(VertexIn in [[stage_in]],
                              constant StrokeTransform *transform [[buffer(1)]]) {
