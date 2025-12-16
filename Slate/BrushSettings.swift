@@ -8,6 +8,7 @@ class BrushSettings: ObservableObject {
     @Published var size: Double = 10.0  // Stroke width in world units (1-100)
     @Published var color: SIMD4<Float> = SIMD4<Float>(1.0, 0.0, 0.0, 1.0)  // Red default
     @Published var cullingMultiplier: Double = 1.0  // Test multiplier for culling box size (1.0, 0.5, 0.25)
+    @Published var depthWriteEnabled: Bool = true  // Set false for strokes that should not write depth (e.g. translucent marker)
 
     static let minSize: Double = 1.0
     static let maxSize: Double = 1000.0

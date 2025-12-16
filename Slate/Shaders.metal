@@ -13,6 +13,7 @@ struct StrokeTransform {
     float rotationAngle;    // Camera rotation
     float halfPixelWidth;   // Half-width of stroke in screen pixels (for screen-space extrusion)
     float featherPx;        // Feather amount in pixels for SDF edge
+    float depth;            // Metal NDC depth [0, 1] (smaller = closer)
 };
 
 /// GPU segment instance data for SDF strokes
@@ -88,7 +89,7 @@ vertex SegmentOut vertex_segment_sdf(
     float ndcY = -(screenPos.y / t->screenHeight) * 2.0;
 
     SegmentOut out;
-    out.position = float4(ndcX, ndcY, 0.0, 1.0);
+    out.position = float4(ndcX, ndcY, t->depth, 1.0);
     out.fragScreen = screenPos;
     out.p0Screen = p0;
     out.p1Screen = p1;
@@ -99,7 +100,7 @@ vertex SegmentOut vertex_segment_sdf(
 fragment float4 fragment_segment_sdf(
     SegmentOut in [[stage_in]],
     constant StrokeTransform *t [[buffer(1)]]
-) {
+) [[early_fragment_tests]] {
     float2 p = in.fragScreen;
     float2 a = in.p0Screen;
     float2 b = in.p1Screen;
@@ -121,8 +122,46 @@ fragment float4 fragment_segment_sdf(
 
     float alpha = 1.0 - smoothstep(R - f, R + f, dist);
 
+    if (alpha <= 0.0) {
+        discard_fragment();
+    }
+
     float4 color = in.color;
     color.a *= alpha;
+    return color;
+}
+
+fragment float4 fragment_segment_sdf_interior(
+    SegmentOut in [[stage_in]],
+    constant StrokeTransform *t [[buffer(1)]]
+) [[early_fragment_tests]] {
+    float2 p = in.fragScreen;
+    float2 a = in.p0Screen;
+    float2 b = in.p1Screen;
+
+    float2 ab = b - a;
+    float denom = dot(ab, ab);
+
+    float h = 0.0;
+    if (denom > 0.0) {
+        h = dot(p - a, ab) / denom;
+        h = clamp(h, 0.0, 1.0);
+    }
+
+    float2 closest = a + h * ab;
+    float dist = length(p - closest);
+
+    float R = t->halfPixelWidth;
+    float f = max(t->featherPx, 0.5);
+
+    // Depth-write pass should only stamp fully covered pixels to avoid
+    // alpha-edge fragments blocking later coverage (which creates gaps).
+    if (dist > (R - f)) {
+        discard_fragment();
+    }
+
+    float4 color = in.color;
+    color.a = 1.0;
     return color;
 }
 
@@ -176,7 +215,7 @@ vertex VertexOut vertex_main(VertexIn in [[stage_in]],
     float2 ndcPos = ndcCenter + ndcNormal * (side * halfWidthNDC);
 
     VertexOut out;
-    out.position = float4(ndcPos, 0.0, 1.0);
+    out.position = float4(ndcPos, transform->depth, 1.0);
     out.uv = in.uv;
     out.color = in.color;
     return out;

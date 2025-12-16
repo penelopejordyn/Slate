@@ -25,12 +25,6 @@ struct QuadVertex {
     var corner: SIMD2<Float>
 }
 
-/// Simple position/UV vertex for card/tile quads
-struct CardQuadVertex {
-    var position: SIMD2<Float>
-    var uv: SIMD2<Float>
-}
-
 // MARK: - Transform Structures
 
 /// Transform for ICB stroke rendering (position offset calculated on GPU)
@@ -43,6 +37,7 @@ struct StrokeTransform {
     var rotationAngle: Float
     var halfPixelWidth: Float           // Half-width of stroke in screen pixels (for screen-space extrusion)
     var featherPx: Float                // Feather amount in pixels for SDF edge
+    var depth: Float                    // Depth in Metal NDC [0, 1] (smaller = closer)
 }
 
 /// Transform for card rendering (not batched, includes offset)

@@ -13,8 +13,10 @@ struct MetalView: UIViewRepresentable {
         mtkView.device = MTLCreateSystemDefaultDevice()
         mtkView.clearColor = MTLClearColor(red: 30.0/255.0, green: 30.0/255.0, blue: 30.0/255.0, alpha: 1.0)
 
-        // Enable Stencil Buffer for card clipping
-        mtkView.depthStencilPixelFormat = .stencil8
+        // Enable Depth+Stencil buffer (depth testing + card clipping)
+        mtkView.depthStencilPixelFormat = .depth32Float_stencil8
+        mtkView.clearDepth = 1.0
+        mtkView.clearStencil = 0
 
         mtkView.delegate = context.coordinator
         mtkView.isUserInteractionEnabled = true
