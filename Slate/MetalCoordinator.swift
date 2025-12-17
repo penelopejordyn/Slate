@@ -848,7 +848,9 @@ import simd
 
     func makePipeLine() {
         let library = device.makeDefaultLibrary()!
-        let viewSampleCount = metalView?.sampleCount ?? 1
+        // Force 4 samples to match MetalView MSAA config
+        // This must match the sampleCount set in MetalView.swift
+        let viewSampleCount = 4
         let depthStencilFormat: MTLPixelFormat = .depth32Float_stencil8
 
         let quadVertexDesc = makeQuadVertexDescriptor()

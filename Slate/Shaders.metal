@@ -118,17 +118,18 @@ fragment float4 fragment_segment_sdf(
     float dist = length(p - closest);
 
     float R = t->halfPixelWidth;
-    float f = max(t->featherPx, 0.5);
 
-    float alpha = 1.0 - smoothstep(R - f, R + f, dist);
-
-    if (alpha <= 0.0) {
+    // MSAA HARD EDGE: No smoothstep - let hardware MSAA handle anti-aliasing
+    // This eliminates transparent pixels that cause halos with depth testing
+    // If we are outside the radius, discard immediately.
+    // If we are inside, draw FULL opacity.
+    if (dist > R) {
         discard_fragment();
     }
 
-    float4 color = in.color;
-    color.a *= alpha;
-    return color;
+    // No alpha blending needed - the stroke is either fully inside or fully outside
+    // Hardware MSAA will automatically smooth the edges at sub-pixel level
+    return in.color;
 }
 
 vertex VertexOut vertex_main(VertexIn in [[stage_in]],

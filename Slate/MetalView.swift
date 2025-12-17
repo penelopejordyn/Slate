@@ -18,6 +18,11 @@ struct MetalView: UIViewRepresentable {
         mtkView.clearDepth = 1.0
         mtkView.clearStencil = 0
 
+        // Enable 4x Multisample Anti-Aliasing (MSAA)
+        // Hardware MSAA provides smooth edges without transparent pixels
+        // This eliminates anti-aliasing halos when using depth testing
+        mtkView.sampleCount = 4
+
         mtkView.delegate = context.coordinator
         mtkView.isUserInteractionEnabled = true
 
