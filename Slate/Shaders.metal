@@ -100,7 +100,7 @@ vertex SegmentOut vertex_segment_sdf(
 fragment float4 fragment_segment_sdf(
     SegmentOut in [[stage_in]],
     constant StrokeTransform *t [[buffer(1)]]
-) [[early_fragment_tests]] {
+) {
     float2 p = in.fragScreen;
     float2 a = in.p0Screen;
     float2 b = in.p1Screen;
@@ -128,40 +128,6 @@ fragment float4 fragment_segment_sdf(
 
     float4 color = in.color;
     color.a *= alpha;
-    return color;
-}
-
-fragment float4 fragment_segment_sdf_interior(
-    SegmentOut in [[stage_in]],
-    constant StrokeTransform *t [[buffer(1)]]
-) [[early_fragment_tests]] {
-    float2 p = in.fragScreen;
-    float2 a = in.p0Screen;
-    float2 b = in.p1Screen;
-
-    float2 ab = b - a;
-    float denom = dot(ab, ab);
-
-    float h = 0.0;
-    if (denom > 0.0) {
-        h = dot(p - a, ab) / denom;
-        h = clamp(h, 0.0, 1.0);
-    }
-
-    float2 closest = a + h * ab;
-    float dist = length(p - closest);
-
-    float R = t->halfPixelWidth;
-    float f = max(t->featherPx, 0.5);
-
-    // Depth-write pass should only stamp fully covered pixels to avoid
-    // alpha-edge fragments blocking later coverage (which creates gaps).
-    if (dist > (R - f)) {
-        discard_fragment();
-    }
-
-    float4 color = in.color;
-    color.a = 1.0;
     return color;
 }
 

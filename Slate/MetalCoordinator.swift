@@ -13,13 +13,12 @@ import simd
 	    var pipelineState: MTLRenderPipelineState!
 	    var cardPipelineState: MTLRenderPipelineState!      // Pipeline for textured cards
 	    var cardSolidPipelineState: MTLRenderPipelineState! // Pipeline for solid color cards
-		    var cardLinedPipelineState: MTLRenderPipelineState! // Pipeline for lined paper cards
-		    var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
-		    var strokeSegmentPipelineState: MTLRenderPipelineState! // SDF segment pipeline
-		    var strokeSegmentInteriorPipelineState: MTLRenderPipelineState! // SDF segment pipeline (depth-write interior pass)
-		    var samplerState: MTLSamplerState!                  // Sampler for card textures
-		    var vertexBuffer: MTLBuffer!
-		    var quadVertexBuffer: MTLBuffer!                    // Unit quad for instanced segments
+	    var cardLinedPipelineState: MTLRenderPipelineState! // Pipeline for lined paper cards
+	    var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
+	    var strokeSegmentPipelineState: MTLRenderPipelineState! // SDF segment pipeline
+	    var samplerState: MTLSamplerState!                  // Sampler for card textures
+	    var vertexBuffer: MTLBuffer!
+	    var quadVertexBuffer: MTLBuffer!                    // Unit quad for instanced segments
 
     // Note: ICB removed - using simple GPU-offset approach instead
 
@@ -29,10 +28,9 @@ import simd
     var stencilStateRead: MTLDepthStencilState!    // Only draws where stencil == 1 (card strokes)
     var stencilStateClear: MTLDepthStencilState!   // Writes 0s to stencil (cleanup)
 
-	    // Depth States for Stroke Rendering
-	    var strokeDepthStateWrite: MTLDepthStencilState!   // Depth test + write enabled
-	    var strokeDepthStateTestNoWrite: MTLDepthStencilState! // Depth test enabled, depth write disabled
-	    var strokeDepthStateNoWrite: MTLDepthStencilState! // Always-pass, depth write disabled (painter's / overlays)
+    // Depth States for Stroke Rendering
+    var strokeDepthStateWrite: MTLDepthStencilState!   // Depth test + write enabled
+    var strokeDepthStateNoWrite: MTLDepthStencilState! // Depth test enabled, depth write disabled
 
     // MARK: - Modal Input: Pencil vs. Finger
 
@@ -86,39 +84,18 @@ import simd
 
     // MARK: - Recursive Renderer
 
-	    private func strokeDepthClass(depthFromActive: Int) -> Int {
-	        // 24-bit depth packing (Milton-style):
-	        // [ 8 bits telescoping depth ][ 16 bits stroke order ]
-	        //
-	        // This guarantees non-overlapping ranges for every telescoping depth and keeps
-	        // stable ordering at extreme zoom depths without running out of [0, 1] space.
-	        //
-	        // Depth 0 (active) is closest. As abs(depthFromActive) grows we push strokes
-	        // farther back. Children are slightly closer than parents at the same distance:
-	        //   active=0, child1=1, parent1=2, child2=3, parent2=4, ...
-	        guard depthFromActive != 0 else { return 0 }
-	        let absDepth = abs(depthFromActive)
-	        let base = absDepth * 2
-	        let idx = base - (depthFromActive > 0 ? 1 : 0)
-	        return min(max(idx, 0), 0xFF)
-	    }
-
-	    private func strokeDepth(depthFromActive: Int, strokeIndex: Int, strokeCount: Int) -> Float {
-	        let depthClass = strokeDepthClass(depthFromActive: depthFromActive)
-	        let maxSlot = 0xFFFF
-
-	        // Oldest -> farthest, newest -> closest within the class.
-	        let slot: Int
-	        if strokeCount <= 1 {
-	            slot = maxSlot / 2
-	        } else {
-	            let t = Double(strokeIndex) / Double(max(strokeCount - 1, 1))
-	            slot = maxSlot - Int((t * Double(maxSlot)).rounded())
-	        }
-
-	        let depthInt = (depthClass << 16) | (slot & maxSlot)
-	        return Float(depthInt) * (1.0 / Float(1 << 24))
-	    }
+    private func strokeDepthBand(depthFromActive: Int) -> (near: Float, far: Float) {
+        // Reserve non-overlapping depth "bands" for the telescoping coordinate system.
+        // Smaller depth is closer in Metal (clearDepth = 1.0, compare = .less).
+        let layerStep: Float = 0.05
+        let layerHalfSpan: Float = 0.02
+        let center = 0.5 - Float(depthFromActive) * layerStep
+        let rawNear = max(0.0, min(1.0, center - layerHalfSpan))
+        let rawFar = max(0.0, min(1.0, center + layerHalfSpan))
+        let far = min(rawFar, 0.999999) // .less would reject geometry at exactly 1.0
+        let near = min(rawNear, far)
+        return (near, far)
+    }
 
     /// Recursively render a frame and adjacent depth levels (depth ±1).
     ///
@@ -201,22 +178,26 @@ import simd
         // Apply Culling Multiplier for testing
         let cullRadius = screenRadius * brushSettings.cullingMultiplier
 
-	        // Render canvas strokes using depth testing (early-Z) with an AA-friendly two-pass approach:
-	        // 1) Depth-write interior (fully covered pixels) to unlock early-Z culling.
-	        // 2) Alpha feather pass (no depth writes) to avoid depth-stamping translucent edges (which causes gaps).
-	        encoder.setCullMode(.none)
-	        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
+        // Render canvas strokes using depth testing (early-Z).
+        encoder.setRenderPipelineState(strokeSegmentPipelineState)
+        encoder.setCullMode(.none)
+        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
 
         let zoom = max(currentZoom, 1e-6)
         let angle = Double(currentRotation)
         let c = cos(angle)
         let s = sin(angle)
 
-	        let strokeCount = frame.strokes.count
+        let band = strokeDepthBand(depthFromActive: depthFromActive)
+        let strokeCount = frame.strokes.count
+        let depthSpan = max(band.far - band.near, 0.0)
+        let denom = max(strokeCount - 1, 1)
 
-	        func depthForStrokeIndex(_ index: Int) -> Float {
-	            strokeDepth(depthFromActive: depthFromActive, strokeIndex: index, strokeCount: strokeCount)
-	        }
+        func depthForStrokeIndex(_ index: Int) -> Float {
+            guard strokeCount > 1 else { return band.near }
+            let t = Float(index) / Float(denom)
+            return min(max(band.far - t * depthSpan, 0.0), 1.0)
+        }
 
         func drawStroke(_ stroke: Stroke, depth: Float) {
             guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { return }
@@ -262,25 +243,23 @@ import simd
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
         }
 
-	        // PASS 1: Depth-write interior, newest -> oldest (front-to-back).
-	        encoder.setRenderPipelineState(strokeSegmentInteriorPipelineState)
-	        encoder.setDepthStencilState(strokeDepthStateWrite)
-	        if strokeCount > 0 {
-	            for i in stride(from: strokeCount - 1, through: 0, by: -1) {
-	                let stroke = frame.strokes[i]
-	                guard stroke.depthWriteEnabled else { continue }
-	                drawStroke(stroke, depth: depthForStrokeIndex(i))
-	            }
-	        }
+        // Depth-write strokes: newest -> oldest (front-to-back).
+        encoder.setDepthStencilState(strokeDepthStateWrite)
+        if strokeCount > 0 {
+            for i in stride(from: strokeCount - 1, through: 0, by: -1) {
+                let stroke = frame.strokes[i]
+                guard stroke.depthWriteEnabled else { continue }
+                drawStroke(stroke, depth: depthForStrokeIndex(i))
+            }
+        }
 
-	        // PASS 2: Feather/AA, oldest -> newest (painter's algorithm) but depth-tested (no writes).
-	        // This pass also draws any non-depth-write strokes (e.g. translucent markers) in correct order.
-	        encoder.setRenderPipelineState(strokeSegmentPipelineState)
-	        encoder.setDepthStencilState(strokeDepthStateTestNoWrite)
-	        for i in 0..<strokeCount {
-	            let stroke = frame.strokes[i]
-	            drawStroke(stroke, depth: depthForStrokeIndex(i))
-	        }
+        // No-depth-write strokes: oldest -> newest (painter's algorithm), but depth-tested.
+        encoder.setDepthStencilState(strokeDepthStateNoWrite)
+        for i in 0..<strokeCount {
+            let stroke = frame.strokes[i]
+            guard !stroke.depthWriteEnabled else { continue }
+            drawStroke(stroke, depth: depthForStrokeIndex(i))
+        }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
         for card in frame.cards {
@@ -887,27 +866,11 @@ import simd
         segDesc.vertexDescriptor = quadVertexDesc
         segDesc.depthAttachmentPixelFormat = depthStencilFormat
         segDesc.stencilAttachmentPixelFormat = depthStencilFormat
-	        do {
-	            strokeSegmentPipelineState = try device.makeRenderPipelineState(descriptor: segDesc)
-	        } catch {
-	            fatalError("Failed to create strokeSegmentPipelineState: \(error)")
-	        }
-
-	        // Stroke Interior Pipeline (Depth-write pass)
-	        let segInteriorDesc = MTLRenderPipelineDescriptor()
-	        segInteriorDesc.vertexFunction = library.makeFunction(name: "vertex_segment_sdf")
-	        segInteriorDesc.fragmentFunction = library.makeFunction(name: "fragment_segment_sdf_interior")
-	        segInteriorDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-	        segInteriorDesc.sampleCount = viewSampleCount
-	        segInteriorDesc.colorAttachments[0].isBlendingEnabled = false
-	        segInteriorDesc.vertexDescriptor = quadVertexDesc
-	        segInteriorDesc.depthAttachmentPixelFormat = depthStencilFormat
-	        segInteriorDesc.stencilAttachmentPixelFormat = depthStencilFormat
-	        do {
-	            strokeSegmentInteriorPipelineState = try device.makeRenderPipelineState(descriptor: segInteriorDesc)
-	        } catch {
-	            fatalError("Failed to create strokeSegmentInteriorPipelineState: \(error)")
-	        }
+        do {
+            strokeSegmentPipelineState = try device.makeRenderPipelineState(descriptor: segDesc)
+        } catch {
+            fatalError("Failed to create strokeSegmentPipelineState: \(error)")
+        }
 
         // Setup vertex descriptor for StrokeVertex structure (shared by both card pipelines)
         let vertexDesc = MTLVertexDescriptor()
@@ -1071,22 +1034,17 @@ import simd
         desc.backFaceStencil = stencilClear
         stencilStateClear = device.makeDepthStencilState(descriptor: desc)
 
-	        // Depth-only states for strokes (no stencil).
-	        let strokeWriteDesc = MTLDepthStencilDescriptor()
-	        strokeWriteDesc.depthCompareFunction = .less
-	        strokeWriteDesc.isDepthWriteEnabled = true
-	        strokeDepthStateWrite = device.makeDepthStencilState(descriptor: strokeWriteDesc)
+        // Depth-only states for strokes (no stencil).
+        let strokeWriteDesc = MTLDepthStencilDescriptor()
+        strokeWriteDesc.depthCompareFunction = .less
+        strokeWriteDesc.isDepthWriteEnabled = true
+        strokeDepthStateWrite = device.makeDepthStencilState(descriptor: strokeWriteDesc)
 
-	        let strokeTestNoWriteDesc = MTLDepthStencilDescriptor()
-	        strokeTestNoWriteDesc.depthCompareFunction = .less
-	        strokeTestNoWriteDesc.isDepthWriteEnabled = false
-	        strokeDepthStateTestNoWrite = device.makeDepthStencilState(descriptor: strokeTestNoWriteDesc)
-
-	        let strokeNoWriteDesc = MTLDepthStencilDescriptor()
-	        strokeNoWriteDesc.depthCompareFunction = .always
-	        strokeNoWriteDesc.isDepthWriteEnabled = false
-	        strokeDepthStateNoWrite = device.makeDepthStencilState(descriptor: strokeNoWriteDesc)
-	    }
+        let strokeNoWriteDesc = MTLDepthStencilDescriptor()
+        strokeNoWriteDesc.depthCompareFunction = .always
+        strokeNoWriteDesc.isDepthWriteEnabled = false
+        strokeDepthStateNoWrite = device.makeDepthStencilState(descriptor: strokeNoWriteDesc)
+    }
 
     func makeVertexBuffer() {
         var positions: [SIMD2<Float>] = [
