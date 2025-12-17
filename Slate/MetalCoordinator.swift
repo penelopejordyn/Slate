@@ -68,13 +68,32 @@ import simd
     // MARK: - Brush Settings
     let brushSettings = BrushSettings()
 
-    // MARK: - Debug Metrics
-    var debugDrawnVerticesThisFrame: Int = 0
-    var debugDrawnNodesThisFrame: Int = 0
+	    // MARK: - Debug Metrics
+	    var debugDrawnVerticesThisFrame: Int = 0
+	    var debugDrawnNodesThisFrame: Int = 0
 
-    override init() {
-        super.init()
-        device = MTLCreateSystemDefaultDevice()!
+	    // MARK: - Global Stroke Depth Ordering
+	    // A monotonic per-stroke counter lets depth testing work across telescoping frames.
+	    // Larger depthID = newer stroke; we map this into Metal NDC depth (smaller = closer).
+	    private static let strokeDepthSlotCount: UInt32 = 1 << 24
+	    private static let strokeDepthDenominator: Float = Float(strokeDepthSlotCount) + 1.0
+	    private var nextStrokeDepthID: UInt32 = 0
+
+	    private func allocateStrokeDepthID() -> UInt32 {
+	        let id = nextStrokeDepthID
+	        if nextStrokeDepthID < Self.strokeDepthSlotCount - 1 {
+	            nextStrokeDepthID += 1
+	        }
+	        return id
+	    }
+
+	    private func peekStrokeDepthID() -> UInt32 {
+	        nextStrokeDepthID
+	    }
+
+	    override init() {
+	        super.init()
+	        device = MTLCreateSystemDefaultDevice()!
         commandQueue = device.makeCommandQueue()!
 
         makePipeLine()
@@ -82,20 +101,12 @@ import simd
         makeQuadVertexBuffer()
     }
 
-    // MARK: - Recursive Renderer
-
-    private func strokeDepthBand(depthFromActive: Int) -> (near: Float, far: Float) {
-        // Reserve non-overlapping depth "bands" for the telescoping coordinate system.
-        // Smaller depth is closer in Metal (clearDepth = 1.0, compare = .less).
-        let layerStep: Float = 0.05
-        let layerHalfSpan: Float = 0.02
-        let center = 0.5 - Float(depthFromActive) * layerStep
-        let rawNear = max(0.0, min(1.0, center - layerHalfSpan))
-        let rawFar = max(0.0, min(1.0, center + layerHalfSpan))
-        let far = min(rawFar, 0.999999) // .less would reject geometry at exactly 1.0
-        let near = min(rawNear, far)
-        return (near, far)
-    }
+	    // MARK: - Recursive Renderer
+	    private func strokeDepth(for depthID: UInt32) -> Float {
+	        let clamped = min(depthID, Self.strokeDepthSlotCount - 1)
+	        let numerator = Float(Self.strokeDepthSlotCount - clamped)
+	        return numerator / Self.strokeDepthDenominator
+	    }
 
     /// Recursively render a frame and adjacent depth levels (depth ±1).
     ///
@@ -188,16 +199,10 @@ import simd
         let c = cos(angle)
         let s = sin(angle)
 
-        let band = strokeDepthBand(depthFromActive: depthFromActive)
-        let strokeCount = frame.strokes.count
-        let depthSpan = max(band.far - band.near, 0.0)
-        let denom = max(strokeCount - 1, 1)
-
-        func depthForStrokeIndex(_ index: Int) -> Float {
-            guard strokeCount > 1 else { return band.near }
-            let t = Float(index) / Float(denom)
-            return min(max(band.far - t * depthSpan, 0.0), 1.0)
-        }
+	        let strokeCount = frame.strokes.count
+	        func depthForStroke(_ stroke: Stroke) -> Float {
+	            strokeDepth(for: stroke.depthID)
+	        }
 
         func drawStroke(_ stroke: Stroke, depth: Float) {
             guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { return }
@@ -243,23 +248,23 @@ import simd
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
         }
 
-        // Depth-write strokes: newest -> oldest (front-to-back).
-        encoder.setDepthStencilState(strokeDepthStateWrite)
-        if strokeCount > 0 {
-            for i in stride(from: strokeCount - 1, through: 0, by: -1) {
-                let stroke = frame.strokes[i]
-                guard stroke.depthWriteEnabled else { continue }
-                drawStroke(stroke, depth: depthForStrokeIndex(i))
-            }
-        }
+	        // Depth-write strokes: newest -> oldest (front-to-back).
+	        encoder.setDepthStencilState(strokeDepthStateWrite)
+	        if strokeCount > 0 {
+	            for i in stride(from: strokeCount - 1, through: 0, by: -1) {
+	                let stroke = frame.strokes[i]
+	                guard stroke.depthWriteEnabled else { continue }
+	                drawStroke(stroke, depth: depthForStroke(stroke))
+	            }
+	        }
 
         // No-depth-write strokes: oldest -> newest (painter's algorithm), but depth-tested.
-        encoder.setDepthStencilState(strokeDepthStateNoWrite)
-        for i in 0..<strokeCount {
-            let stroke = frame.strokes[i]
-            guard !stroke.depthWriteEnabled else { continue }
-            drawStroke(stroke, depth: depthForStrokeIndex(i))
-        }
+	        encoder.setDepthStencilState(strokeDepthStateNoWrite)
+	        for i in 0..<strokeCount {
+	            let stroke = frame.strokes[i]
+	            guard !stroke.depthWriteEnabled else { continue }
+	            drawStroke(stroke, depth: depthForStroke(stroke))
+	        }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
         for card in frame.cards {
@@ -566,10 +571,11 @@ import simd
                 zoomInTarget = zoomScale / child.scaleRelativeToParent
             }
 
-            let liveStroke = createStrokeForCard(screenPoints: screenPoints,
-                                                 card: card,
-                                                 frame: frame,
-                                                 viewSize: view.bounds.size)
+	            let liveStroke = createStrokeForCard(screenPoints: screenPoints,
+	                                                 card: card,
+	                                                 frame: frame,
+	                                                 viewSize: view.bounds.size,
+	                                                 depthID: peekStrokeDepthID())
             guard !liveStroke.segments.isEmpty, let segmentBuffer = liveStroke.segmentBuffer else { return }
 
             // 1) Write stencil for the card region without affecting color output.
@@ -1040,11 +1046,11 @@ import simd
         strokeWriteDesc.isDepthWriteEnabled = true
         strokeDepthStateWrite = device.makeDepthStencilState(descriptor: strokeWriteDesc)
 
-        let strokeNoWriteDesc = MTLDepthStencilDescriptor()
-        strokeNoWriteDesc.depthCompareFunction = .always
-        strokeNoWriteDesc.isDepthWriteEnabled = false
-        strokeDepthStateNoWrite = device.makeDepthStencilState(descriptor: strokeNoWriteDesc)
-    }
+	        let strokeNoWriteDesc = MTLDepthStencilDescriptor()
+	        strokeNoWriteDesc.depthCompareFunction = .less
+	        strokeNoWriteDesc.isDepthWriteEnabled = false
+	        strokeDepthStateNoWrite = device.makeDepthStencilState(descriptor: strokeNoWriteDesc)
+	    }
 
     func makeVertexBuffer() {
         var positions: [SIMD2<Float>] = [
@@ -1319,28 +1325,30 @@ import simd
         switch target {
         case .canvas(let frame):
             // DRAW ON CANVAS (existing logic)
-            let stroke = Stroke(screenPoints: smoothScreenPoints,
-                                zoomAtCreation: zoomScale,
-                                panAtCreation: panOffset,
-                                viewSize: view.bounds.size,
-                                rotationAngle: rotationAngle,
-                                color: brushSettings.color,
-                                baseWidth: brushSettings.size,
-                                zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
-                                device: device,
-                                depthWriteEnabled: brushSettings.depthWriteEnabled)
-            frame.strokes.append(stroke)
+	            let stroke = Stroke(screenPoints: smoothScreenPoints,
+	                                zoomAtCreation: zoomScale,
+	                                panAtCreation: panOffset,
+	                                viewSize: view.bounds.size,
+	                                rotationAngle: rotationAngle,
+	                                color: brushSettings.color,
+	                                baseWidth: brushSettings.size,
+	                                zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
+	                                device: device,
+	                                depthID: allocateStrokeDepthID(),
+	                                depthWriteEnabled: brushSettings.depthWriteEnabled)
+	            frame.strokes.append(stroke)
 
         case .card(let card, let frame):
             // DRAW ON CARD (Cross-Depth Compatible)
             // Transform points into card-local space accounting for which frame the card is in
-            let cardStroke = createStrokeForCard(
-                screenPoints: smoothScreenPoints,
-                card: card,
-                frame: frame,
-                viewSize: view.bounds.size
-            )
-            card.strokes.append(cardStroke)
+	            let cardStroke = createStrokeForCard(
+	                screenPoints: smoothScreenPoints,
+	                card: card,
+	                frame: frame,
+	                viewSize: view.bounds.size,
+	                depthID: allocateStrokeDepthID()
+	            )
+	            card.strokes.append(cardStroke)
         }
 
         currentTouchPoints = []
@@ -1482,7 +1490,7 @@ import simd
     ///   - frame: The frame the card belongs to (may be parent, active, or child)
     ///   - viewSize: Screen dimensions
     /// - Returns: A stroke with points relative to card center
-    func createStrokeForCard(screenPoints: [CGPoint], card: Card, frame: Frame, viewSize: CGSize) -> Stroke {
+	    func createStrokeForCard(screenPoints: [CGPoint], card: Card, frame: Frame, viewSize: CGSize, depthID: UInt32) -> Stroke {
         // 1. Get the Card's World Position & Rotation (in its Frame)
         let cardOrigin = card.origin
         let cardRot = Double(card.rotation)
@@ -1562,19 +1570,20 @@ import simd
         }
 
         // 5. Create the Stroke with Effective Zoom
-        return Stroke(
-            screenPoints: cardLocalPoints,   // Virtual screen space (world units * effectiveZoom)
-            zoomAtCreation: max(effectiveZoom, 1e-6),   // Use effective zoom for the card's frame!
-            panAtCreation: .zero,            // We handled position manually
-            viewSize: .zero,                 // We handled centering manually
-            rotationAngle: 0,                // We handled rotation manually
-            color: brushSettings.color,      // Use brush settings color
-            baseWidth: brushSettings.size,   // Use brush settings size
-            zoomEffectiveAtCreation: Float(max(effectiveZoom, 1e-6)),
-            device: device,                  // Pass device for buffer caching
-            depthWriteEnabled: brushSettings.depthWriteEnabled
-        )
-    }
+	        return Stroke(
+	            screenPoints: cardLocalPoints,   // Virtual screen space (world units * effectiveZoom)
+	            zoomAtCreation: max(effectiveZoom, 1e-6),   // Use effective zoom for the card's frame!
+	            panAtCreation: .zero,            // We handled position manually
+	            viewSize: .zero,                 // We handled centering manually
+	            rotationAngle: 0,                // We handled rotation manually
+	            color: brushSettings.color,      // Use brush settings color
+	            baseWidth: brushSettings.size,   // Use brush settings size
+	            zoomEffectiveAtCreation: Float(max(effectiveZoom, 1e-6)),
+	            device: device,                  // Pass device for buffer caching
+	            depthID: depthID,
+	            depthWriteEnabled: brushSettings.depthWriteEnabled
+	        )
+	    }
 
 }
 
