@@ -43,14 +43,21 @@ class Frame: Identifiable {
     /// This allows us to re-enter existing frames instead of creating parallel universes
     var children: [Frame] = []
 
+    /// Cached depth relative to a reference root frame
+    /// Positive = child of root (drilled in), Negative = parent of root (telescoped out), 0 = is root
+    /// This is set once when the frame is created and never changes
+    var depthFromRoot: Int = 0
+
     /// Initialize a new Frame
     /// - Parameters:
     ///   - parent: The containing universe (nil for root)
     ///   - origin: Where this frame lives in parent coordinates
     ///   - scale: The zoom factor when this frame was created
-    init(parent: Frame? = nil, origin: SIMD2<Double> = .zero, scale: Double = 1.0) {
+    ///   - depth: The depth relative to root (calculated by caller)
+    init(parent: Frame? = nil, origin: SIMD2<Double> = .zero, scale: Double = 1.0, depth: Int = 0) {
         self.parent = parent
         self.originInParent = origin
         self.scaleRelativeToParent = scale
+        self.depthFromRoot = depth
     }
 }
