@@ -102,7 +102,33 @@ import simd
     }
 
 	    // MARK: - Recursive Renderer
+	    /// Calculate Metal depth value for a stroke based on creation order
+	    ///
+	    /// **DEPTH TESTING BY STROKE ORDER:**
+	    /// Newer strokes (higher depthID) are always rendered on top of older strokes,
+	    /// regardless of which telescope depth they were created at.
+	    ///
+	    /// Example:
+	    /// - Draw stroke A at depth -9 (depthID = 100)
+	    /// - Draw stroke B at depth 0  (depthID = 200)
+	    /// - Draw stroke C at depth -9 (depthID = 300)
+	    ///
+	    /// Result: C is on top of B, which is on top of A
+	    ///
+	    /// This uses the global monotonic depthID counter, so stroke ordering is consistent
+	    /// across all telescope depths from -∞ to +∞.
+	    ///
+	    /// **OVERDRAW PREVENTION:**
+	    /// All segments within a stroke share the same depth value. The depth buffer prevents
+	    /// pixel-level overdraw when drawing complex shapes. Front-to-back rendering of
+	    /// depth-write-enabled strokes provides early-Z rejection for maximum performance.
+	    ///
+	    /// - Parameters:
+	    ///   - depthID: The stroke's depth ID (monotonic counter for creation order)
+	    /// - Returns: Metal NDC depth value [0, 1] where 0 is closest
 	    private func strokeDepth(for depthID: UInt32) -> Float {
+	        // Map depthID directly to depth buffer
+	        // Higher depthID (newer stroke) → lower depth value (closer to camera)
 	        let clamped = min(depthID, Self.strokeDepthSlotCount - 1)
 	        let numerator = Float(Self.strokeDepthSlotCount - clamped)
 	        return numerator / Self.strokeDepthDenominator
@@ -206,6 +232,14 @@ import simd
 
         func drawStroke(_ stroke: Stroke, depth: Float) {
             guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { return }
+
+            // ZOOM-BASED CULLING: Skip strokes drawn at extreme zoom when we're zoomed way out
+            // If current zoom is more than 100,000x higher than when the stroke was created,
+            // the stroke would be invisible (sub-pixel), so skip all math and rendering
+            let strokeZoom = max(Double(stroke.zoomEffectiveAtCreation), 1.0) // Treat 0 as 1
+            if zoom > strokeZoom * 100_000.0 {
+                return
+            }
 
             let dx = stroke.origin.x - cameraCenterInThisFrame.x
             let dy = stroke.origin.y - cameraCenterInThisFrame.y
@@ -400,12 +434,22 @@ import simd
                 // Draw card strokes directly (GPU applies offset)
                 for stroke in card.strokes {
                     guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { continue }
+
+                    // ZOOM-BASED CULLING: Skip strokes drawn at extreme zoom when we're zoomed way out
+                    let strokeZoom = max(Double(stroke.zoomEffectiveAtCreation), 1.0) // Treat 0 as 1
+                    if currentZoom > strokeZoom * 100_000.0 {
+                        continue
+                    }
+
                     let strokeOffset = stroke.origin
                     let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
 
                     // Calculate screen-space thickness for card strokes
                     let basePixelWidth = Float(stroke.worldWidth * currentZoom)
                     let halfPixelWidth = max(basePixelWidth * 0.5, 0.5)
+
+                    // Calculate depth based on stroke's depthID (creation order)
+                    let cardStrokeDepth = strokeDepth(for: stroke.depthID)
 
                     var strokeTransform = StrokeTransform(
                         relativeOffset: strokeRelativeOffset,
@@ -417,7 +461,7 @@ import simd
                         rotationAngle: totalRotation,
                         halfPixelWidth: halfPixelWidth,
                         featherPx: 1.0,
-                        depth: 0.0
+                        depth: cardStrokeDepth
                     )
 
                     encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
@@ -539,6 +583,10 @@ import simd
             )
 
             let halfPixelWidth = max(Float(brushSettings.size) * 0.5, 0.5)
+
+            // Canvas live stroke depth: use peek for current drawing stroke
+            let canvasLiveStrokeDepth = strokeDepth(for: peekStrokeDepthID())
+
             var transform = StrokeTransform(
                 relativeOffset: .zero,
                 rotatedOffsetScreen: rotatedOffsetScreen,
@@ -548,7 +596,7 @@ import simd
                 rotationAngle: rotationAngle,
                 halfPixelWidth: halfPixelWidth,
                 featherPx: 1.0,
-                depth: 0.0
+                depth: canvasLiveStrokeDepth
             )
 
             enc.setRenderPipelineState(strokeSegmentPipelineState)
@@ -625,6 +673,9 @@ import simd
             let basePixelWidth = Float(liveStroke.worldWidth * zoomInTarget)
             let halfPixelWidth = max(basePixelWidth * 0.5, 0.5)
 
+            // Live stroke depth: use peekStrokeDepthID (creation order)
+            let liveStrokeDepth = strokeDepth(for: peekStrokeDepthID())
+
             var strokeTransform = StrokeTransform(
                 relativeOffset: strokeRelativeOffset,
                 rotatedOffsetScreen: SIMD2<Float>(
@@ -637,7 +688,7 @@ import simd
                 rotationAngle: totalRotation,
                 halfPixelWidth: halfPixelWidth,
                 featherPx: 1.0,
-                depth: 0.0
+                depth: liveStrokeDepth
             )
 
             enc.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
@@ -723,6 +774,7 @@ import simd
                 StrokeVertex(position: pos, uv: .zero, color: handleColor)
             }
 
+            // Selection handles are UI elements - always render in front (depth 0.0)
             var handleTransform = StrokeTransform(
                 relativeOffset: relativeOffset,
                 rotatedOffsetScreen: SIMD2<Float>(Float((Double(relativeOffset.x) * cos(Double(rotation)) - Double(relativeOffset.y) * sin(Double(rotation))) * zoom),
@@ -733,7 +785,7 @@ import simd
                 rotationAngle: rotation,
                 halfPixelWidth: 1.0,  // Handles don't use thickness, but field is required
                 featherPx: 1.0,
-                depth: 0.0
+                depth: 0.0  // UI elements always in front
             )
 
             // Create buffer and draw
@@ -784,13 +836,8 @@ import simd
         // Find the debug label subview
         guard let debugLabel = mtkView.subviews.compactMap({ $0 as? UILabel }).first else { return }
 
-        // Calculate frame depth
-        var depth = 0
-        var current: Frame? = activeFrame
-        while current?.parent != nil {
-            depth += 1
-            current = current?.parent
-        }
+        // Get stored depth from the frame
+        let depth = activeFrame.depthFromRoot
 
         // Format zoom scale nicely
         let zoomText: String
@@ -803,6 +850,7 @@ import simd
         }
 
         // Calculate effective zoom (depth multiplier)
+        // pow(1000, -1) = 0.001, so negative depths work correctly
         let effectiveZoom = pow(1000.0, Double(depth)) * zoomScale
         let effectiveText: String
         if effectiveZoom >= 1e12 {
@@ -814,8 +862,13 @@ import simd
             effectiveText = String(format: "%.1fM×", effectiveZoom / 1e6)
         } else if effectiveZoom >= 1e3 {
             effectiveText = String(format: "%.1fk×", effectiveZoom / 1e3)
-        } else {
+        } else if effectiveZoom >= 1.0 {
             effectiveText = String(format: "%.1f×", effectiveZoom)
+        } else if effectiveZoom >= 0.001 {
+            effectiveText = String(format: "%.3f×", effectiveZoom)
+        } else {
+            let exponent = Int(log10(effectiveZoom))
+            effectiveText = String(format: "10^%d", exponent)
         }
 
         // Calculate camera position in current frame

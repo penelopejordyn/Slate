@@ -97,6 +97,7 @@ vertex SegmentOut vertex_segment_sdf(
     return out;
 }
 
+[[early_fragment_tests]]
 fragment float4 fragment_segment_sdf(
     SegmentOut in [[stage_in]],
     constant StrokeTransform *t [[buffer(1)]]
@@ -119,16 +120,24 @@ fragment float4 fragment_segment_sdf(
 
     float R = t->halfPixelWidth;
 
-    // MSAA HARD EDGE: No smoothstep - let hardware MSAA handle anti-aliasing
-    // This eliminates transparent pixels that cause halos with depth testing
-    // If we are outside the radius, discard immediately.
-    // If we are inside, draw FULL opacity.
+    // EARLY FRAGMENT TESTS + DISCARD = Best of Both Worlds
+    //
+    // [[early_fragment_tests]] attribute forces GPU to do depth test BEFORE running this shader:
+    // 1. Depth test happens first (read-only check)
+    // 2. If pixel is occluded (behind existing strokes), shader NEVER RUNS → massive perf gain
+    // 3. If pixel passes, shader runs expensive SDF math
+    // 4. If outside radius, discard_fragment() prevents color AND depth writes → circular erasing
+    // 5. If inside radius, both color and depth are written
+    //
+    // RESULT:
+    // ✓ Occluded pixels (behind other strokes) never run expensive SDF calculation
+    // ✓ Only circular pixels write to depth buffer (circular erasing, not square)
+    // ✓ 4x MSAA provides smooth anti-aliased edges
+    // ✓ Drawing a simple circle over complex blob = instant performance boost
     if (dist > R) {
         discard_fragment();
     }
 
-    // No alpha blending needed - the stroke is either fully inside or fully outside
-    // Hardware MSAA will automatically smooth the edges at sub-pixel level
     return in.color;
 }
 
