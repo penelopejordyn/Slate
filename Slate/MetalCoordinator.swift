@@ -16,6 +16,7 @@ import simd
 	    var cardLinedPipelineState: MTLRenderPipelineState! // Pipeline for lined paper cards
 	    var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
 	    var strokeSegmentPipelineState: MTLRenderPipelineState! // SDF segment pipeline
+	    var postProcessPipelineState: MTLRenderPipelineState!   // FXAA fullscreen pass
 	    var samplerState: MTLSamplerState!                  // Sampler for card textures
 	    var vertexBuffer: MTLBuffer!
 	    var quadVertexBuffer: MTLBuffer!                    // Unit quad for instanced segments
@@ -31,6 +32,12 @@ import simd
     // Depth States for Stroke Rendering
     var strokeDepthStateWrite: MTLDepthStencilState!   // Depth test + write enabled
     var strokeDepthStateNoWrite: MTLDepthStencilState! // Depth test enabled, depth write disabled
+
+    // Offscreen render targets (scene -> texture, then FXAA -> drawable)
+    private var offscreenColorTexture: MTLTexture?
+    private var offscreenDepthStencilTexture: MTLTexture?
+    private var offscreenTextureWidth: Int = 0
+    private var offscreenTextureHeight: Int = 0
 
     // MARK: - Modal Input: Pencil vs. Finger
 
@@ -799,32 +806,68 @@ import simd
     }
 
     func draw(in view: MTKView) {
+        resizeOffscreenTexturesIfNeeded(drawableSize: view.drawableSize)
+        guard let offscreenColor = offscreenColorTexture,
+              let offscreenDepthStencil = offscreenDepthStencilTexture else { return }
+
         guard let mainCommandBuffer = commandQueue.makeCommandBuffer(),
-              let rpd = view.currentRenderPassDescriptor,
-              let enc = mainCommandBuffer.makeRenderCommandEncoder(descriptor: rpd) else { return }
+              let drawable = view.currentDrawable,
+              let drawableRPD = view.currentRenderPassDescriptor else { return }
+
+        // PASS 1: Render the full scene into an offscreen texture (no MSAA, hard stroke coverage).
+        let sceneRPD = MTLRenderPassDescriptor()
+        sceneRPD.colorAttachments[0].texture = offscreenColor
+        sceneRPD.colorAttachments[0].loadAction = .clear
+        sceneRPD.colorAttachments[0].storeAction = .store
+        sceneRPD.colorAttachments[0].clearColor = view.clearColor
+
+        sceneRPD.depthAttachment.texture = offscreenDepthStencil
+        sceneRPD.depthAttachment.loadAction = .clear
+        sceneRPD.depthAttachment.storeAction = .dontCare
+        sceneRPD.depthAttachment.clearDepth = view.clearDepth
+
+        sceneRPD.stencilAttachment.texture = offscreenDepthStencil
+        sceneRPD.stencilAttachment.loadAction = .clear
+        sceneRPD.stencilAttachment.storeAction = .dontCare
+        sceneRPD.stencilAttachment.clearStencil = view.clearStencil
+
+        guard let sceneEnc = mainCommandBuffer.makeRenderCommandEncoder(descriptor: sceneRPD) else { return }
 
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
 
-        enc.setRenderPipelineState(strokeSegmentPipelineState)
-        enc.setCullMode(.none)
+        sceneEnc.setRenderPipelineState(strokeSegmentPipelineState)
+        sceneEnc.setCullMode(.none)
 
         renderFrame(activeFrame,
                     cameraCenterInThisFrame: cameraCenterWorld,
                     viewSize: view.bounds.size,
                     currentZoom: zoomScale,
                     currentRotation: rotationAngle,
-                    encoder: enc,
+                    encoder: sceneEnc,
                     excludedChild: nil)
 
-        // Live stroke rendering (unchanged logic), reuse main encoder
+        // Live stroke rendering (same logic), reusing the scene encoder.
         if (currentTouchPoints.count + predictedTouchPoints.count) >= 2, let tempOrigin = liveStrokeOrigin {
-            renderLiveStroke(view: view, encoder: enc, cameraCenterWorld: cameraCenterWorld, tempOrigin: tempOrigin)
+            renderLiveStroke(view: view, encoder: sceneEnc, cameraCenterWorld: cameraCenterWorld, tempOrigin: tempOrigin)
         }
 
-        enc.endEncoding()
-        if let drawable = view.currentDrawable {
-            mainCommandBuffer.present(drawable)
-        }
+        sceneEnc.endEncoding()
+
+        // PASS 2: FXAA fullscreen pass into the drawable.
+        guard let postEnc = mainCommandBuffer.makeRenderCommandEncoder(descriptor: drawableRPD) else { return }
+        postEnc.setRenderPipelineState(postProcessPipelineState)
+        postEnc.setDepthStencilState(stencilStateDefault)
+        postEnc.setCullMode(.none)
+
+        postEnc.setFragmentTexture(offscreenColor, index: 0)
+        postEnc.setFragmentSamplerState(samplerState, index: 0)
+        var invResolution = SIMD2<Float>(1.0 / Float(offscreenTextureWidth),
+                                         1.0 / Float(offscreenTextureHeight))
+        postEnc.setFragmentBytes(&invResolution, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+        postEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        postEnc.endEncoding()
+
+        mainCommandBuffer.present(drawable)
         mainCommandBuffer.commit()
 
         updateDebugHUD(view: view)
@@ -887,7 +930,43 @@ import simd
         }
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        resizeOffscreenTexturesIfNeeded(drawableSize: size)
+    }
+
+    private func resizeOffscreenTexturesIfNeeded(drawableSize: CGSize) {
+        let width = max(Int(drawableSize.width.rounded(.down)), 1)
+        let height = max(Int(drawableSize.height.rounded(.down)), 1)
+        guard width != offscreenTextureWidth ||
+              height != offscreenTextureHeight ||
+              offscreenColorTexture == nil ||
+              offscreenDepthStencilTexture == nil else { return }
+
+        offscreenTextureWidth = width
+        offscreenTextureHeight = height
+
+        let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        colorDesc.usage = [.renderTarget, .shaderRead]
+        colorDesc.storageMode = .private
+        colorDesc.sampleCount = 1
+        offscreenColorTexture = device.makeTexture(descriptor: colorDesc)
+
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float_stencil8,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        depthDesc.usage = [.renderTarget]
+        depthDesc.storageMode = .private
+        depthDesc.sampleCount = 1
+        offscreenDepthStencilTexture = device.makeTexture(descriptor: depthDesc)
+    }
 
     private func makeQuadVertexDescriptor() -> MTLVertexDescriptor {
         let vd = MTLVertexDescriptor()
@@ -901,9 +980,9 @@ import simd
 
     func makePipeLine() {
         let library = device.makeDefaultLibrary()!
-        // Force 4 samples to match MetalView MSAA config
-        // This must match the sampleCount set in MetalView.swift
-        let viewSampleCount = 4
+        // Single-sample render target (FXAA handles anti-aliasing as a post-process).
+        // Must match `MTKView.sampleCount`.
+        let viewSampleCount = 1
         let depthStencilFormat: MTLPixelFormat = .depth32Float_stencil8
 
         let quadVertexDesc = makeQuadVertexDescriptor()
@@ -1033,6 +1112,21 @@ import simd
             cardGridPipelineState = try device.makeRenderPipelineState(descriptor: gridDesc)
         } catch {
             fatalError("Failed to create grid card pipeline: \(error)")
+        }
+
+        // Post-process Pipeline (FXAA fullscreen pass)
+        let fxaaDesc = MTLRenderPipelineDescriptor()
+        fxaaDesc.vertexFunction = library.makeFunction(name: "vertex_fullscreen_triangle")
+        fxaaDesc.fragmentFunction = library.makeFunction(name: "fragment_fxaa")
+        fxaaDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        fxaaDesc.sampleCount = viewSampleCount
+        fxaaDesc.depthAttachmentPixelFormat = depthStencilFormat
+        fxaaDesc.stencilAttachmentPixelFormat = depthStencilFormat
+
+        do {
+            postProcessPipelineState = try device.makeRenderPipelineState(descriptor: fxaaDesc)
+        } catch {
+            fatalError("Failed to create postProcessPipelineState: \(error)")
         }
 
         // Create Sampler for card textures

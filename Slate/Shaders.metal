@@ -253,6 +253,93 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) {
     return color;
 }
 
+// MARK: - Post-Process (FXAA)
+
+struct PostProcessOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex PostProcessOut vertex_fullscreen_triangle(uint vid [[vertex_id]]) {
+    // Fullscreen triangle covering NDC [-1, 1] without a vertex buffer.
+    float2 pos[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    // UVs chosen so the visible region maps to [0, 1] with a Y flip (NDC is Y-up, textures are Y-down).
+    float2 uv[3] = { float2(0.0, 1.0), float2(2.0, 1.0), float2(0.0, -1.0) };
+
+    PostProcessOut out;
+    out.position = float4(pos[vid], 0.0, 1.0);
+    out.uv = uv[vid];
+    return out;
+}
+
+fragment float4 fragment_fxaa(
+    PostProcessOut in [[stage_in]],
+    texture2d<float> colorTex [[texture(0)]],
+    sampler colorSampler [[sampler(0)]],
+    constant float2 &invResolution [[buffer(0)]]
+) {
+    float2 uv = in.uv;
+
+    float3 rgbNW = colorTex.sample(colorSampler, uv + float2(-1.0, -1.0) * invResolution).rgb;
+    float3 rgbNE = colorTex.sample(colorSampler, uv + float2(1.0, -1.0) * invResolution).rgb;
+    float3 rgbSW = colorTex.sample(colorSampler, uv + float2(-1.0, 1.0) * invResolution).rgb;
+    float3 rgbSE = colorTex.sample(colorSampler, uv + float2(1.0, 1.0) * invResolution).rgb;
+    float4 rgbaM = colorTex.sample(colorSampler, uv);
+    float3 rgbM = rgbaM.rgb;
+
+    constexpr float3 lumaWeights = float3(0.299, 0.587, 0.114);
+    float lumaNW = dot(rgbNW, lumaWeights);
+    float lumaNE = dot(rgbNE, lumaWeights);
+    float lumaSW = dot(rgbSW, lumaWeights);
+    float lumaSE = dot(rgbSE, lumaWeights);
+    float lumaM = dot(rgbM, lumaWeights);
+
+    float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+    float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+    float lumaRange = lumaMax - lumaMin;
+
+    // FXAA quality presets (tuned for speed on iOS).
+    constexpr float edgeThreshold = 0.125;
+    constexpr float edgeThresholdMin = 0.0312;
+    constexpr float subpixQuality = 0.75;
+    constexpr float spanMax = 8.0;
+    constexpr float subpixReduceMin = 1.0 / 128.0;
+    constexpr float subpixReduceMul = 1.0 / 8.0;
+
+    if (lumaRange < max(edgeThresholdMin, lumaMax * edgeThreshold)) {
+        return rgbaM;
+    }
+
+    float2 dir;
+    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
+    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
+
+    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * subpixReduceMul), subpixReduceMin);
+    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, float2(-spanMax), float2(spanMax)) * invResolution;
+
+    float3 rgbA = 0.5 * (
+        colorTex.sample(colorSampler, uv + dir * (1.0 / 3.0 - 0.5)).rgb +
+        colorTex.sample(colorSampler, uv + dir * (2.0 / 3.0 - 0.5)).rgb
+    );
+
+    float3 rgbB = rgbA * 0.5 + 0.25 * (
+        colorTex.sample(colorSampler, uv + dir * -0.5).rgb +
+        colorTex.sample(colorSampler, uv + dir * 0.5).rgb
+    );
+
+    float lumaB = dot(rgbB, lumaWeights);
+    float3 rgbOut = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+
+    // Subpixel blending factor (helps thin geometry).
+    float lumaAvg = (lumaNW + lumaNE + lumaSW + lumaSE) * 0.25;
+    float subpix = clamp(abs(lumaAvg - lumaM) / max(lumaRange, 1e-5), 0.0, 1.0);
+    float subpixBlend = subpix * subpixQuality;
+    rgbOut = mix(rgbM, rgbOut, subpixBlend);
+
+    return float4(rgbOut, rgbaM.a);
+}
+
 // MARK: - Card Rendering Shaders
 
 /// Transform for cards (not batched, so needs relativeOffset)
