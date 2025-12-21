@@ -39,15 +39,30 @@ struct ContentView: View {
 
                     if let coordinator = metalViewCoordinator {
                         Button(action: {
-                            coordinator.brushSettings.isEraser.toggle()
+                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isMaskEraser ? .paint : .maskEraser
                         }) {
                             VStack(spacing: 2) {
-                                Image(systemName: coordinator.brushSettings.isEraser ? "eraser.fill" : "eraser")
+                                Image(systemName: coordinator.brushSettings.isMaskEraser ? "eraser.fill" : "eraser")
                                     .font(.system(size: 20))
                                 Text("Erase")
                                     .font(.caption)
                             }
-                            .foregroundColor(coordinator.brushSettings.isEraser ? .pink : .white)
+                            .foregroundColor(coordinator.brushSettings.isMaskEraser ? .pink : .white)
+                            .padding(8)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(12)
+                        }
+
+                        Button(action: {
+                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isStrokeEraser ? .paint : .strokeEraser
+                        }) {
+                            VStack(spacing: 2) {
+                                Image(systemName: coordinator.brushSettings.isStrokeEraser ? "trash.fill" : "trash")
+                                    .font(.system(size: 20))
+                                Text("Stroke")
+                                    .font(.caption)
+                            }
+                            .foregroundColor(coordinator.brushSettings.isStrokeEraser ? .orange : .white)
                             .padding(8)
                             .background(.ultraThinMaterial)
                             .cornerRadius(12)

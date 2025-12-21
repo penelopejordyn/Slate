@@ -433,7 +433,7 @@ import simd
             //  STEP 2: DRAW CARD STROKES (CLIPPED TO CARD)
             // Only draw where stencil == 1
             let isLiveCardEraserTarget: Bool
-            if brushSettings.isEraser, let target = currentDrawingTarget,
+            if brushSettings.isMaskEraser, let target = currentDrawingTarget,
                case .card(let targetCard, let targetFrame) = target,
                targetFrame === frame, targetCard === card {
                 isLiveCardEraserTarget = true
@@ -614,7 +614,7 @@ import simd
     }
 
     private func renderLiveStroke(view: MTKView, encoder enc: MTLRenderCommandEncoder, cameraCenterWorld: SIMD2<Double>, tempOrigin: SIMD2<Double>) {
-        guard !brushSettings.isEraser else { return }
+        guard brushSettings.toolMode == .paint else { return }
         guard let target = currentDrawingTarget else { return }
         guard let screenPoints = buildLiveScreenPoints() else { return }
         guard let firstScreenPoint = screenPoints.first else { return }
@@ -796,7 +796,7 @@ import simd
                                                 currentZoom: Double,
                                                 currentRotation: Float,
                                                 encoder: MTLRenderCommandEncoder) {
-        guard brushSettings.isEraser else { return }
+        guard brushSettings.isMaskEraser else { return }
         guard let target = currentDrawingTarget else { return }
         guard case .canvas(let targetFrame) = target, targetFrame === frame else { return }
         guard let tempOrigin = liveStrokeOrigin else { return }
@@ -1500,9 +1500,19 @@ import simd
 	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
 	        guard isDrawingTouchType(touchType) else { return }
 	
-	        guard let view = metalView else { return }
+        guard let view = metalView else { return }
 
-        if brushSettings.isEraser {
+        if brushSettings.isStrokeEraser {
+            eraseStrokeAtPoint(screenPoint: point, viewSize: view.bounds.size)
+            currentTouchPoints = []
+            predictedTouchPoints = []
+            liveStrokeOrigin = nil
+            currentDrawingTarget = nil
+            lastSavedPoint = nil
+            return
+        }
+
+        if brushSettings.isMaskEraser {
             if let result = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
                 // If we're over a card, always target that card's strokes.
                 currentDrawingTarget = .card(result.card, result.frame)
@@ -1576,6 +1586,12 @@ import simd
 	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
 	        guard isDrawingTouchType(touchType) else { return }
 
+        if brushSettings.isStrokeEraser {
+            guard let view = metalView else { return }
+            eraseStrokeAtPoint(screenPoint: point, viewSize: view.bounds.size)
+            return
+        }
+
         //  OPTIMIZATION: Distance Filter
         // Only add the point if it's far enough from the last one (e.g., 2.0 pixels)
         // This prevents "vertex explosion" when drawing slowly at 120Hz/240Hz.
@@ -1602,9 +1618,20 @@ import simd
 
 	    func handleTouchEnded(at point: CGPoint, touchType: UITouch.TouchType) {
 	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
-	        guard isDrawingTouchType(touchType), let target = currentDrawingTarget else { return }
-
+	        guard isDrawingTouchType(touchType) else { return }
         guard let view = metalView else { return }
+
+        if brushSettings.isStrokeEraser {
+            eraseStrokeAtPoint(screenPoint: point, viewSize: view.bounds.size)
+            predictedTouchPoints = []
+            currentTouchPoints = []
+            liveStrokeOrigin = nil
+            currentDrawingTarget = nil
+            lastSavedPoint = nil
+            return
+        }
+
+        guard let target = currentDrawingTarget else { return }
 
         // Clear predictions (no longer needed)
         predictedTouchPoints = []
@@ -1669,8 +1696,9 @@ import simd
         }
 
         //  MODAL INPUT: Route stroke to correct target
-        let strokeColor = brushSettings.isEraser ? SIMD4<Float>(0, 0, 0, 0) : brushSettings.color
-        let strokeDepthWriteEnabled = brushSettings.isEraser ? true : brushSettings.depthWriteEnabled
+        let isMaskEraser = brushSettings.isMaskEraser
+        let strokeColor = isMaskEraser ? SIMD4<Float>(0, 0, 0, 0) : brushSettings.color
+        let strokeDepthWriteEnabled = isMaskEraser ? true : brushSettings.depthWriteEnabled
         switch target {
         case .canvas(let frame):
             if frame === activeFrame {
@@ -1745,6 +1773,7 @@ import simd
         }
 
         let target: Target
+        let stroke: Stroke
         let depthID: UInt32
     }
 
@@ -1816,16 +1845,51 @@ import simd
         return nil
     }
 
-    private func hitTestStroke(_ stroke: Stroke, pointInFrame: SIMD2<Double>) -> Bool {
-        let localX = pointInFrame.x - stroke.origin.x
-        let localY = pointInFrame.y - stroke.origin.y
-        let localPoint = CGPoint(x: localX, y: localY)
+    private func pointInFrame(screenPoint: CGPoint, viewSize: CGSize, frame: Frame) -> SIMD2<Double>? {
+        let pointActive = screenToWorldPixels_PureDouble(
+            screenPoint,
+            viewSize: viewSize,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
 
-        if stroke.localBounds != .null, !stroke.localBounds.contains(localPoint) {
-            return false
+        if frame === activeFrame {
+            return pointActive
         }
 
-        let radius = Float(stroke.worldWidth * 0.5)
+        guard let transform = transformFromActive(to: frame) else { return nil }
+        return pointActive * transform.scale + transform.translation
+    }
+
+    private func eraserRadiusWorld(forScale scale: Double) -> Double {
+        let safeZoom = max(zoomScale, 1e-6)
+        return (brushSettings.size * 0.5) * scale / safeZoom
+    }
+
+    private func hitTestStroke(_ stroke: Stroke,
+                               pointInFrame: SIMD2<Double>,
+                               eraserRadius: Double) -> Bool {
+        let localX = pointInFrame.x - stroke.origin.x
+        let localY = pointInFrame.y - stroke.origin.y
+
+        if stroke.localBounds != .null {
+            // Broad-phase: skip per-segment math if eraser bounds don't overlap stroke bounds.
+            let sBounds = stroke.localBounds
+            let eMinX = localX - eraserRadius
+            let eMaxX = localX + eraserRadius
+            let eMinY = localY - eraserRadius
+            let eMaxY = localY + eraserRadius
+
+            if eMaxX < Double(sBounds.minX) ||
+                eMinX > Double(sBounds.maxX) ||
+                eMaxY < Double(sBounds.minY) ||
+                eMinY > Double(sBounds.maxY) {
+                return false
+            }
+        }
+
+        let radius = Float(stroke.worldWidth * 0.5 + eraserRadius)
         let radiusSq = radius * radius
         let p = SIMD2<Float>(Float(localX), Float(localY))
 
@@ -1847,6 +1911,35 @@ import simd
         return false
     }
 
+    private func hitTestCardStroke(card: Card,
+                                   pointInFrame: SIMD2<Double>,
+                                   eraserRadius: Double,
+                                   minimumDepthID: UInt32? = nil) -> Stroke? {
+        guard !card.strokes.isEmpty else { return nil }
+        guard card.hitTest(pointInFrame: pointInFrame) else { return nil }
+
+        let dx = pointInFrame.x - card.origin.x
+        let dy = pointInFrame.y - card.origin.y
+        let c = cos(-card.rotation)
+        let s = sin(-card.rotation)
+        let localX = dx * Double(c) - dy * Double(s)
+        let localY = dx * Double(s) + dy * Double(c)
+        let pointInCard = SIMD2<Double>(localX, localY)
+
+        for stroke in card.strokes.reversed() {
+            if let minimumDepthID, stroke.depthID <= minimumDepthID {
+                break
+            }
+            if hitTestStroke(stroke,
+                             pointInFrame: pointInCard,
+                             eraserRadius: eraserRadius) {
+                return stroke
+            }
+        }
+
+        return nil
+    }
+
     private func hitTestStrokeHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> StrokeHit? {
         let pointActive = screenToWorldPixels_PureDouble(
             screenPoint,
@@ -1859,68 +1952,109 @@ import simd
         let transforms = collectFrameTransforms(pointActive: pointActive)
         var bestDepthID: UInt32?
         var bestTarget: StrokeHit.Target?
+        var bestStroke: Stroke?
 
-        func considerCanvasStrokes(in frame: Frame, pointInFrame: SIMD2<Double>) {
+        func considerCanvasStrokes(in frame: Frame,
+                                   pointInFrame: SIMD2<Double>,
+                                   eraserRadius: Double) {
             guard !frame.strokes.isEmpty else { return }
             for stroke in frame.strokes.reversed() {
                 if let best = bestDepthID, stroke.depthID <= best {
                     break
                 }
-                if hitTestStroke(stroke, pointInFrame: pointInFrame) {
+                if hitTestStroke(stroke,
+                                 pointInFrame: pointInFrame,
+                                 eraserRadius: eraserRadius) {
                     bestDepthID = stroke.depthID
                     bestTarget = .canvas(frame: frame, pointInFrame: pointInFrame)
+                    bestStroke = stroke
                     break
                 }
             }
         }
 
-        func considerCardStrokes(in frame: Frame, pointInFrame: SIMD2<Double>) {
+        func considerCardStrokes(in frame: Frame,
+                                 pointInFrame: SIMD2<Double>,
+                                 eraserRadius: Double) {
             guard !frame.cards.isEmpty else { return }
 
             for card in frame.cards.reversed() {
-                guard !card.strokes.isEmpty else { continue }
-                if let best = bestDepthID, let newest = card.strokes.last?.depthID, newest <= best {
+                guard let newest = card.strokes.last?.depthID else { continue }
+                if let best = bestDepthID, newest <= best {
                     continue
                 }
-                guard card.hitTest(pointInFrame: pointInFrame) else { continue }
-
-                let dx = pointInFrame.x - card.origin.x
-                let dy = pointInFrame.y - card.origin.y
-                let c = cos(-card.rotation)
-                let s = sin(-card.rotation)
-                let localX = dx * Double(c) - dy * Double(s)
-                let localY = dx * Double(s) + dy * Double(c)
-                let pointInCard = SIMD2<Double>(localX, localY)
-
-                for stroke in card.strokes.reversed() {
-                    if let best = bestDepthID, stroke.depthID <= best {
-                        break
-                    }
-                    if hitTestStroke(stroke, pointInFrame: pointInCard) {
-                        bestDepthID = stroke.depthID
-                        bestTarget = .card(card: card, frame: frame)
-                        break
-                    }
+                if let stroke = hitTestCardStroke(card: card,
+                                                  pointInFrame: pointInFrame,
+                                                  eraserRadius: eraserRadius,
+                                                  minimumDepthID: bestDepthID) {
+                    bestDepthID = stroke.depthID
+                    bestTarget = .card(card: card, frame: frame)
+                    bestStroke = stroke
+                    break
                 }
             }
         }
 
         // Active frame first, then ancestors/descendants.
-        considerCanvasStrokes(in: activeFrame, pointInFrame: pointActive)
-        considerCardStrokes(in: activeFrame, pointInFrame: pointActive)
+        let activeEraserRadius = eraserRadiusWorld(forScale: 1.0)
+        considerCanvasStrokes(in: activeFrame,
+                              pointInFrame: pointActive,
+                              eraserRadius: activeEraserRadius)
+        considerCardStrokes(in: activeFrame,
+                            pointInFrame: pointActive,
+                            eraserRadius: activeEraserRadius)
 
         for ancestor in transforms.ancestors {
-            considerCanvasStrokes(in: ancestor.frame, pointInFrame: ancestor.point)
-            considerCardStrokes(in: ancestor.frame, pointInFrame: ancestor.point)
+            let eraserRadius = eraserRadiusWorld(forScale: ancestor.scale)
+            considerCanvasStrokes(in: ancestor.frame,
+                                  pointInFrame: ancestor.point,
+                                  eraserRadius: eraserRadius)
+            considerCardStrokes(in: ancestor.frame,
+                                pointInFrame: ancestor.point,
+                                eraserRadius: eraserRadius)
         }
 
         for descendant in transforms.descendants {
-            considerCanvasStrokes(in: descendant.frame, pointInFrame: descendant.point)
-            considerCardStrokes(in: descendant.frame, pointInFrame: descendant.point)
+            let eraserRadius = eraserRadiusWorld(forScale: descendant.scale)
+            considerCanvasStrokes(in: descendant.frame,
+                                  pointInFrame: descendant.point,
+                                  eraserRadius: eraserRadius)
+            considerCardStrokes(in: descendant.frame,
+                                pointInFrame: descendant.point,
+                                eraserRadius: eraserRadius)
         }
 
-        guard let depthID = bestDepthID, let target = bestTarget else { return nil }
-        return StrokeHit(target: target, depthID: depthID)
+        guard let depthID = bestDepthID, let target = bestTarget, let stroke = bestStroke else { return nil }
+        return StrokeHit(target: target, stroke: stroke, depthID: depthID)
+    }
+
+    private func eraseStrokeAtPoint(screenPoint: CGPoint, viewSize: CGSize) {
+        // Cards sit on top of the canvas; when covered, only card strokes are eligible.
+        if let cardHit = hitTestHierarchy(screenPoint: screenPoint, viewSize: viewSize) {
+            guard let pointInTargetFrame = pointInFrame(screenPoint: screenPoint,
+                                                        viewSize: viewSize,
+                                                        frame: cardHit.frame) else { return }
+            let eraserRadius = eraserRadiusWorld(forScale: cardHit.conversionScale)
+            if let stroke = hitTestCardStroke(card: cardHit.card,
+                                              pointInFrame: pointInTargetFrame,
+                                              eraserRadius: eraserRadius),
+               let index = cardHit.card.strokes.firstIndex(where: { $0 === stroke }) {
+                cardHit.card.strokes.remove(at: index)
+            }
+            return
+        }
+
+        guard let hit = hitTestStrokeHierarchy(screenPoint: screenPoint, viewSize: viewSize) else { return }
+        switch hit.target {
+        case .canvas(let frame, _):
+            if let index = frame.strokes.firstIndex(where: { $0 === hit.stroke }) {
+                frame.strokes.remove(at: index)
+            }
+        case .card(let card, _):
+            if let index = card.strokes.firstIndex(where: { $0 === hit.stroke }) {
+                card.strokes.remove(at: index)
+            }
+        }
     }
 
     // MARK: - Card Management
