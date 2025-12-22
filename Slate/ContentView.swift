@@ -39,6 +39,36 @@ struct ContentView: View {
 
                     if let coordinator = metalViewCoordinator {
                         Button(action: {
+                            coordinator.debugPopulateFrames()
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "bolt.fill")
+                                Text("Debug Fill")
+                            }
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.yellow)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(20)
+                        }
+
+                        Button(action: {
+                            coordinator.clearAllStrokes()
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "trash.slash")
+                                Text("Clear Strokes")
+                            }
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.red)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(20)
+                        }
+
+                        Button(action: {
                             coordinator.brushSettings.toolMode = coordinator.brushSettings.isMaskEraser ? .paint : .maskEraser
                         }) {
                             VStack(spacing: 2) {

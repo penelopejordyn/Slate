@@ -81,6 +81,100 @@ import simd
 	    var debugDrawnVerticesThisFrame: Int = 0
 	    var debugDrawnNodesThisFrame: Int = 0
 
+	    // MARK: - Debug Tools
+	    func debugPopulateFrames(parentCount: Int = 20,
+	                             childCount: Int = 20,
+	                             strokesPerFrame: Int = 1000,
+	                             maxOffset: Double = 1000.0) {
+	        guard let view = metalView else { return }
+
+	        let cameraCenterActive = calculateCameraCenterWorld(viewSize: view.bounds.size)
+
+	        // Build parent chain above the current top-most frame (linked-list invariant).
+	        var topFrame = activeFrame
+	        while let parent = topFrame.parent {
+	            topFrame = parent
+	        }
+
+	        if parentCount > 0 {
+	            for _ in 0..<parentCount {
+	                let newParent = Frame(depth: topFrame.depthFromRoot - 1)
+	                topFrame.parent = newParent
+	                newParent.children.append(topFrame)
+	                topFrame.originInParent = .zero
+	                topFrame.scaleRelativeToParent = 1000.0
+	                topFrame = newParent
+	            }
+	        }
+
+	        // Build child chain below the current bottom-most frame (linked-list invariant).
+	        var bottomFrame = activeFrame
+	        while let child = childFrame(of: bottomFrame) {
+	            bottomFrame = child
+	        }
+
+	        if childCount > 0 {
+	            var parentFrame = bottomFrame
+	            for _ in 0..<childCount {
+	                let parentCameraCenter = cameraCenterInFrame(parentFrame, cameraCenterActive: cameraCenterActive)
+	                let newChild = Frame(parent: parentFrame,
+	                                     origin: parentCameraCenter,
+	                                     scale: 1000.0,
+	                                     depth: parentFrame.depthFromRoot + 1)
+	                parentFrame.children.append(newChild)
+	                parentFrame = newChild
+	            }
+	        }
+
+	        // Debug stress fill: keep strokes within +/- maxOffset in each frame's world space.
+	        let transforms = collectFrameTransforms(pointActive: cameraCenterActive)
+	        var frames: [Frame] = transforms.ancestors.map { $0.frame }
+	        frames.append(activeFrame)
+	        frames.append(contentsOf: transforms.descendants.map { $0.frame })
+
+	        for frame in frames {
+	            let (cameraCenterInTarget, effectiveZoom) = cameraCenterAndZoom(in: frame, cameraCenterActive: cameraCenterActive)
+	            frame.strokes.reserveCapacity(frame.strokes.count + strokesPerFrame)
+
+	            for _ in 0..<strokesPerFrame {
+	                let points = randomStrokePoints(center: cameraCenterInTarget, maxOffset: maxOffset)
+	                let virtualScreenPoints = points.map { CGPoint(x: $0.x * effectiveZoom, y: $0.y * effectiveZoom) }
+	                let color = SIMD4<Float>(Float.random(in: 0.1...1.0),
+	                                         Float.random(in: 0.1...1.0),
+	                                         Float.random(in: 0.1...1.0),
+	                                         1.0)
+	                let stroke = Stroke(screenPoints: virtualScreenPoints,
+	                                    zoomAtCreation: effectiveZoom,
+	                                    panAtCreation: .zero,
+	                                    viewSize: .zero,
+	                                    rotationAngle: 0,
+	                                    color: color,
+	                                    baseWidth: Double.random(in: 2.0...10.0),
+	                                    zoomEffectiveAtCreation: Float(effectiveZoom),
+	                                    device: device,
+	                                    depthID: allocateStrokeDepthID(),
+	                                    depthWriteEnabled: true)
+	                frame.strokes.append(stroke)
+	            }
+	        }
+	    }
+
+	    func clearAllStrokes() {
+	        var topFrame = activeFrame
+	        while let parent = topFrame.parent {
+	            topFrame = parent
+	        }
+
+	        var current: Frame? = topFrame
+	        while let frame = current {
+	            frame.strokes.removeAll()
+	            for card in frame.cards {
+	                card.strokes.removeAll()
+	            }
+	            current = childFrame(of: frame)
+	        }
+	    }
+
 	    // MARK: - Global Stroke Depth Ordering
 	    // A monotonic per-stroke counter lets depth testing work across telescoping frames.
 	    // Larger depthID = newer stroke; we map this into Metal NDC depth (smaller = closer).
@@ -1411,6 +1505,45 @@ import simd
                                               panOffset: panOffset,       // Now passing SIMD2<Double>
                                               zoomScale: zoomScale,       // Now passing Double
                                               rotationAngle: rotationAngle)
+    }
+
+    private func cameraCenterInFrame(_ frame: Frame,
+                                     cameraCenterActive: SIMD2<Double>) -> SIMD2<Double> {
+        guard frame !== activeFrame, let transform = transformFromActive(to: frame) else {
+            return cameraCenterActive
+        }
+        return cameraCenterActive * transform.scale + transform.translation
+    }
+
+    private func cameraCenterAndZoom(in frame: Frame,
+                                     cameraCenterActive: SIMD2<Double>) -> (SIMD2<Double>, Double) {
+        guard frame !== activeFrame, let transform = transformFromActive(to: frame) else {
+            return (cameraCenterActive, max(zoomScale, 1e-6))
+        }
+        let cameraCenter = cameraCenterActive * transform.scale + transform.translation
+        let effectiveZoom = max(zoomScale / transform.scale, 1e-6)
+        return (cameraCenter, effectiveZoom)
+    }
+
+    private func randomStrokePoints(center: SIMD2<Double>, maxOffset: Double) -> [SIMD2<Double>] {
+        let pointCount = Int.random(in: 2...6)
+        var points: [SIMD2<Double>] = []
+        points.reserveCapacity(pointCount)
+
+        var x = center.x + Double.random(in: -maxOffset...maxOffset)
+        var y = center.y + Double.random(in: -maxOffset...maxOffset)
+        points.append(SIMD2<Double>(x, y))
+
+        let stepRange = maxOffset * 0.1
+        for _ in 1..<pointCount {
+            x += Double.random(in: -stepRange...stepRange)
+            y += Double.random(in: -stepRange...stepRange)
+            x = min(center.x + maxOffset, max(center.x - maxOffset, x))
+            y = min(center.y + maxOffset, max(center.y - maxOffset, y))
+            points.append(SIMD2<Double>(x, y))
+        }
+
+        return points
     }
 
     // MARK: - Stroke Simplification
