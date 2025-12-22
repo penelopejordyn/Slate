@@ -1,11 +1,15 @@
 // ContentView.swift wires the SwiftUI interface, hosting the toolbar and MetalView canvas binding.
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     // Reference to MetalView's coordinator for adding cards
     @State private var metalViewCoordinator: MetalView.Coordinator?
     @State private var editingCard: Card? // The card being edited
     @State private var showSettingsSheet = false
+    @State private var showingImportPicker = false
+    @State private var isExporting = false
+    @State private var exportDocument = CanvasDocument()
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -69,6 +73,39 @@ struct ContentView: View {
                         }
 
                         Button(action: {
+                            if let data = PersistenceManager.shared.exportCanvas(rootFrame: coordinator.rootFrame) {
+                                exportDocument = CanvasDocument(data: data)
+                                isExporting = true
+                            }
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "square.and.arrow.up")
+                                Text("Export")
+                            }
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(20)
+                        }
+
+                        Button(action: {
+                            showingImportPicker = true
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "square.and.arrow.down")
+                                Text("Import")
+                            }
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(20)
+                        }
+
+                        Button(action: {
                             coordinator.brushSettings.toolMode = coordinator.brushSettings.isMaskEraser ? .paint : .maskEraser
                         }) {
                             VStack(spacing: 2) {
@@ -113,6 +150,29 @@ struct ContentView: View {
             if let card = editingCard {
                 CardSettingsView(card: card)
                     .presentationDetents([.medium])
+            }
+        }
+        .fileImporter(isPresented: $showingImportPicker, allowedContentTypes: [.json]) { result in
+            switch result {
+            case .success(let url):
+                let access = url.startAccessingSecurityScopedResource()
+                defer {
+                    if access {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                guard let coordinator = metalViewCoordinator else { return }
+                guard let data = try? Data(contentsOf: url) else { return }
+                if let newRoot = PersistenceManager.shared.importCanvas(data: data, device: coordinator.device) {
+                    coordinator.replaceCanvas(with: newRoot)
+                }
+            case .failure(let error):
+                print("Import error: \(error)")
+            }
+        }
+        .fileExporter(isPresented: $isExporting, document: exportDocument, contentType: .json, defaultFilename: "canvas") { result in
+            if case .failure(let error) = result {
+                print("Export error: \(error)")
             }
         }
     }
@@ -209,6 +269,24 @@ struct StrokeSizeSlider: View {
         .padding(.vertical, 12)
         .background(.ultraThinMaterial)
         .cornerRadius(20)
+    }
+}
+
+struct CanvasDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.json] }
+
+    var data: Data
+
+    init(data: Data = Data()) {
+        self.data = data
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        self.data = configuration.file.regularFileContents ?? Data()
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
     }
 }
 

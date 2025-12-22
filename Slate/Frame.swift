@@ -19,7 +19,7 @@ import Foundation
 /// Like the movie "Men in Black" - the galaxy is inside a marble, which is
 /// inside a bag, which is inside a locker. Each level is a separate Frame.
 class Frame: Identifiable {
-    let id = UUID()
+    let id: UUID
 
     /// Strokes that belong to this specific "depth" or layer of reality
     var strokes: [Stroke] = []
@@ -54,10 +54,26 @@ class Frame: Identifiable {
     ///   - origin: Where this frame lives in parent coordinates
     ///   - scale: The zoom factor when this frame was created
     ///   - depth: The depth relative to root (calculated by caller)
-    init(parent: Frame? = nil, origin: SIMD2<Double> = .zero, scale: Double = 1.0, depth: Int = 0) {
+    init(id: UUID = UUID(), parent: Frame? = nil, origin: SIMD2<Double> = .zero, scale: Double = 1.0, depth: Int = 0) {
+        self.id = id
         self.parent = parent
         self.originInParent = origin
         self.scaleRelativeToParent = scale
         self.depthFromRoot = depth
+    }
+}
+
+// MARK: - Serialization
+extension Frame {
+    func toDTO() -> FrameDTO {
+        FrameDTO(
+            id: id,
+            originInParent: [originInParent.x, originInParent.y],
+            scaleRelativeToParent: scaleRelativeToParent,
+            depthFromRoot: depthFromRoot,
+            strokes: strokes.map { $0.toDTO() },
+            cards: cards.map { $0.toDTO() },
+            children: children.map { $0.toDTO() }
+        )
     }
 }

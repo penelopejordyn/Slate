@@ -1,6 +1,7 @@
 // Card.swift defines the Card model, covering metadata, stroke contents, and size/transform state.
 import SwiftUI
 import Metal
+import UIKit
 
 // Configuration for procedural backgrounds
 struct LinedBackgroundConfig {
@@ -27,7 +28,7 @@ struct CardShaderUniforms {
 }
 
 class Card: Identifiable {
-    let id = UUID()
+    let id: UUID
 
     // MARK: - Physical Properties
     // These are stored in the Parent Frame's coordinate space.
@@ -61,7 +62,8 @@ class Card: Identifiable {
     // This optimization means we don't have to do math every frame.
     var localVertices: [StrokeVertex] = []
 
-    init(origin: SIMD2<Double>, size: SIMD2<Double>, rotation: Float = 0, zoom: Double, type: CardType) {
+    init(id: UUID = UUID(), origin: SIMD2<Double>, size: SIMD2<Double>, rotation: Float = 0, zoom: Double, type: CardType) {
+        self.id = id
         self.origin = origin
         self.size = size
         self.rotation = rotation
@@ -146,5 +148,71 @@ class Card: Identifiable {
             SIMD2<Float>(-halfW,  halfH), // Bottom-Left
             SIMD2<Float>( halfW,  halfH)  // Bottom-Right
         ]
+    }
+}
+
+// MARK: - Serialization
+extension Card {
+    func toDTO() -> CardDTO {
+        let content: CardContentDTO
+
+        switch type {
+        case .solidColor(let c):
+            content = .solid(color: [c.x, c.y, c.z, c.w])
+        case .lined(let cfg):
+            content = .lined(spacing: cfg.spacing, lineWidth: cfg.lineWidth, color: [cfg.color.x, cfg.color.y, cfg.color.z, cfg.color.w])
+        case .grid(let cfg):
+            content = .grid(spacing: cfg.spacing, lineWidth: cfg.lineWidth, color: [cfg.color.x, cfg.color.y, cfg.color.z, cfg.color.w])
+        case .image(let texture):
+            if let data = textureToPNGData(texture) {
+                content = .image(pngData: data)
+            } else {
+                content = .solid(color: [1, 0, 1, 1])
+            }
+        case .drawing:
+            content = .solid(color: [1, 1, 1, 1])
+        }
+
+        return CardDTO(
+            id: id,
+            origin: [origin.x, origin.y],
+            size: [size.x, size.y],
+            rotation: rotation,
+            creationZoom: creationZoom,
+            content: content,
+            strokes: strokes.map { $0.toDTO() }
+        )
+    }
+
+    private func textureToPNGData(_ texture: MTLTexture) -> Data? {
+        let format = texture.pixelFormat
+        guard format == .bgra8Unorm || format == .bgra8Unorm_srgb else { return nil }
+
+        let width = texture.width
+        let height = texture.height
+        let rowBytes = width * 4
+        var bytes = [UInt8](repeating: 0, count: rowBytes * height)
+
+        let region = MTLRegionMake2D(0, 0, width, height)
+        texture.getBytes(&bytes, bytesPerRow: rowBytes, from: region, mipmapLevel: 0)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+            .union(.byteOrder32Little)
+
+        guard let context = CGContext(
+            data: &bytes,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: rowBytes,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo.rawValue
+        ),
+        let cgImage = context.makeImage() else {
+            return nil
+        }
+
+        return UIImage(cgImage: cgImage).pngData()
     }
 }

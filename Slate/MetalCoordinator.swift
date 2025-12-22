@@ -61,7 +61,7 @@ import simd
 
     // Telescoping Reference Frames
     // Instead of a flat array, we use a linked list of Frames for infinite zoom
-    let rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
+    var rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
     lazy var activeFrame: Frame = rootFrame  // The current "Local Universe" we are viewing/editing
 
     weak var metalView: MTKView?
@@ -175,6 +175,21 @@ import simd
 	        }
 	    }
 
+	    func replaceCanvas(with newRoot: Frame) {
+	        newRoot.parent = nil
+	        rootFrame = newRoot
+	        activeFrame = findFrame(withDepth: 0, in: newRoot) ?? newRoot
+	        panOffset = .zero
+	        zoomScale = 1.0
+	        rotationAngle = 0.0
+	        currentDrawingTarget = nil
+	        currentTouchPoints = []
+	        predictedTouchPoints = []
+	        liveStrokeOrigin = nil
+	        lastSavedPoint = nil
+	        resetStrokeDepthID(using: newRoot)
+	    }
+
 	    // MARK: - Global Stroke Depth Ordering
 	    // A monotonic per-stroke counter lets depth testing work across telescoping frames.
 	    // Larger depthID = newer stroke; we map this into Metal NDC depth (smaller = closer).
@@ -192,6 +207,60 @@ import simd
 
 	    private func peekStrokeDepthID() -> UInt32 {
 	        nextStrokeDepthID
+	    }
+
+	    private func resetStrokeDepthID(using frame: Frame) {
+	        if let maxDepth = maxStrokeDepthID(in: frame) {
+	            if maxDepth < Self.strokeDepthSlotCount - 1 {
+	                nextStrokeDepthID = maxDepth + 1
+	            } else {
+	                nextStrokeDepthID = Self.strokeDepthSlotCount - 1
+	            }
+	        } else {
+	            nextStrokeDepthID = 0
+	        }
+	    }
+
+	    private func maxStrokeDepthID(in frame: Frame) -> UInt32? {
+	        var maxID: UInt32?
+
+	        func consider(_ id: UInt32) {
+	            if let current = maxID {
+	                if id > current {
+	                    maxID = id
+	                }
+	            } else {
+	                maxID = id
+	            }
+	        }
+
+	        for stroke in frame.strokes {
+	            consider(stroke.depthID)
+	        }
+	        for card in frame.cards {
+	            for stroke in card.strokes {
+	                consider(stroke.depthID)
+	            }
+	        }
+	        for child in frame.children {
+	            if let childMax = maxStrokeDepthID(in: child) {
+	                consider(childMax)
+	            }
+	        }
+
+	        return maxID
+	    }
+
+	    private func findFrame(withDepth depth: Int, in frame: Frame) -> Frame? {
+	        if frame.depthFromRoot == depth {
+	            return frame
+	        }
+	        for child in frame.children {
+	            if let found = findFrame(withDepth: depth, in: child) {
+	                return found
+	            }
+	        }
+	        return nil
 	    }
 
 	    override init() {
