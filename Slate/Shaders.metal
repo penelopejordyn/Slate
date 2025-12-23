@@ -349,6 +349,15 @@ struct CardTransform {
     float screenWidth;
     float screenHeight;
     float rotationAngle;
+    float depth;
+};
+
+struct CardStyleUniforms {
+    float2 cardHalfSize;
+    float zoomScale;
+    float cornerRadiusPx;
+    float shadowBlurPx;
+    float shadowOpacity;
 };
 
 /// Vertex input structure for cards - matches Swift's StrokeVertex
@@ -361,6 +370,7 @@ struct CardVertexIn {
 struct CardVertexOut {
     float4 position [[position]];  // Clip-space position
     float2 uv;                     // Texture coordinate (interpolated)
+    float2 localPos;               // Card-local position (world units)
 };
 
 /// Vertex shader for cards - applies floating origin transform
@@ -383,25 +393,59 @@ vertex CardVertexOut vertex_card(CardVertexIn in [[stage_in]],
     float ndcY = -(zoomed.y / transform->screenHeight) * 2.0;
 
     CardVertexOut out;
-    out.position = float4(ndcX, ndcY, 0.0, 1.0);
+    out.position = float4(ndcX, ndcY, transform->depth, 1.0);
     out.uv = in.uv;
+    out.localPos = in.position;
 
     return out;
+}
+
+inline float roundedRectDistance(float2 p, float2 halfSize, float radius) {
+    float2 q = abs(p) - (halfSize - float2(radius, radius));
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+inline float cardEdgeAlpha(float2 localPos,
+                           constant CardStyleUniforms &style,
+                           thread float &distPx) {
+    float safeZoom = max(style.zoomScale, 1e-6);
+    float radiusWorld = style.cornerRadiusPx / safeZoom;
+    float2 halfSize = style.cardHalfSize;
+    float maxRadius = min(halfSize.x, halfSize.y);
+    radiusWorld = min(radiusWorld, maxRadius);
+    float distWorld = roundedRectDistance(localPos, halfSize, radiusWorld);
+    distPx = distWorld * safeZoom;
+    return 1.0 - smoothstep(0.0, 1.0, distPx);
+}
+
+inline float4 applyCardMask(float4 baseColor,
+                            float2 localPos,
+                            constant CardStyleUniforms &style) {
+    float distPx = 0.0;
+    float edgeAlpha = cardEdgeAlpha(localPos, style, distPx);
+    if (distPx > 1.0) {
+        discard_fragment();
+    }
+
+    return float4(baseColor.rgb, baseColor.a * edgeAlpha);
 }
 
 /// Fragment shader for solid color cards - no texture required
 /// This avoids Metal validation issues when no texture is bound
 fragment float4 fragment_card_solid(CardVertexOut in [[stage_in]],
-                                    constant float4 &color [[buffer(0)]]) {
-    return color;
+                                    constant float4 &color [[buffer(0)]],
+                                    constant CardStyleUniforms &style [[buffer(2)]]) {
+    return applyCardMask(color, in.localPos, style);
 }
 
 /// Fragment shader for textured cards (images, PDFs)
 /// This shader requires a texture to be bound at index 0
 fragment float4 fragment_card_texture(CardVertexOut in [[stage_in]],
                                       texture2d<float> cardTexture [[texture(0)]],
-                                      sampler cardSampler [[sampler(0)]]) {
-    return cardTexture.sample(cardSampler, in.uv);
+                                      sampler cardSampler [[sampler(0)]],
+                                      constant CardStyleUniforms &style [[buffer(2)]]) {
+    float4 base = cardTexture.sample(cardSampler, in.uv);
+    return applyCardMask(base, in.localPos, style);
 }
 
 // MARK: - Procedural Background Shaders
@@ -420,7 +464,8 @@ struct CardShaderUniforms {
 /// Lines stay sharp at infinite zoom because they're calculated procedurally per-pixel
 fragment float4 fragment_card_lined(CardVertexOut in [[stage_in]],
                                     constant float4 &bgColor [[buffer(0)]],
-                                    constant CardShaderUniforms &uniforms [[buffer(1)]]) {
+                                    constant CardShaderUniforms &uniforms [[buffer(1)]],
+                                    constant CardStyleUniforms &style [[buffer(2)]]) {
     // 1. Calculate position in card units (world units)
     // UV is 0..1. Multiply by height to get local Y position in world units.
     float yPos = in.uv.y * uniforms.cardHeight;
@@ -443,7 +488,8 @@ fragment float4 fragment_card_lined(CardVertexOut in [[stage_in]],
     float alpha = 1.0 - smoothstep(halfLine - delta, halfLine + delta, d);
 
     // Mix background color and line color
-    return mix(bgColor, uniforms.color, alpha);
+    float4 base = mix(bgColor, uniforms.color, alpha);
+    return applyCardMask(base, in.localPos, style);
 }
 
 /// GRID PAPER SHADER
@@ -451,7 +497,8 @@ fragment float4 fragment_card_lined(CardVertexOut in [[stage_in]],
 /// Creates a graph paper effect that stays sharp at infinite zoom
 fragment float4 fragment_card_grid(CardVertexOut in [[stage_in]],
                                    constant float4 &bgColor [[buffer(0)]],
-                                   constant CardShaderUniforms &uniforms [[buffer(1)]]) {
+                                   constant CardShaderUniforms &uniforms [[buffer(1)]],
+                                   constant CardStyleUniforms &style [[buffer(2)]]) {
     // Calculate X and Y positions in card units (world units)
     float xPos = in.uv.x * uniforms.cardWidth;
     float yPos = in.uv.y * uniforms.cardHeight;
@@ -477,5 +524,23 @@ fragment float4 fragment_card_grid(CardVertexOut in [[stage_in]],
     float alpha = max(alphaX, alphaY);
 
     // Mix background color and line color
-    return mix(bgColor, uniforms.color, alpha);
+    float4 base = mix(bgColor, uniforms.color, alpha);
+    return applyCardMask(base, in.localPos, style);
+}
+
+fragment float4 fragment_card_shadow(CardVertexOut in [[stage_in]],
+                                     constant CardStyleUniforms &style [[buffer(2)]]) {
+    float distPx = 0.0;
+    cardEdgeAlpha(in.localPos, style, distPx);
+    if (distPx < 0.0) {
+        discard_fragment();
+    }
+
+    float blurPx = max(style.shadowBlurPx, 0.0);
+    if (blurPx <= 0.0 || style.shadowOpacity <= 0.0) {
+        discard_fragment();
+    }
+
+    float alpha = (1.0 - smoothstep(0.0, blurPx, distPx)) * style.shadowOpacity;
+    return float4(0.0, 0.0, 0.0, alpha);
 }

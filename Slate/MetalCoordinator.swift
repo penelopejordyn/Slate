@@ -15,6 +15,7 @@ import simd
 	    var cardSolidPipelineState: MTLRenderPipelineState! // Pipeline for solid color cards
 	    var cardLinedPipelineState: MTLRenderPipelineState! // Pipeline for lined paper cards
 	    var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
+	    var cardShadowPipelineState: MTLRenderPipelineState! // Pipeline for card shadows
 	    var strokeSegmentPipelineState: MTLRenderPipelineState! // SDF segment pipeline
 	    var postProcessPipelineState: MTLRenderPipelineState!   // FXAA fullscreen pass
 	    var samplerState: MTLSamplerState!                  // Sampler for card textures
@@ -26,12 +27,14 @@ import simd
     //  Stencil States for Card Clipping
     var stencilStateDefault: MTLDepthStencilState! // Default passthrough (no testing)
     var stencilStateWrite: MTLDepthStencilState!   // Writes 1s to stencil (card background)
-    var stencilStateRead: MTLDepthStencilState!    // Only draws where stencil == 1 (card strokes)
+    var stencilStateRead: MTLDepthStencilState!    // Stencil read only (no depth test)
     var stencilStateClear: MTLDepthStencilState!   // Writes 0s to stencil (cleanup)
 
     // Depth States for Stroke Rendering
     var strokeDepthStateWrite: MTLDepthStencilState!   // Depth test + write enabled
     var strokeDepthStateNoWrite: MTLDepthStencilState! // Depth test enabled, depth write disabled
+    var cardStrokeDepthStateWrite: MTLDepthStencilState!   // Depth test + write enabled, stencil read
+    var cardStrokeDepthStateNoWrite: MTLDepthStencilState! // Depth test enabled, stencil read only
 
     // Offscreen render targets (scene -> texture, then FXAA -> drawable)
     private var offscreenColorTexture: MTLTexture?
@@ -49,9 +52,113 @@ import simd
     }
     var currentDrawingTarget: DrawingTarget?
 
+    // MARK: - Lasso Selection
+    struct LassoFrameSelection {
+        var frame: Frame
+        var strokeIDs: Set<UUID>
+    }
+
+    struct LassoCardSelection {
+        let card: Card
+        let frame: Frame
+    }
+
+    struct LassoCardStrokeSelection {
+        let card: Card
+        let frame: Frame
+        let strokeIDs: Set<UUID>
+    }
+
+    struct LassoSelection {
+        var points: [SIMD2<Double>] // Closed polygon in active frame coordinates
+        var bounds: CGRect
+        var center: SIMD2<Double>
+        var frames: [LassoFrameSelection]
+        var cards: [LassoCardSelection]
+        var cardStrokes: [LassoCardStrokeSelection]
+    }
+
+    private struct StrokeSnapshot {
+        let id: UUID
+        let frame: Frame
+        let index: Int
+        let activePoints: [SIMD2<Double>]
+        let color: SIMD4<Float>
+        let worldWidth: Double
+        let zoomEffectiveAtCreation: Float
+        let depthID: UInt32
+        let depthWriteEnabled: Bool
+        let frameScale: Double
+        let frameTranslation: SIMD2<Double>
+    }
+
+    private struct CardSnapshot {
+        let card: Card
+        let frameScale: Double
+        let frameTranslation: SIMD2<Double>
+        let originActive: SIMD2<Double>
+        let size: SIMD2<Double>
+        let rotation: Float
+    }
+
+    private struct CardStrokeSnapshot {
+        let card: Card
+        let frame: Frame
+        let index: Int
+        let activePoints: [SIMD2<Double>]
+        let color: SIMD4<Float>
+        let worldWidth: Double
+        let zoomEffectiveAtCreation: Float
+        let depthID: UInt32
+        let depthWriteEnabled: Bool
+        let frameScale: Double
+        let frameTranslation: SIMD2<Double>
+        let cardOrigin: SIMD2<Double>
+        let cardRotation: Double
+    }
+
+    private struct LassoTransformState {
+        let basePoints: [SIMD2<Double>]
+        let baseCenter: SIMD2<Double>
+        let baseStrokes: [StrokeSnapshot]
+        let baseCards: [CardSnapshot]
+        let baseCardStrokes: [CardStrokeSnapshot]
+        var currentScale: Double
+        var currentRotation: Double
+    }
+
+    private enum LassoTarget {
+        case canvas
+        case card(Card, Frame)
+    }
+
+    // MARK: - Undo/Redo System
+
+    enum UndoAction {
+        case drawStroke(stroke: Stroke, target: DrawingTarget)
+        case eraseStroke(stroke: Stroke, strokeIndex: Int, target: DrawingTarget)
+        case moveCard(card: Card, frame: Frame, oldOrigin: SIMD2<Double>)
+        case resizeCard(card: Card, frame: Frame, oldOrigin: SIMD2<Double>, oldSize: SIMD2<Double>)
+        // TODO: Add lasso move/transform cases
+    }
+
+    private var undoStack: [UndoAction] = []
+    private var redoStack: [UndoAction] = []
+    private let maxUndoActions = 25
+
     var currentTouchPoints: [CGPoint] = []      // Real historical points (SCREEN space)
     var predictedTouchPoints: [CGPoint] = []    // Future points (Transient, SCREEN space)
     var liveStrokeOrigin: SIMD2<Double>?        // Temporary origin for live stroke (Double precision)
+
+    var lassoDrawingPoints: [CGPoint] = []
+    var lassoPredictedPoints: [CGPoint] = []
+    var lassoSelection: LassoSelection?
+    var lassoPreviewStroke: Stroke?
+    var lassoPreviewFrame: Frame?
+    private var lassoTransformState: LassoTransformState?
+    private var lassoTarget: LassoTarget?
+    private var lassoPreviewCard: Card?
+    private var lassoPreviewCardFrame: Frame?
 
     //  OPTIMIZATION: Adaptive Fidelity
     // Track last saved point for distance filtering to prevent vertex explosion during slow drawing
@@ -59,7 +166,7 @@ import simd
 
     // Telescoping Reference Frames
     // Instead of a flat array, we use a linked list of Frames for infinite zoom
-    let rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
+    var rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
     lazy var activeFrame: Frame = rootFrame  // The current "Local Universe" we are viewing/editing
 
     weak var metalView: MTKView?
@@ -75,9 +182,237 @@ import simd
     // MARK: - Brush Settings
     let brushSettings = BrushSettings()
 
+    private let lassoDashLengthPx: Double = 6.0
+    private let lassoGapLengthPx: Double = 4.0
+    private let lassoLineWidthPx: Double = 1.5
+    private let lassoColor = SIMD4<Float>(1.0, 1.0, 1.0, 0.6)
+    private let cardCornerRadiusPx: Float = 12.0
+    private let cardShadowEnabled: Bool = true
+    private let cardShadowBlurPx: Float = 18.0
+    private let cardShadowOpacity: Float = 0.25
+    private let cardShadowOffsetPx = SIMD2<Float>(0.0, 0.0)
+
 	    // MARK: - Debug Metrics
 	    var debugDrawnVerticesThisFrame: Int = 0
 	    var debugDrawnNodesThisFrame: Int = 0
+
+	    // MARK: - Debug Tools
+	    func debugPopulateFrames(parentCount: Int = 20,
+	                             childCount: Int = 20,
+	                             strokesPerFrame: Int = 1000,
+	                             maxOffset: Double = 1000.0) {
+	        guard let view = metalView else { return }
+
+	        let cameraCenterActive = calculateCameraCenterWorld(viewSize: view.bounds.size)
+
+	        // Build parent chain above the current top-most frame (linked-list invariant).
+	        var topFrame = activeFrame
+	        while let parent = topFrame.parent {
+	            topFrame = parent
+	        }
+
+	        if parentCount > 0 {
+	            for _ in 0..<parentCount {
+	                let newParent = Frame(depth: topFrame.depthFromRoot - 1)
+	                topFrame.parent = newParent
+	                newParent.children.append(topFrame)
+	                topFrame.originInParent = .zero
+	                topFrame.scaleRelativeToParent = 1000.0
+	                topFrame = newParent
+	            }
+	        }
+
+	        // Build child chain below the current bottom-most frame (linked-list invariant).
+	        var bottomFrame = activeFrame
+	        while let child = childFrame(of: bottomFrame) {
+	            bottomFrame = child
+	        }
+
+	        if childCount > 0 {
+	            var parentFrame = bottomFrame
+	            for _ in 0..<childCount {
+	                let parentCameraCenter = cameraCenterInFrame(parentFrame, cameraCenterActive: cameraCenterActive)
+	                let newChild = Frame(parent: parentFrame,
+	                                     origin: parentCameraCenter,
+	                                     scale: 1000.0,
+	                                     depth: parentFrame.depthFromRoot + 1)
+	                parentFrame.children.append(newChild)
+	                parentFrame = newChild
+	            }
+	        }
+
+	        // Debug stress fill: keep strokes within +/- maxOffset in each frame's world space.
+	        let transforms = collectFrameTransforms(pointActive: cameraCenterActive)
+	        var frames: [Frame] = transforms.ancestors.map { $0.frame }
+	        frames.append(activeFrame)
+	        frames.append(contentsOf: transforms.descendants.map { $0.frame })
+
+	        for frame in frames {
+	            let (cameraCenterInTarget, effectiveZoom) = cameraCenterAndZoom(in: frame, cameraCenterActive: cameraCenterActive)
+	            frame.strokes.reserveCapacity(frame.strokes.count + strokesPerFrame)
+
+	            for _ in 0..<strokesPerFrame {
+	                let points = randomStrokePoints(center: cameraCenterInTarget, maxOffset: maxOffset)
+	                let virtualScreenPoints = points.map { CGPoint(x: $0.x * effectiveZoom, y: $0.y * effectiveZoom) }
+	                let color = SIMD4<Float>(Float.random(in: 0.1...1.0),
+	                                         Float.random(in: 0.1...1.0),
+	                                         Float.random(in: 0.1...1.0),
+	                                         1.0)
+	                let stroke = Stroke(screenPoints: virtualScreenPoints,
+	                                    zoomAtCreation: effectiveZoom,
+	                                    panAtCreation: .zero,
+	                                    viewSize: .zero,
+	                                    rotationAngle: 0,
+	                                    color: color,
+	                                    baseWidth: Double.random(in: 2.0...10.0),
+	                                    zoomEffectiveAtCreation: Float(effectiveZoom),
+	                                    device: device,
+	                                    depthID: allocateStrokeDepthID(),
+	                                    depthWriteEnabled: true)
+	                frame.strokes.append(stroke)
+	            }
+	        }
+	    }
+
+	    func clearAllStrokes() {
+	        var topFrame = activeFrame
+	        while let parent = topFrame.parent {
+	            topFrame = parent
+	        }
+
+	        var current: Frame? = topFrame
+	        while let frame = current {
+	            frame.strokes.removeAll()
+	            for card in frame.cards {
+	                card.strokes.removeAll()
+	            }
+	            current = childFrame(of: frame)
+	        }
+	    }
+
+	    // MARK: - Undo/Redo Implementation
+
+	    func pushUndo(_ action: UndoAction) {
+	        undoStack.append(action)
+	        if undoStack.count > maxUndoActions {
+	            undoStack.removeFirst()
+	        }
+	        redoStack.removeAll() // Clear redo stack when new action is performed
+	    }
+
+	    func pushUndoMoveCard(card: Card, frame: Frame, oldOrigin: SIMD2<Double>) {
+	        pushUndo(.moveCard(card: card, frame: frame, oldOrigin: oldOrigin))
+	    }
+
+	    func pushUndoResizeCard(card: Card, frame: Frame, oldOrigin: SIMD2<Double>, oldSize: SIMD2<Double>) {
+	        pushUndo(.resizeCard(card: card, frame: frame, oldOrigin: oldOrigin, oldSize: oldSize))
+	    }
+
+	    // TODO: Implement lasso snapshot capture for undo support
+
+	    func undo() {
+	        guard let action = undoStack.popLast() else { return }
+
+	        switch action {
+	        case .drawStroke(let stroke, let target):
+	            // Remove the stroke
+	            switch target {
+	            case .canvas(let frame):
+	                if let index = frame.strokes.firstIndex(where: { $0.id == stroke.id }) {
+	                    frame.strokes.remove(at: index)
+	                }
+	            case .card(let card, _):
+	                if let index = card.strokes.firstIndex(where: { $0.id == stroke.id }) {
+	                    card.strokes.remove(at: index)
+	                }
+	            }
+	            redoStack.append(action)
+
+	        case .eraseStroke(let stroke, let strokeIndex, let target):
+	            // Restore the stroke
+	            switch target {
+	            case .canvas(let frame):
+	                frame.strokes.insert(stroke, at: min(strokeIndex, frame.strokes.count))
+	            case .card(let card, _):
+	                card.strokes.insert(stroke, at: min(strokeIndex, card.strokes.count))
+	            }
+	            redoStack.append(action)
+
+	        case .moveCard(let card, _, let oldOrigin):
+	            let currentOrigin = card.origin
+	            card.origin = oldOrigin
+	            redoStack.append(.moveCard(card: card, frame: activeFrame, oldOrigin: currentOrigin))
+
+	        case .resizeCard(let card, _, let oldOrigin, let oldSize):
+	            let currentOrigin = card.origin
+	            let currentSize = card.size
+	            card.origin = oldOrigin
+	            card.size = oldSize
+	            card.rebuildGeometry()
+	            redoStack.append(.resizeCard(card: card, frame: activeFrame, oldOrigin: currentOrigin, oldSize: currentSize))
+	        }
+	    }
+
+	    func redo() {
+	        guard let action = redoStack.popLast() else { return }
+
+	        switch action {
+	        case .drawStroke(let stroke, let target):
+	            // Re-add the stroke
+	            switch target {
+	            case .canvas(let frame):
+	                frame.strokes.append(stroke)
+	            case .card(let card, _):
+	                card.strokes.append(stroke)
+	            }
+	            undoStack.append(action)
+
+	        case .eraseStroke(let stroke, let strokeIndex, let target):
+	            // Re-remove the stroke
+	            switch target {
+	            case .canvas(let frame):
+	                if let index = frame.strokes.firstIndex(where: { $0.id == stroke.id }) {
+	                    frame.strokes.remove(at: index)
+	                }
+	            case .card(let card, _):
+	                if let index = card.strokes.firstIndex(where: { $0.id == stroke.id }) {
+	                    card.strokes.remove(at: index)
+	                }
+	            }
+	            undoStack.append(action)
+
+	        case .moveCard(let card, let frame, let oldOrigin):
+	            let currentOrigin = card.origin
+	            card.origin = oldOrigin
+	            undoStack.append(.moveCard(card: card, frame: frame, oldOrigin: currentOrigin))
+
+	        case .resizeCard(let card, let frame, let oldOrigin, let oldSize):
+	            let currentOrigin = card.origin
+	            let currentSize = card.size
+	            card.origin = oldOrigin
+	            card.size = oldSize
+	            card.rebuildGeometry()
+	            undoStack.append(.resizeCard(card: card, frame: frame, oldOrigin: currentOrigin, oldSize: currentSize))
+	        }
+	    }
+
+	    func replaceCanvas(with newRoot: Frame) {
+	        newRoot.parent = nil
+	        rootFrame = newRoot
+	        activeFrame = findFrame(withDepth: 0, in: newRoot) ?? newRoot
+	        panOffset = .zero
+	        zoomScale = 1.0
+	        rotationAngle = 0.0
+	        currentDrawingTarget = nil
+	        currentTouchPoints = []
+	        predictedTouchPoints = []
+	        liveStrokeOrigin = nil
+	        lastSavedPoint = nil
+	        clearLassoSelection()
+	        lassoDrawingPoints = []
+	        lassoPredictedPoints = []
+	        resetStrokeDepthID(using: newRoot)
+	    }
 
 	    // MARK: - Global Stroke Depth Ordering
 	    // A monotonic per-stroke counter lets depth testing work across telescoping frames.
@@ -96,6 +431,60 @@ import simd
 
 	    private func peekStrokeDepthID() -> UInt32 {
 	        nextStrokeDepthID
+	    }
+
+	    private func resetStrokeDepthID(using frame: Frame) {
+	        if let maxDepth = maxStrokeDepthID(in: frame) {
+	            if maxDepth < Self.strokeDepthSlotCount - 1 {
+	                nextStrokeDepthID = maxDepth + 1
+	            } else {
+	                nextStrokeDepthID = Self.strokeDepthSlotCount - 1
+	            }
+	        } else {
+	            nextStrokeDepthID = 0
+	        }
+	    }
+
+	    private func maxStrokeDepthID(in frame: Frame) -> UInt32? {
+	        var maxID: UInt32?
+
+	        func consider(_ id: UInt32) {
+	            if let current = maxID {
+	                if id > current {
+	                    maxID = id
+	                }
+	            } else {
+	                maxID = id
+	            }
+	        }
+
+	        for stroke in frame.strokes {
+	            consider(stroke.depthID)
+	        }
+	        for card in frame.cards {
+	            for stroke in card.strokes {
+	                consider(stroke.depthID)
+	            }
+	        }
+	        for child in frame.children {
+	            if let childMax = maxStrokeDepthID(in: child) {
+	                consider(childMax)
+	            }
+	        }
+
+	        return maxID
+	    }
+
+	    private func findFrame(withDepth depth: Int, in frame: Frame) -> Frame? {
+	        if frame.depthFromRoot == depth {
+	            return frame
+	        }
+	        for child in frame.children {
+	            if let found = findFrame(withDepth: depth, in: child) {
+	                return found
+	            }
+	        }
+	        return nil
 	    }
 
 	    override init() {
@@ -232,6 +621,13 @@ import simd
         let c = cos(angle)
         let s = sin(angle)
 
+        drawLiveEraserOnCanvasIfNeeded(frame: frame,
+                                       cameraCenterInThisFrame: cameraCenterInThisFrame,
+                                       viewSize: viewSize,
+                                       currentZoom: currentZoom,
+                                       currentRotation: currentRotation,
+                                       encoder: encoder)
+
 	        let strokeCount = frame.strokes.count
 	        func depthForStroke(_ stroke: Stroke) -> Float {
 	            strokeDepth(for: stroke.depthID)
@@ -312,6 +708,8 @@ import simd
             // A. Calculate Position
             // Card lives in the Frame, so it moves with the Frame
             let relativeOffsetDouble = card.origin - cameraCenterInThisFrame
+            let cardOffsetLocal = cardOffsetFromCameraInLocalSpace(card: card,
+                                                                   cameraCenter: cameraCenterInThisFrame)
 
             // SCREEN SPACE CULLING for cards
             let distWorld = sqrt(relativeOffsetDouble.x * relativeOffsetDouble.x + relativeOffsetDouble.y * relativeOffsetDouble.y)
@@ -323,7 +721,15 @@ import simd
                 continue // Cull card
             }
 
-            let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x), Float(relativeOffsetDouble.y))
+            let relativeOffset = SIMD2<Float>(Float(cardOffsetLocal.x), Float(cardOffsetLocal.y))
+            let cardHalfSize = SIMD2<Float>(Float(card.size.x * 0.5), Float(card.size.y * 0.5))
+            var style = CardStyleUniforms(
+                cardHalfSize: cardHalfSize,
+                zoomScale: Float(currentZoom),
+                cornerRadiusPx: cardCornerRadiusPx,
+                shadowBlurPx: cardShadowBlurPx,
+                shadowOpacity: cardShadowOpacity
+            )
 
             // B. Handle Rotation
             // Cards have their own rotation property
@@ -335,8 +741,46 @@ import simd
                 zoomScale: Float(currentZoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
-                rotationAngle: finalRotation
+                rotationAngle: finalRotation,
+                depth: 1.0
             )
+
+            if cardShadowEnabled {
+                let shadowExpandWorld = Double(cardShadowBlurPx) / max(currentZoom, 1e-6)
+                let scaleX = (card.size.x * 0.5 + shadowExpandWorld) / max(card.size.x * 0.5, 1e-6)
+                let scaleY = (card.size.y * 0.5 + shadowExpandWorld) / max(card.size.y * 0.5, 1e-6)
+                let shadowVertices = card.localVertices.map { vertex in
+                    StrokeVertex(
+                        position: SIMD2<Float>(vertex.position.x * Float(scaleX), vertex.position.y * Float(scaleY)),
+                        uv: vertex.uv,
+                        color: vertex.color
+                    )
+                }
+
+                let shadowOffset = shadowOffsetInCardLocalSpace(offsetPx: cardShadowOffsetPx,
+                                                                rotation: finalRotation,
+                                                                zoom: currentZoom)
+                var shadowTransform = CardTransform(
+                    relativeOffset: SIMD2<Float>(Float(cardOffsetLocal.x + shadowOffset.x),
+                                                 Float(cardOffsetLocal.y + shadowOffset.y)),
+                    zoomScale: Float(currentZoom),
+                    screenWidth: Float(viewSize.width),
+                    screenHeight: Float(viewSize.height),
+                    rotationAngle: finalRotation,
+                    depth: 1.0
+                )
+
+                if let shadowBuffer = device.makeBuffer(bytes: shadowVertices,
+                                                        length: shadowVertices.count * MemoryLayout<StrokeVertex>.stride,
+                                                        options: .storageModeShared) {
+                    encoder.setDepthStencilState(stencilStateDefault)
+                    encoder.setRenderPipelineState(cardShadowPipelineState)
+                    encoder.setVertexBytes(&shadowTransform, length: MemoryLayout<CardTransform>.stride, index: 1)
+                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+                    encoder.setVertexBuffer(shadowBuffer, offset: 0, index: 0)
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+                }
+            }
 
             //  STEP 1: DRAW CARD BACKGROUND + WRITE STENCIL
             // Write '1' into the stencil buffer where the card pixels are
@@ -345,12 +789,13 @@ import simd
 
             // C. Set Pipeline & Bind Content Based on Card Type
             switch card.type {
-            case .solidColor(let color):
+            case .solidColor:
                 // Use solid color pipeline (no texture required)
                 encoder.setRenderPipelineState(cardSolidPipelineState)
                 encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
-                var c = color
+                var c = card.backgroundColor
                 encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
 
             case .image(let texture):
                 // Use textured pipeline (requires texture binding)
@@ -358,14 +803,15 @@ import simd
                 encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
                 encoder.setFragmentTexture(texture, index: 0)
                 encoder.setFragmentSamplerState(samplerState, index: 0)
+                encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
 
             case .lined(let config):
                 // Use procedural lined paper pipeline
                 encoder.setRenderPipelineState(cardLinedPipelineState)
                 encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
 
-                // 1. Background Color (Paper White)
-                var bg = SIMD4<Float>(1, 1, 1, 1)
+                // 1. Background Color
+                var bg = card.backgroundColor
                 encoder.setFragmentBytes(&bg, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
 
                 // 2. Uniforms (Lines)
@@ -383,14 +829,15 @@ import simd
                     cardHeight: Float(card.size.y)
                 )
                 encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardShaderUniforms>.stride, index: 1)
+                encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
 
             case .grid(let config):
                 // Use procedural grid paper pipeline
                 encoder.setRenderPipelineState(cardGridPipelineState)
                 encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
 
-                // 1. Background Color (Paper White)
-                var bg = SIMD4<Float>(1, 1, 1, 1)
+                // 1. Background Color
+                var bg = card.backgroundColor
                 encoder.setFragmentBytes(&bg, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
 
                 // 2. Uniforms (Grid)
@@ -406,6 +853,7 @@ import simd
                     cardHeight: Float(card.size.y)
                 )
                 encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardShaderUniforms>.stride, index: 1)
+                encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
 
             case .drawing:
                 continue // Future: Render nested strokes
@@ -422,30 +870,33 @@ import simd
 
             //  STEP 2: DRAW CARD STROKES (CLIPPED TO CARD)
             // Only draw where stencil == 1
-            if !card.strokes.isEmpty {
+            let isLiveCardEraserTarget: Bool
+            if brushSettings.isMaskEraser, let target = currentDrawingTarget,
+               case .card(let targetCard, let targetFrame) = target,
+               targetFrame === frame, targetCard === card {
+                isLiveCardEraserTarget = true
+            } else {
+                isLiveCardEraserTarget = false
+            }
+
+            let isLiveCardLassoTarget = (lassoPreviewCard === card && lassoPreviewCardFrame === frame)
+
+            if !card.strokes.isEmpty || isLiveCardEraserTarget || isLiveCardLassoTarget {
                 encoder.setRenderPipelineState(strokeSegmentPipelineState)
-                encoder.setDepthStencilState(stencilStateRead) // <--- READ MODE
                 encoder.setStencilReferenceValue(1)
                 encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
 
                 // Calculate "magic offset" for card-local coordinates
                 let totalRotation = currentRotation + card.rotation
-                let distX = card.origin.x - cameraCenterInThisFrame.x
-                let distY = card.origin.y - cameraCenterInThisFrame.y
-                let c = cos(Double(-card.rotation))
-                let s = sin(Double(-card.rotation))
-                let magicOffsetX = distX * c - distY * s
-                let magicOffsetY = distX * s + distY * c
-                let offset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
+                let offset = SIMD2<Float>(Float(cardOffsetLocal.x), Float(cardOffsetLocal.y))
 
-                // Draw card strokes directly (GPU applies offset)
-                for stroke in card.strokes {
-                    guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { continue }
+                func drawCardStroke(_ stroke: Stroke) {
+                    guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { return }
 
                     // ZOOM-BASED CULLING: Skip strokes drawn at extreme zoom when we're zoomed way out
                     let strokeZoom = max(Double(stroke.zoomEffectiveAtCreation), 1.0) // Treat 0 as 1
                     if currentZoom > strokeZoom * 100_000.0 {
-                        continue
+                        return
                     }
 
                     let strokeOffset = stroke.origin
@@ -476,6 +927,49 @@ import simd
                     encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
                     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
                 }
+
+                let liveCardStroke: Stroke?
+                if isLiveCardEraserTarget, let screenPoints = buildLiveScreenPoints() {
+                    liveCardStroke = createStrokeForCard(
+                        screenPoints: screenPoints,
+                        card: card,
+                        frame: frame,
+                        viewSize: viewSize,
+                        depthID: peekStrokeDepthID(),
+                        color: SIMD4<Float>(0, 0, 0, 0),
+                        depthWriteEnabled: true
+                    )
+                } else {
+                    liveCardStroke = nil
+                }
+
+                let liveCardLassoStroke = isLiveCardLassoTarget ? lassoPreviewStroke : nil
+
+                let strokeCount = card.strokes.count
+
+                // Depth-write strokes: newest -> oldest (front-to-back).
+                encoder.setDepthStencilState(cardStrokeDepthStateWrite)
+                if let liveStroke = liveCardStroke {
+                    drawCardStroke(liveStroke)
+                }
+                if strokeCount > 0 {
+                    for i in stride(from: strokeCount - 1, through: 0, by: -1) {
+                        let stroke = card.strokes[i]
+                        guard stroke.depthWriteEnabled else { continue }
+                        drawCardStroke(stroke)
+                    }
+                }
+
+                // No-depth-write strokes: oldest -> newest (painter's), but depth-tested.
+                encoder.setDepthStencilState(cardStrokeDepthStateNoWrite)
+                if let liveLasso = liveCardLassoStroke {
+                    drawCardStroke(liveLasso)
+                }
+                for i in 0..<strokeCount {
+                    let stroke = card.strokes[i]
+                    guard !stroke.depthWriteEnabled else { continue }
+                    drawCardStroke(stroke)
+                }
             }
 
             //  STEP 3: CLEANUP STENCIL (Reset to 0 for next card)
@@ -486,6 +980,7 @@ import simd
             encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
             var clearColor = SIMD4<Float>(0, 0, 0, 0)
             encoder.setFragmentBytes(&clearColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
@@ -497,7 +992,7 @@ import simd
                                 cameraCenter: cameraCenterInThisFrame,
                                 viewSize: viewSize,
                                 zoom: currentZoom,
-                                rotation: finalRotation,
+                                rotation: currentRotation,
                                 encoder: encoder)
             }
         }
@@ -526,8 +1021,8 @@ import simd
         }
     }
 
-    private func renderLiveStroke(view: MTKView, encoder enc: MTLRenderCommandEncoder, cameraCenterWorld: SIMD2<Double>, tempOrigin: SIMD2<Double>) {
-        guard let target = currentDrawingTarget else { return }
+    private func buildLiveScreenPoints() -> [CGPoint]? {
+        guard !currentTouchPoints.isEmpty else { return nil }
 
         var screenPoints = currentTouchPoints
         if let last = screenPoints.last,
@@ -538,8 +1033,7 @@ import simd
             screenPoints.append(contentsOf: predictedTouchPoints)
         }
 
-        // Segment pipeline can draw a dot (p0 == p1), but skip when we have no points.
-        guard let firstScreenPoint = screenPoints.first else { return }
+        guard !screenPoints.isEmpty else { return nil }
 
         // Keep the live preview cheap and bounded.
         let maxScreenPoints = 1000
@@ -556,11 +1050,93 @@ import simd
             screenPoints = downsampled
         }
 
+        return screenPoints
+    }
+
+    private func buildLassoScreenPoints() -> [CGPoint]? {
+        guard !lassoDrawingPoints.isEmpty else { return nil }
+
+        var screenPoints = lassoDrawingPoints
+        if let last = screenPoints.last,
+           let firstPredicted = lassoPredictedPoints.first,
+           last == firstPredicted {
+            screenPoints.append(contentsOf: lassoPredictedPoints.dropFirst())
+        } else {
+            screenPoints.append(contentsOf: lassoPredictedPoints)
+        }
+
+        guard !screenPoints.isEmpty else { return nil }
+
+        let maxScreenPoints = 1000
+        if screenPoints.count > maxScreenPoints {
+            let step = max(1, screenPoints.count / maxScreenPoints)
+            var downsampled: [CGPoint] = []
+            downsampled.reserveCapacity(maxScreenPoints + 1)
+            for i in stride(from: 0, to: screenPoints.count, by: step) {
+                downsampled.append(screenPoints[i])
+            }
+            if let last = screenPoints.last, last != downsampled.last {
+                downsampled.append(last)
+            }
+            screenPoints = downsampled
+        }
+
+        return screenPoints
+    }
+
+    private func updateLassoPreviewFromScreenPoints(_ screenPoints: [CGPoint], close: Bool, viewSize: CGSize) {
+        let worldPoints = screenPoints.map {
+            screenToWorldPixels_PureDouble(
+                $0,
+                viewSize: viewSize,
+                panOffset: panOffset,
+                zoomScale: zoomScale,
+                rotationAngle: rotationAngle
+            )
+        }
+
+        switch lassoTarget {
+        case .card(let card, let frame):
+            guard let transform = transformFromActive(to: frame) else {
+                updateLassoPreview(for: worldPoints, close: close)
+                return
+            }
+            let cardPoints = worldPoints.map { activePoint in
+                let framePoint = SIMD2<Double>(
+                    activePoint.x * transform.scale + transform.translation.x,
+                    activePoint.y * transform.scale + transform.translation.y
+                )
+                return framePointToCardLocal(framePoint, card: card)
+            }
+            let zoomInFrame = zoomScale / max(transform.scale, 1e-6)
+            updateLassoPreview(for: cardPoints, close: close, card: card, frame: frame, zoom: zoomInFrame)
+        default:
+            updateLassoPreview(for: worldPoints, close: close)
+        }
+    }
+
+    private func renderLiveStroke(view: MTKView, encoder enc: MTLRenderCommandEncoder, cameraCenterWorld: SIMD2<Double>, tempOrigin: SIMD2<Double>) {
+        guard brushSettings.toolMode == .paint else { return }
+        guard let target = currentDrawingTarget else { return }
+        guard let screenPoints = buildLiveScreenPoints() else { return }
+        guard let firstScreenPoint = screenPoints.first else { return }
+        let previewColor = brushSettings.color
         enc.setCullMode(.none)
 
         switch target {
-        case .canvas:
-            let zoom = max(zoomScale, 1e-6)
+        case .canvas(let frame):
+            let zoom: Double
+            let cameraCenterInTarget: SIMD2<Double>
+            if frame === activeFrame {
+                zoom = max(zoomScale, 1e-6)
+                cameraCenterInTarget = cameraCenterWorld
+            } else if let transform = transformFromActive(to: frame) {
+                zoom = max(zoomScale / transform.scale, 1e-6)
+                cameraCenterInTarget = cameraCenterWorld * transform.scale + transform.translation
+            } else {
+                zoom = max(zoomScale, 1e-6)
+                cameraCenterInTarget = cameraCenterWorld
+            }
             let angle = Double(rotationAngle)
             let c = cos(angle)
             let s = sin(angle)
@@ -576,14 +1152,14 @@ import simd
                 return SIMD2<Float>(Float(unrotatedX / zoom), Float(unrotatedY / zoom))
             }
 
-            let segments = Stroke.buildSegments(from: localPoints, color: brushSettings.color)
+            let segments = Stroke.buildSegments(from: localPoints, color: previewColor)
             guard !segments.isEmpty else { return }
             guard let segmentBuffer = device.makeBuffer(bytes: segments,
                                                         length: segments.count * MemoryLayout<StrokeSegmentInstance>.stride,
                                                         options: .storageModeShared) else { return }
 
-            let dx = tempOrigin.x - cameraCenterWorld.x
-            let dy = tempOrigin.y - cameraCenterWorld.y
+            let dx = tempOrigin.x - cameraCenterInTarget.x
+            let dy = tempOrigin.y - cameraCenterInTarget.y
             let rotatedOffsetScreen = SIMD2<Float>(
                 Float((dx * c - dy * s) * zoom),
                 Float((dx * s + dy * c) * zoom)
@@ -607,7 +1183,8 @@ import simd
             )
 
             enc.setRenderPipelineState(strokeSegmentPipelineState)
-            enc.setDepthStencilState(strokeDepthStateNoWrite)
+            // Use the same depth state as the final stroke will use
+            enc.setDepthStencilState(brushSettings.depthWriteEnabled ? strokeDepthStateWrite : strokeDepthStateNoWrite)
             enc.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
             enc.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
@@ -615,35 +1192,43 @@ import simd
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: segments.count)
 
         case .card(let card, let frame):
-            // Determine the camera transform in the target frame (parent/active/child).
+            // Determine the camera transform in the target frame (linked list chain).
             var cameraCenterInTarget = cameraCenterWorld
             var zoomInTarget = zoomScale
-            if let parent = activeFrame.parent, frame === parent {
-                cameraCenterInTarget = activeFrame.originInParent + (cameraCenterWorld / activeFrame.scaleRelativeToParent)
-                zoomInTarget = zoomScale * activeFrame.scaleRelativeToParent
-            } else if let child = activeFrame.children.first(where: { $0 === frame }) {
-                cameraCenterInTarget = (cameraCenterWorld - child.originInParent) * child.scaleRelativeToParent
-                zoomInTarget = zoomScale / child.scaleRelativeToParent
+            if let transform = transformFromActive(to: frame) {
+                cameraCenterInTarget = cameraCenterWorld * transform.scale + transform.translation
+                zoomInTarget = zoomScale / transform.scale
             }
 
-	            let liveStroke = createStrokeForCard(screenPoints: screenPoints,
-	                                                 card: card,
-	                                                 frame: frame,
-	                                                 viewSize: view.bounds.size,
-	                                                 depthID: peekStrokeDepthID())
+            let liveStroke = createStrokeForCard(screenPoints: screenPoints,
+                                                 card: card,
+                                                 frame: frame,
+                                                 viewSize: view.bounds.size,
+                                                 depthID: peekStrokeDepthID(),
+                                                 color: previewColor)
             guard !liveStroke.segments.isEmpty, let segmentBuffer = liveStroke.segmentBuffer else { return }
 
             // 1) Write stencil for the card region without affecting color output.
-            let relativeOffsetDouble = card.origin - cameraCenterInTarget
-            let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x), Float(relativeOffsetDouble.y))
+            let cardOffsetLocal = cardOffsetFromCameraInLocalSpace(card: card,
+                                                                   cameraCenter: cameraCenterInTarget)
+            let relativeOffset = SIMD2<Float>(Float(cardOffsetLocal.x), Float(cardOffsetLocal.y))
             let finalRotation = rotationAngle + card.rotation
+            let cardHalfSize = SIMD2<Float>(Float(card.size.x * 0.5), Float(card.size.y * 0.5))
+            var style = CardStyleUniforms(
+                cardHalfSize: cardHalfSize,
+                zoomScale: Float(zoomInTarget),
+                cornerRadiusPx: cardCornerRadiusPx,
+                shadowBlurPx: cardShadowBlurPx,
+                shadowOpacity: cardShadowOpacity
+            )
 
             var cardTransform = CardTransform(
                 relativeOffset: relativeOffset,
                 zoomScale: Float(zoomInTarget),
                 screenWidth: Float(view.bounds.size.width),
                 screenHeight: Float(view.bounds.size.height),
-                rotationAngle: finalRotation
+                rotationAngle: finalRotation,
+                depth: 1.0
             )
 
             let cardVertexBuffer = device.makeBuffer(bytes: card.localVertices,
@@ -656,23 +1241,18 @@ import simd
             enc.setVertexBytes(&cardTransform, length: MemoryLayout<CardTransform>.stride, index: 1)
             var transparent = SIMD4<Float>(0, 0, 0, 0)
             enc.setFragmentBytes(&transparent, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            enc.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
             enc.setVertexBuffer(cardVertexBuffer, offset: 0, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
             // 2) Draw the live stroke clipped to stencil.
             enc.setRenderPipelineState(strokeSegmentPipelineState)
-            enc.setDepthStencilState(stencilStateRead)
+            enc.setDepthStencilState(cardStrokeDepthStateNoWrite)
             enc.setStencilReferenceValue(1)
             enc.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
 
             let totalRotation = rotationAngle + card.rotation
-            let distX = card.origin.x - cameraCenterInTarget.x
-            let distY = card.origin.y - cameraCenterInTarget.y
-            let cCard = cos(Double(-card.rotation))
-            let sCard = sin(Double(-card.rotation))
-            let magicOffsetX = distX * cCard - distY * sCard
-            let magicOffsetY = distX * sCard + distY * cCard
-            let offset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
+            let offset = SIMD2<Float>(Float(cardOffsetLocal.x), Float(cardOffsetLocal.y))
 
             let strokeOffset = liveStroke.origin
             let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
@@ -709,6 +1289,7 @@ import simd
             enc.setStencilReferenceValue(0)
             enc.setVertexBytes(&cardTransform, length: MemoryLayout<CardTransform>.stride, index: 1)
             enc.setFragmentBytes(&transparent, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            enc.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
             enc.setVertexBuffer(cardVertexBuffer, offset: 0, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
@@ -717,16 +1298,126 @@ import simd
     }
     // Note: ICB encoding functions removed - using simple GPU-offset rendering
 
+    private func renderLassoOverlay(view: MTKView,
+                                    encoder enc: MTLRenderCommandEncoder,
+                                    cameraCenterWorld: SIMD2<Double>) {
+        guard lassoPreviewCard == nil else { return }
+        guard let stroke = lassoPreviewStroke, lassoPreviewFrame === activeFrame else { return }
+        guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { return }
+
+        enc.setRenderPipelineState(strokeSegmentPipelineState)
+        enc.setDepthStencilState(strokeDepthStateNoWrite)
+        enc.setCullMode(.none)
+        enc.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
+
+        let zoom = max(zoomScale, 1e-6)
+        let angle = Double(rotationAngle)
+        let c = cos(angle)
+        let s = sin(angle)
+
+        let dx = stroke.origin.x - cameraCenterWorld.x
+        let dy = stroke.origin.y - cameraCenterWorld.y
+        let rotatedOffsetScreen = SIMD2<Float>(
+            Float((dx * c - dy * s) * zoom),
+            Float((dx * s + dy * c) * zoom)
+        )
+
+        let basePixelWidth = Float(stroke.worldWidth * zoom)
+        let halfPixelWidth = max(basePixelWidth * 0.5, 0.5)
+
+        var transform = StrokeTransform(
+            relativeOffset: .zero,
+            rotatedOffsetScreen: rotatedOffsetScreen,
+            zoomScale: Float(zoom),
+            screenWidth: Float(view.bounds.size.width),
+            screenHeight: Float(view.bounds.size.height),
+            rotationAngle: rotationAngle,
+            halfPixelWidth: halfPixelWidth,
+            featherPx: 1.0,
+            depth: 0.0
+        )
+
+        enc.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+        enc.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+        enc.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
+    }
+
+    private func drawLiveEraserOnCanvasIfNeeded(frame: Frame,
+                                                cameraCenterInThisFrame: SIMD2<Double>,
+                                                viewSize: CGSize,
+                                                currentZoom: Double,
+                                                currentRotation: Float,
+                                                encoder: MTLRenderCommandEncoder) {
+        guard brushSettings.isMaskEraser else { return }
+        guard let target = currentDrawingTarget else { return }
+        guard case .canvas(let targetFrame) = target, targetFrame === frame else { return }
+        guard let tempOrigin = liveStrokeOrigin else { return }
+        guard let screenPoints = buildLiveScreenPoints() else { return }
+        guard let firstScreenPoint = screenPoints.first else { return }
+
+        let zoom = max(currentZoom, 1e-6)
+        let angle = Double(currentRotation)
+        let c = cos(angle)
+        let s = sin(angle)
+
+        let localPoints: [SIMD2<Float>] = screenPoints.map { pt in
+            let dx = Double(pt.x) - Double(firstScreenPoint.x)
+            let dy = Double(pt.y) - Double(firstScreenPoint.y)
+
+            let unrotatedX = dx * c + dy * s
+            let unrotatedY = -dx * s + dy * c
+
+            return SIMD2<Float>(Float(unrotatedX / zoom), Float(unrotatedY / zoom))
+        }
+
+        let segments = Stroke.buildSegments(from: localPoints, color: SIMD4<Float>(0, 0, 0, 0))
+        guard !segments.isEmpty else { return }
+        guard let segmentBuffer = device.makeBuffer(bytes: segments,
+                                                    length: segments.count * MemoryLayout<StrokeSegmentInstance>.stride,
+                                                    options: .storageModeShared) else { return }
+
+        let dx = tempOrigin.x - cameraCenterInThisFrame.x
+        let dy = tempOrigin.y - cameraCenterInThisFrame.y
+        let rotatedOffsetScreen = SIMD2<Float>(
+            Float((dx * c - dy * s) * zoom),
+            Float((dx * s + dy * c) * zoom)
+        )
+
+        let halfPixelWidth = max(Float(brushSettings.size) * 0.5, 0.5)
+        let liveDepth = strokeDepth(for: peekStrokeDepthID())
+
+        var transform = StrokeTransform(
+            relativeOffset: .zero,
+            rotatedOffsetScreen: rotatedOffsetScreen,
+            zoomScale: Float(zoom),
+            screenWidth: Float(viewSize.width),
+            screenHeight: Float(viewSize.height),
+            rotationAngle: currentRotation,
+            halfPixelWidth: halfPixelWidth,
+            featherPx: 1.0,
+            depth: liveDepth
+        )
+
+        encoder.setRenderPipelineState(strokeSegmentPipelineState)
+        encoder.setDepthStencilState(strokeDepthStateWrite)
+        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+        encoder.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+        encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: segments.count)
+    }
+
     ///  CONSTANT SCREEN SIZE HANDLES
-    /// Draws resize handles at card corners that maintain 12pt screen size regardless of zoom
-    /// This provides consistent UX across all zoom levels (infinite canvas requirement)
+    /// Draws resize handles at card corners that maintain constant screen size regardless of zoom.
+    /// Rendered as rounded line segments inset from the card edges.
     ///
     /// - Parameters:
     ///   - card: The card to draw handles for
     ///   - cameraCenter: Camera position in frame coordinates
     ///   - viewSize: Screen dimensions
     ///   - zoom: Current zoom level
-    ///   - rotation: Total rotation (camera + card)
+    ///   - rotation: Camera rotation (card rotation is baked into corner positions)
     ///   - encoder: Metal render encoder
     func drawCardHandles(card: Card,
                          cameraCenter: SIMD2<Double>,
@@ -735,74 +1426,141 @@ import simd
                          rotation: Float,
                          encoder: MTLRenderCommandEncoder) {
 
-        // 1. Calculate Constant Screen Size
-        // We want handles to be ~12pt on screen regardless of zoom
-        // In World Space, that is: 12.0 / Zoom
-        let handleSizeScreen: Float = 12.0
-        let handleSizeWorld = handleSizeScreen / Float(zoom)
+        guard zoom.isFinite, zoom > 0 else { return }
 
-        // 2. Generate Handle Geometry (A small quad centered at 0,0)
-        // We generate this on the fly because the size changes every frame (based on zoom)
-        let halfS = handleSizeWorld / 2.0
-        let handleColor = SIMD4<Float>(0.0, 0.47, 1.0, 1.0) // Blue handle color
-        let baseHandleVertices: [SIMD2<Float>] = [
-            SIMD2<Float>(-halfS, -halfS), SIMD2<Float>(-halfS,  halfS), SIMD2<Float>( halfS, -halfS),
-            SIMD2<Float>(-halfS,  halfS), SIMD2<Float>( halfS, -halfS), SIMD2<Float>( halfS,  halfS)
+        let handleInsetPx: Float = 5.0
+        let handleLengthPx: Float = 12.0
+        let handleThicknessPx: Float = 3.0
+        let handleColor = cardHandleColor(for: card)
+
+        let insetWorld = handleInsetPx / Float(zoom)
+        let outerCornerRadiusWorld = cardCornerRadiusPx / Float(zoom)
+        let handleArcRadiusPx = max(cardCornerRadiusPx - handleInsetPx, 0.0)
+        let handleArcRadiusWorld = handleArcRadiusPx / Float(zoom)
+        let joinInsetWorld = handleArcRadiusWorld
+        let straightLengthPx = max(handleLengthPx - handleArcRadiusPx, handleThicknessPx)
+
+        let maxLengthX = max(0.0, Float(card.size.x) - insetWorld * 2.0 - joinInsetWorld)
+        let maxLengthY = max(0.0, Float(card.size.y) - insetWorld * 2.0 - joinInsetWorld)
+        let lengthWorldX = min(straightLengthPx / Float(zoom), maxLengthX)
+        let lengthWorldY = min(straightLengthPx / Float(zoom), maxLengthY)
+
+        if lengthWorldX <= 0 || lengthWorldY <= 0 { return }
+
+        let halfW = Float(card.size.x) * 0.5
+        let halfH = Float(card.size.y) * 0.5
+        let xRight = halfW - insetWorld
+        let yBottom = halfH - insetWorld
+        let xRightStart = xRight - joinInsetWorld
+        let yBottomStart = yBottom - joinInsetWorld
+
+        struct HandleSegment {
+            let p0: SIMD2<Double>
+            let p1: SIMD2<Double>
+        }
+
+        let segments: [HandleSegment] = [
+            // Bottom-right only (L shape)
+            HandleSegment(p0: SIMD2<Double>(Double(xRightStart), Double(yBottom)),
+                          p1: SIMD2<Double>(Double(xRightStart - lengthWorldX), Double(yBottom))),
+            HandleSegment(p0: SIMD2<Double>(Double(xRight), Double(yBottomStart)),
+                          p1: SIMD2<Double>(Double(xRight), Double(yBottomStart - lengthWorldY)))
         ]
 
-        // 3. Calculate Corner Positions
-        // We need to place these squares at the card's corners
-        // IMPORTANT: The handles must rotate WITH the card
-        let corners = card.getLocalCorners() // TL, TR, BL, BR
+        let angle = Double(rotation)
+        let c = cos(angle)
+        let s = sin(angle)
 
-        // NOTE: Base transform not needed - each handle gets its own transform with relativeOffset
+        encoder.setRenderPipelineState(strokeSegmentPipelineState)
+        encoder.setDepthStencilState(stencilStateDefault)
+        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
 
-        // 5. Draw Loop - One handle at each corner
-        for cornerLocal in corners {
-            // Calculate the Handle's World Origin on CPU
-            let cardRot = card.rotation
-            let c = cos(cardRot)
-            let s = sin(cardRot)
+        let drawSegment: (SIMD2<Double>, SIMD2<Double>, Float) -> Void = { p0Local, p1Local, radiusPx in
+            let p0Frame = self.cardLocalToFramePoint(p0Local, card: card)
+            let p1Frame = self.cardLocalToFramePoint(p1Local, card: card)
+            let origin = SIMD2<Double>((p0Frame.x + p1Frame.x) * 0.5,
+                                       (p0Frame.y + p1Frame.y) * 0.5)
 
-            // Rotate the corner offset by card rotation
-            let rotatedCornerX = Double(cornerLocal.x) * Double(c) - Double(cornerLocal.y) * Double(s)
-            let rotatedCornerY = Double(cornerLocal.x) * Double(s) + Double(cornerLocal.y) * Double(c)
+            let localP0 = SIMD2<Float>(Float(p0Frame.x - origin.x),
+                                       Float(p0Frame.y - origin.y))
+            let localP1 = SIMD2<Float>(Float(p1Frame.x - origin.x),
+                                       Float(p1Frame.y - origin.y))
 
-            // Absolute World Position of this handle
-            let handleOriginX = card.origin.x + rotatedCornerX
-            let handleOriginY = card.origin.y + rotatedCornerY
+            var segmentInstance = StrokeSegmentInstance(p0: localP0, p1: localP1, color: handleColor)
+            guard let segmentBuffer = self.device.makeBuffer(bytes: &segmentInstance,
+                                                        length: MemoryLayout<StrokeSegmentInstance>.stride,
+                                                        options: .storageModeShared) else { return }
 
-            // Calculate Relative Offset (camera-relative position)
-            let relativeOffset = SIMD2<Float>(Float(handleOriginX - cameraCenter.x),
-                                              Float(handleOriginY - cameraCenter.y))
+            let dx = origin.x - cameraCenter.x
+            let dy = origin.y - cameraCenter.y
+            let rotatedOffsetScreen = SIMD2<Float>(
+                Float((dx * c - dy * s) * zoom),
+                Float((dx * s + dy * c) * zoom)
+            )
 
-            // Use GPU offset approach
-            let handleVertices = baseHandleVertices.map { pos in
-                StrokeVertex(position: pos, uv: .zero, color: handleColor)
-            }
-
-            // Selection handles are UI elements - always render in front (depth 0.0)
-            var handleTransform = StrokeTransform(
-                relativeOffset: relativeOffset,
-                rotatedOffsetScreen: SIMD2<Float>(Float((Double(relativeOffset.x) * cos(Double(rotation)) - Double(relativeOffset.y) * sin(Double(rotation))) * zoom),
-                                                  Float((Double(relativeOffset.x) * sin(Double(rotation)) + Double(relativeOffset.y) * cos(Double(rotation))) * zoom)),
+            var transform = StrokeTransform(
+                relativeOffset: .zero,
+                rotatedOffsetScreen: rotatedOffsetScreen,
                 zoomScale: Float(zoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
                 rotationAngle: rotation,
-                halfPixelWidth: 1.0,  // Handles don't use thickness, but field is required
+                halfPixelWidth: radiusPx,
                 featherPx: 1.0,
-                depth: 0.0  // UI elements always in front
+                depth: 0.0
             )
 
-            // Create buffer and draw
-            let vertexBuffer = device.makeBuffer(bytes: handleVertices,
-                                                 length: handleVertices.count * MemoryLayout<StrokeVertex>.stride,
-                                                 options: [])
-            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            encoder.setVertexBytes(&handleTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: 1)
         }
+
+        for segment in segments {
+            drawSegment(segment.p0, segment.p1, handleThicknessPx * 0.5)
+        }
+
+        // Only draw corner arcs if they're visually meaningful (at least 2px)
+        // This prevents overlap with straight segment end caps
+        if handleArcRadiusPx >= 2.0 {
+            let brCenter = SIMD2<Double>(Double(halfW - outerCornerRadiusWorld),
+                                         Double(halfH - outerCornerRadiusWorld))
+
+            let arcSegments = 6
+            func arcPoints(center: SIMD2<Double>, startAngle: Double, endAngle: Double) -> [SIMD2<Double>] {
+                guard arcSegments > 0 else { return [] }
+                var points: [SIMD2<Double>] = []
+                points.reserveCapacity(arcSegments + 1)
+                for i in 0...arcSegments {
+                    let t = Double(i) / Double(arcSegments)
+                    let angle = startAngle + (endAngle - startAngle) * t
+                    let x = center.x + Double(handleArcRadiusWorld) * cos(angle)
+                    let y = center.y + Double(handleArcRadiusWorld) * sin(angle)
+                    points.append(SIMD2<Double>(x, y))
+                }
+                return points
+            }
+
+            let arcs: [[SIMD2<Double>]] = [
+                arcPoints(center: brCenter, startAngle: 0.0, endAngle: 0.5 * .pi)
+            ]
+
+            for arc in arcs {
+                guard arc.count >= 2 else { continue }
+                for i in 0..<(arc.count - 1) {
+                    drawSegment(arc[i], arc[i + 1], handleThicknessPx * 0.5)
+                }
+            }
+        }
+    }
+
+    private func cardHandleColor(for card: Card) -> SIMD4<Float> {
+        let base = card.handleBaseColor()
+        let luminance = 0.299 * base.x + 0.587 * base.y + 0.114 * base.z
+        if luminance > 0.5 {
+            return SIMD4<Float>(0, 0, 0, 1.0)
+        }
+        return SIMD4<Float>(1, 1, 1, 1.0)
     }
 
     func draw(in view: MTKView) {
@@ -847,9 +1605,13 @@ import simd
                     excludedChild: nil)
 
         // Live stroke rendering (same logic), reusing the scene encoder.
-        if (currentTouchPoints.count + predictedTouchPoints.count) >= 2, let tempOrigin = liveStrokeOrigin {
+        if !brushSettings.isLasso,
+           (currentTouchPoints.count + predictedTouchPoints.count) >= 2,
+           let tempOrigin = liveStrokeOrigin {
             renderLiveStroke(view: view, encoder: sceneEnc, cameraCenterWorld: cameraCenterWorld, tempOrigin: tempOrigin)
         }
+
+        renderLassoOverlay(view: view, encoder: sceneEnc, cameraCenterWorld: cameraCenterWorld)
 
         sceneEnc.endEncoding()
 
@@ -1114,6 +1876,29 @@ import simd
             fatalError("Failed to create grid card pipeline: \(error)")
         }
 
+        // Card Shadow Pipeline
+        let shadowDesc = MTLRenderPipelineDescriptor()
+        shadowDesc.vertexFunction = library.makeFunction(name: "vertex_card")
+        shadowDesc.fragmentFunction = library.makeFunction(name: "fragment_card_shadow")
+        shadowDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        shadowDesc.sampleCount = viewSampleCount
+        shadowDesc.colorAttachments[0].isBlendingEnabled = true
+        shadowDesc.colorAttachments[0].rgbBlendOperation = .add
+        shadowDesc.colorAttachments[0].alphaBlendOperation = .add
+        shadowDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        shadowDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        shadowDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        shadowDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        shadowDesc.vertexDescriptor = vertexDesc
+        shadowDesc.depthAttachmentPixelFormat = depthStencilFormat
+        shadowDesc.stencilAttachmentPixelFormat = depthStencilFormat
+
+        do {
+            cardShadowPipelineState = try device.makeRenderPipelineState(descriptor: shadowDesc)
+        } catch {
+            fatalError("Failed to create card shadow pipeline: \(error)")
+        }
+
         // Post-process Pipeline (FXAA fullscreen pass)
         let fxaaDesc = MTLRenderPipelineDescriptor()
         fxaaDesc.vertexFunction = library.makeFunction(name: "vertex_fullscreen_triangle")
@@ -1159,17 +1944,20 @@ import simd
         stencilStateDefault = device.makeDepthStencilState(descriptor: desc)
 
         // 1. WRITE State (Used when drawing the Card Background)
-        // "Always pass, and replace the stencil value with the reference (1)"
+        // "Always pass, replace stencil with the reference (1), and reset depth to far"
         let stencilWrite = MTLStencilDescriptor()
         stencilWrite.stencilCompareFunction = .always
         stencilWrite.stencilFailureOperation = .keep
         stencilWrite.depthFailureOperation = .keep
         stencilWrite.depthStencilPassOperation = .replace
-        desc.frontFaceStencil = stencilWrite
-        desc.backFaceStencil = stencilWrite
-        stencilStateWrite = device.makeDepthStencilState(descriptor: desc)
+        let stencilWriteDesc = MTLDepthStencilDescriptor()
+        stencilWriteDesc.depthCompareFunction = .always
+        stencilWriteDesc.isDepthWriteEnabled = true
+        stencilWriteDesc.frontFaceStencil = stencilWrite
+        stencilWriteDesc.backFaceStencil = stencilWrite
+        stencilStateWrite = device.makeDepthStencilState(descriptor: stencilWriteDesc)
 
-        // 2. READ State (Used when drawing Card Strokes)
+        // 2. READ State (Stencil-only, no depth testing)
         // "Only pass if the stencil value equals the reference (1)"
         let stencilRead = MTLStencilDescriptor()
         stencilRead.stencilCompareFunction = .equal
@@ -1195,10 +1983,30 @@ import simd
         strokeWriteDesc.isDepthWriteEnabled = true
         strokeDepthStateWrite = device.makeDepthStencilState(descriptor: strokeWriteDesc)
 
-	        let strokeNoWriteDesc = MTLDepthStencilDescriptor()
-	        strokeNoWriteDesc.depthCompareFunction = .less
-	        strokeNoWriteDesc.isDepthWriteEnabled = false
-	        strokeDepthStateNoWrite = device.makeDepthStencilState(descriptor: strokeNoWriteDesc)
+        let strokeNoWriteDesc = MTLDepthStencilDescriptor()
+        strokeNoWriteDesc.depthCompareFunction = .less
+        strokeNoWriteDesc.isDepthWriteEnabled = false
+        strokeDepthStateNoWrite = device.makeDepthStencilState(descriptor: strokeNoWriteDesc)
+
+        let cardStencilRead = MTLStencilDescriptor()
+        cardStencilRead.stencilCompareFunction = .equal
+        cardStencilRead.stencilFailureOperation = .keep
+        cardStencilRead.depthFailureOperation = .keep
+        cardStencilRead.depthStencilPassOperation = .keep
+
+        let cardStrokeWriteDesc = MTLDepthStencilDescriptor()
+        cardStrokeWriteDesc.depthCompareFunction = .less
+        cardStrokeWriteDesc.isDepthWriteEnabled = true
+        cardStrokeWriteDesc.frontFaceStencil = cardStencilRead
+        cardStrokeWriteDesc.backFaceStencil = cardStencilRead
+        cardStrokeDepthStateWrite = device.makeDepthStencilState(descriptor: cardStrokeWriteDesc)
+
+        let cardStrokeNoWriteDesc = MTLDepthStencilDescriptor()
+        cardStrokeNoWriteDesc.depthCompareFunction = .less
+        cardStrokeNoWriteDesc.isDepthWriteEnabled = false
+        cardStrokeNoWriteDesc.frontFaceStencil = cardStencilRead
+        cardStrokeNoWriteDesc.backFaceStencil = cardStencilRead
+        cardStrokeDepthStateNoWrite = device.makeDepthStencilState(descriptor: cardStrokeNoWriteDesc)
 	    }
 
     func makeVertexBuffer() {
@@ -1250,6 +2058,45 @@ import simd
                                               panOffset: panOffset,       // Now passing SIMD2<Double>
                                               zoomScale: zoomScale,       // Now passing Double
                                               rotationAngle: rotationAngle)
+    }
+
+    private func cameraCenterInFrame(_ frame: Frame,
+                                     cameraCenterActive: SIMD2<Double>) -> SIMD2<Double> {
+        guard frame !== activeFrame, let transform = transformFromActive(to: frame) else {
+            return cameraCenterActive
+        }
+        return cameraCenterActive * transform.scale + transform.translation
+    }
+
+    private func cameraCenterAndZoom(in frame: Frame,
+                                     cameraCenterActive: SIMD2<Double>) -> (SIMD2<Double>, Double) {
+        guard frame !== activeFrame, let transform = transformFromActive(to: frame) else {
+            return (cameraCenterActive, max(zoomScale, 1e-6))
+        }
+        let cameraCenter = cameraCenterActive * transform.scale + transform.translation
+        let effectiveZoom = max(zoomScale / transform.scale, 1e-6)
+        return (cameraCenter, effectiveZoom)
+    }
+
+    private func randomStrokePoints(center: SIMD2<Double>, maxOffset: Double) -> [SIMD2<Double>] {
+        let pointCount = Int.random(in: 2...6)
+        var points: [SIMD2<Double>] = []
+        points.reserveCapacity(pointCount)
+
+        var x = center.x + Double.random(in: -maxOffset...maxOffset)
+        var y = center.y + Double.random(in: -maxOffset...maxOffset)
+        points.append(SIMD2<Double>(x, y))
+
+        let stepRange = maxOffset * 0.1
+        for _ in 1..<pointCount {
+            x += Double.random(in: -stepRange...stepRange)
+            y += Double.random(in: -stepRange...stepRange)
+            x = min(center.x + maxOffset, max(center.x - maxOffset, x))
+            y = min(center.y + maxOffset, max(center.y - maxOffset, y))
+            points.append(SIMD2<Double>(x, y))
+        }
+
+        return points
     }
 
     // MARK: - Stroke Simplification
@@ -1311,6 +2158,753 @@ import simd
         return result
     }
 
+    // MARK: - Lasso Selection
+
+    func clearLassoSelection() {
+        lassoSelection = nil
+        lassoPreviewStroke = nil
+        lassoPreviewFrame = nil
+        lassoTransformState = nil
+        lassoTarget = nil
+        lassoPreviewCard = nil
+        lassoPreviewCardFrame = nil
+    }
+
+    func handleLassoTap(screenPoint: CGPoint, viewSize: CGSize) -> Bool {
+        guard let selection = lassoSelection else { return false }
+        let pointWorld = screenToWorldPixels_PureDouble(
+            screenPoint,
+            viewSize: viewSize,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
+
+        if !pointInPolygon(pointWorld, polygon: selection.points) {
+            clearLassoSelection()
+        }
+        return true
+    }
+
+    func lassoContains(screenPoint: CGPoint, viewSize: CGSize) -> Bool {
+        guard let selection = lassoSelection else { return false }
+        let pointWorld = screenToWorldPixels_PureDouble(
+            screenPoint,
+            viewSize: viewSize,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
+        return pointInPolygon(pointWorld, polygon: selection.points)
+    }
+
+    func translateLassoSelection(by delta: SIMD2<Double>) {
+        guard var selection = lassoSelection else { return }
+
+        for frameSelection in selection.frames {
+            guard let transform = transformFromActive(to: frameSelection.frame) else { continue }
+            let deltaFrame = SIMD2<Double>(delta.x * transform.scale, delta.y * transform.scale)
+
+            for (index, stroke) in frameSelection.frame.strokes.enumerated() {
+                guard frameSelection.strokeIDs.contains(stroke.id) else { continue }
+                let newOrigin = SIMD2<Double>(stroke.origin.x + deltaFrame.x, stroke.origin.y + deltaFrame.y)
+                let newStroke = Stroke(
+                    id: stroke.id,
+                    origin: newOrigin,
+                    worldWidth: stroke.worldWidth,
+                    color: stroke.color,
+                    zoomEffectiveAtCreation: stroke.zoomEffectiveAtCreation,
+                    segments: stroke.segments,
+                    localBounds: stroke.localBounds,
+                    segmentBounds: stroke.segmentBounds,
+                    device: device,
+                    depthID: stroke.depthID,
+                    depthWriteEnabled: stroke.depthWriteEnabled
+                )
+                frameSelection.frame.strokes[index] = newStroke
+            }
+        }
+
+        for cardSelection in selection.cards {
+            guard let transform = transformFromActive(to: cardSelection.frame) else { continue }
+            let deltaFrame = SIMD2<Double>(delta.x * transform.scale, delta.y * transform.scale)
+            cardSelection.card.origin.x += deltaFrame.x
+            cardSelection.card.origin.y += deltaFrame.y
+        }
+
+        for cardStrokeSelection in selection.cardStrokes {
+            guard let transform = transformFromActive(to: cardStrokeSelection.frame) else { continue }
+            let deltaFrame = SIMD2<Double>(delta.x * transform.scale, delta.y * transform.scale)
+            let c = cos(Double(-cardStrokeSelection.card.rotation))
+            let s = sin(Double(-cardStrokeSelection.card.rotation))
+            let localDx = deltaFrame.x * c - deltaFrame.y * s
+            let localDy = deltaFrame.x * s + deltaFrame.y * c
+
+            for (index, stroke) in cardStrokeSelection.card.strokes.enumerated() {
+                guard cardStrokeSelection.strokeIDs.contains(stroke.id) else { continue }
+                let newOrigin = SIMD2<Double>(stroke.origin.x + localDx, stroke.origin.y + localDy)
+                let newStroke = Stroke(
+                    id: stroke.id,
+                    origin: newOrigin,
+                    worldWidth: stroke.worldWidth,
+                    color: stroke.color,
+                    zoomEffectiveAtCreation: stroke.zoomEffectiveAtCreation,
+                    segments: stroke.segments,
+                    localBounds: stroke.localBounds,
+                    segmentBounds: stroke.segmentBounds,
+                    device: device,
+                    depthID: stroke.depthID,
+                    depthWriteEnabled: stroke.depthWriteEnabled
+                )
+                cardStrokeSelection.card.strokes[index] = newStroke
+            }
+        }
+
+        selection.points = selection.points.map { SIMD2<Double>($0.x + delta.x, $0.y + delta.y) }
+        selection.bounds = selection.bounds.offsetBy(dx: delta.x, dy: delta.y)
+        selection.center = SIMD2<Double>(selection.center.x + delta.x, selection.center.y + delta.y)
+        lassoSelection = selection
+        updateLassoPreview(for: selection)
+    }
+
+    func beginLassoTransformIfNeeded() {
+        guard lassoTransformState == nil,
+              let selection = lassoSelection else { return }
+
+        var snapshots: [StrokeSnapshot] = []
+        var cardSnapshots: [CardSnapshot] = []
+        var cardStrokeSnapshots: [CardStrokeSnapshot] = []
+
+        for frameSelection in selection.frames {
+            guard let transform = transformFromActive(to: frameSelection.frame) else { continue }
+            let invScale = transform.scale != 0 ? (1.0 / transform.scale) : 1.0
+
+            for (index, stroke) in frameSelection.frame.strokes.enumerated() {
+                guard frameSelection.strokeIDs.contains(stroke.id) else { continue }
+                let worldPointsFrame = stroke.rawPoints.map {
+                    SIMD2<Double>(
+                        stroke.origin.x + Double($0.x),
+                        stroke.origin.y + Double($0.y)
+                    )
+                }
+                let worldPointsActive = worldPointsFrame.map {
+                    SIMD2<Double>(
+                        ($0.x - transform.translation.x) * invScale,
+                        ($0.y - transform.translation.y) * invScale
+                    )
+                }
+
+                snapshots.append(
+                    StrokeSnapshot(
+                        id: stroke.id,
+                        frame: frameSelection.frame,
+                        index: index,
+                        activePoints: worldPointsActive,
+                        color: stroke.color,
+                        worldWidth: stroke.worldWidth,
+                        zoomEffectiveAtCreation: stroke.zoomEffectiveAtCreation,
+                        depthID: stroke.depthID,
+                        depthWriteEnabled: stroke.depthWriteEnabled,
+                        frameScale: transform.scale,
+                        frameTranslation: transform.translation
+                    )
+                )
+            }
+        }
+
+        for cardSelection in selection.cards {
+            guard let transform = transformFromActive(to: cardSelection.frame) else { continue }
+            let invScale = transform.scale != 0 ? (1.0 / transform.scale) : 1.0
+            let originActive = SIMD2<Double>(
+                (cardSelection.card.origin.x - transform.translation.x) * invScale,
+                (cardSelection.card.origin.y - transform.translation.y) * invScale
+            )
+            cardSnapshots.append(
+                CardSnapshot(
+                    card: cardSelection.card,
+                    frameScale: transform.scale,
+                    frameTranslation: transform.translation,
+                    originActive: originActive,
+                    size: cardSelection.card.size,
+                    rotation: cardSelection.card.rotation
+                )
+            )
+        }
+
+        for cardStrokeSelection in selection.cardStrokes {
+            guard let transform = transformFromActive(to: cardStrokeSelection.frame) else { continue }
+            let invScale = transform.scale != 0 ? (1.0 / transform.scale) : 1.0
+            let cardOrigin = cardStrokeSelection.card.origin
+            let cardRotation = Double(cardStrokeSelection.card.rotation)
+            let c = cos(cardRotation)
+            let s = sin(cardRotation)
+
+            for (index, stroke) in cardStrokeSelection.card.strokes.enumerated() {
+                guard cardStrokeSelection.strokeIDs.contains(stroke.id) else { continue }
+
+                let localPoints = stroke.rawPoints.map {
+                    SIMD2<Double>(
+                        stroke.origin.x + Double($0.x),
+                        stroke.origin.y + Double($0.y)
+                    )
+                }
+
+                let framePoints = localPoints.map {
+                    let rotX = $0.x * c - $0.y * s
+                    let rotY = $0.x * s + $0.y * c
+                    return SIMD2<Double>(cardOrigin.x + rotX, cardOrigin.y + rotY)
+                }
+
+                let activePoints = framePoints.map {
+                    SIMD2<Double>(
+                        ($0.x - transform.translation.x) * invScale,
+                        ($0.y - transform.translation.y) * invScale
+                    )
+                }
+
+                cardStrokeSnapshots.append(
+                    CardStrokeSnapshot(
+                        card: cardStrokeSelection.card,
+                        frame: cardStrokeSelection.frame,
+                        index: index,
+                        activePoints: activePoints,
+                        color: stroke.color,
+                        worldWidth: stroke.worldWidth,
+                        zoomEffectiveAtCreation: stroke.zoomEffectiveAtCreation,
+                        depthID: stroke.depthID,
+                        depthWriteEnabled: stroke.depthWriteEnabled,
+                        frameScale: transform.scale,
+                        frameTranslation: transform.translation,
+                        cardOrigin: cardOrigin,
+                        cardRotation: cardRotation
+                    )
+                )
+            }
+        }
+
+        lassoTransformState = LassoTransformState(
+            basePoints: selection.points,
+            baseCenter: selection.center,
+            baseStrokes: snapshots,
+            baseCards: cardSnapshots,
+            baseCardStrokes: cardStrokeSnapshots,
+            currentScale: 1.0,
+            currentRotation: 0.0
+        )
+    }
+
+    func updateLassoTransformScale(delta: Double) {
+        guard var state = lassoTransformState else { return }
+        guard delta.isFinite, delta > 0 else { return }
+        state.currentScale *= delta
+        lassoTransformState = state
+        applyLassoTransform(state)
+    }
+
+    func updateLassoTransformRotation(delta: Double) {
+        guard var state = lassoTransformState else { return }
+        guard delta.isFinite else { return }
+        state.currentRotation += delta
+        lassoTransformState = state
+        applyLassoTransform(state)
+    }
+
+    func endLassoTransformIfNeeded() {
+        lassoTransformState = nil
+    }
+
+    private func applyLassoTransform(_ state: LassoTransformState) {
+        guard var selection = lassoSelection else { return }
+
+        let cosR = cos(state.currentRotation)
+        let sinR = sin(state.currentRotation)
+        let scale = max(state.currentScale, 1e-6)
+
+        func transformPoint(_ point: SIMD2<Double>) -> SIMD2<Double> {
+            let dx = point.x - state.baseCenter.x
+            let dy = point.y - state.baseCenter.y
+            let sx = dx * scale
+            let sy = dy * scale
+            let rx = sx * cosR - sy * sinR
+            let ry = sx * sinR + sy * cosR
+            return SIMD2<Double>(state.baseCenter.x + rx, state.baseCenter.y + ry)
+        }
+
+        let transformedSelection = state.basePoints.map(transformPoint)
+        selection.points = transformedSelection
+        selection.bounds = polygonBounds(transformedSelection)
+        selection.center = state.baseCenter
+        lassoSelection = selection
+        updateLassoPreview(for: selection)
+
+        for snapshot in state.baseStrokes {
+            guard snapshot.index < snapshot.frame.strokes.count else { continue }
+
+            let transformedActivePoints = snapshot.activePoints.map(transformPoint)
+            let transformedFramePoints = transformedActivePoints.map {
+                SIMD2<Double>(
+                    $0.x * snapshot.frameScale + snapshot.frameTranslation.x,
+                    $0.y * snapshot.frameScale + snapshot.frameTranslation.y
+                )
+            }
+
+            guard let first = transformedFramePoints.first else { continue }
+            let origin = first
+            let localPoints: [SIMD2<Float>] = transformedFramePoints.map {
+                SIMD2<Float>(Float($0.x - origin.x), Float($0.y - origin.y))
+            }
+
+            let segments = Stroke.buildSegments(from: localPoints, color: snapshot.color)
+            let bounds = Stroke.calculateBounds(for: localPoints, radius: Float(snapshot.worldWidth * scale) * 0.5)
+            let newStroke = Stroke(
+                id: snapshot.id,
+                origin: origin,
+                worldWidth: snapshot.worldWidth * scale,
+                color: snapshot.color,
+                zoomEffectiveAtCreation: snapshot.zoomEffectiveAtCreation,
+                segments: segments,
+                localBounds: bounds,
+                segmentBounds: bounds,
+                device: device,
+                depthID: snapshot.depthID,
+                depthWriteEnabled: snapshot.depthWriteEnabled
+            )
+            snapshot.frame.strokes[snapshot.index] = newStroke
+        }
+
+        for cardSnapshot in state.baseCards {
+            let transformedOriginActive = transformPoint(cardSnapshot.originActive)
+            let originFrame = SIMD2<Double>(
+                transformedOriginActive.x * cardSnapshot.frameScale + cardSnapshot.frameTranslation.x,
+                transformedOriginActive.y * cardSnapshot.frameScale + cardSnapshot.frameTranslation.y
+            )
+
+            cardSnapshot.card.origin = originFrame
+            cardSnapshot.card.rotation = cardSnapshot.rotation + Float(state.currentRotation)
+            cardSnapshot.card.size = SIMD2<Double>(
+                cardSnapshot.size.x * scale,
+                cardSnapshot.size.y * scale
+            )
+            cardSnapshot.card.rebuildGeometry()
+        }
+
+        for snapshot in state.baseCardStrokes {
+            guard snapshot.index < snapshot.card.strokes.count else { continue }
+
+            let transformedActivePoints = snapshot.activePoints.map(transformPoint)
+            let transformedFramePoints = transformedActivePoints.map {
+                SIMD2<Double>(
+                    $0.x * snapshot.frameScale + snapshot.frameTranslation.x,
+                    $0.y * snapshot.frameScale + snapshot.frameTranslation.y
+                )
+            }
+
+            let cInv = cos(-snapshot.cardRotation)
+            let sInv = sin(-snapshot.cardRotation)
+            let transformedCardLocal = transformedFramePoints.map {
+                let dx = $0.x - snapshot.cardOrigin.x
+                let dy = $0.y - snapshot.cardOrigin.y
+                let localX = dx * cInv - dy * sInv
+                let localY = dx * sInv + dy * cInv
+                return SIMD2<Double>(localX, localY)
+            }
+
+            guard let first = transformedCardLocal.first else { continue }
+            let origin = first
+            let localPoints: [SIMD2<Float>] = transformedCardLocal.map {
+                SIMD2<Float>(Float($0.x - origin.x), Float($0.y - origin.y))
+            }
+
+            let segments = Stroke.buildSegments(from: localPoints, color: snapshot.color)
+            let bounds = Stroke.calculateBounds(for: localPoints, radius: Float(snapshot.worldWidth * scale) * 0.5)
+            let newStroke = Stroke(
+                id: snapshot.card.strokes[snapshot.index].id,
+                origin: origin,
+                worldWidth: snapshot.worldWidth * scale,
+                color: snapshot.color,
+                zoomEffectiveAtCreation: snapshot.zoomEffectiveAtCreation,
+                segments: segments,
+                localBounds: bounds,
+                segmentBounds: bounds,
+                device: device,
+                depthID: snapshot.depthID,
+                depthWriteEnabled: snapshot.depthWriteEnabled
+            )
+            snapshot.card.strokes[snapshot.index] = newStroke
+        }
+    }
+
+    private func updateLassoPreview(for points: [SIMD2<Double>],
+                                    close: Bool,
+                                    card: Card? = nil,
+                                    frame: Frame? = nil,
+                                    zoom: Double? = nil) {
+        let resolvedZoom = zoom ?? max(zoomScale, 1e-6)
+        lassoPreviewStroke = buildLassoPreviewStroke(points: points, close: close, zoom: resolvedZoom)
+        lassoPreviewFrame = activeFrame
+        lassoPreviewCard = card
+        lassoPreviewCardFrame = frame
+    }
+
+    private func updateLassoPreview(for selection: LassoSelection) {
+        if let cardSelection = selection.cardStrokes.first {
+            guard let transform = transformFromActive(to: cardSelection.frame) else {
+                updateLassoPreview(for: selection.points, close: true)
+                return
+            }
+            let cardPoints = selection.points.map { activePoint in
+                let framePoint = SIMD2<Double>(
+                    activePoint.x * transform.scale + transform.translation.x,
+                    activePoint.y * transform.scale + transform.translation.y
+                )
+                return framePointToCardLocal(framePoint, card: cardSelection.card)
+            }
+            let zoomInFrame = zoomScale / max(transform.scale, 1e-6)
+            updateLassoPreview(for: cardPoints,
+                               close: true,
+                               card: cardSelection.card,
+                               frame: cardSelection.frame,
+                               zoom: zoomInFrame)
+        } else {
+            updateLassoPreview(for: selection.points, close: true)
+        }
+    }
+
+    private func buildLassoPreviewStroke(points: [SIMD2<Double>], close: Bool, zoom: Double) -> Stroke? {
+        guard points.count >= 2 else { return nil }
+
+        var path = points
+        if close, let first = points.first, let last = points.last {
+            let dx = last.x - first.x
+            let dy = last.y - first.y
+            if (dx * dx + dy * dy) > 1e-12 {
+                path.append(first)
+            }
+        }
+
+        let safeZoom = max(zoom, 1e-6)
+        let dashWorld = lassoDashLengthPx / safeZoom
+        let gapWorld = lassoGapLengthPx / safeZoom
+        let widthWorld = lassoLineWidthPx / safeZoom
+
+        let origin = path[0]
+        var segments: [StrokeSegmentInstance] = []
+        var boundPoints: [SIMD2<Float>] = []
+
+        for i in 0..<(path.count - 1) {
+            let a = path[i]
+            let b = path[i + 1]
+            let dx = b.x - a.x
+            let dy = b.y - a.y
+            let len = sqrt(dx * dx + dy * dy)
+            if len <= 0 { continue }
+
+            let ux = dx / len
+            let uy = dy / len
+            var t = 0.0
+            while t < len {
+                let segLen = min(dashWorld, len - t)
+                let start = t
+                let end = t + segLen
+
+                let p0World = SIMD2<Double>(a.x + ux * start, a.y + uy * start)
+                let p1World = SIMD2<Double>(a.x + ux * end, a.y + uy * end)
+
+                let p0Local = SIMD2<Float>(Float(p0World.x - origin.x), Float(p0World.y - origin.y))
+                let p1Local = SIMD2<Float>(Float(p1World.x - origin.x), Float(p1World.y - origin.y))
+
+                segments.append(StrokeSegmentInstance(p0: p0Local, p1: p1Local, color: lassoColor))
+                boundPoints.append(p0Local)
+                boundPoints.append(p1Local)
+
+                t += dashWorld + gapWorld
+            }
+        }
+
+        guard !segments.isEmpty else { return nil }
+        let bounds = Stroke.calculateBounds(for: boundPoints, radius: Float(widthWorld) * 0.5)
+        return Stroke(
+            id: UUID(),
+            origin: origin,
+            worldWidth: widthWorld,
+            color: lassoColor,
+            zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
+            segments: segments,
+            localBounds: bounds,
+            segmentBounds: bounds,
+            device: device,
+            depthID: Self.strokeDepthSlotCount - 1,
+            depthWriteEnabled: false
+        )
+    }
+
+    private func polygonBounds(_ points: [SIMD2<Double>]) -> CGRect {
+        guard let first = points.first else { return .null }
+        var minX = first.x
+        var maxX = first.x
+        var minY = first.y
+        var maxY = first.y
+
+        for p in points.dropFirst() {
+            minX = min(minX, p.x)
+            maxX = max(maxX, p.x)
+            minY = min(minY, p.y)
+            maxY = max(maxY, p.y)
+        }
+
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    private func framePointToCardLocal(_ point: SIMD2<Double>, card: Card) -> SIMD2<Double> {
+        let dx = point.x - card.origin.x
+        let dy = point.y - card.origin.y
+        let c = cos(Double(-card.rotation))
+        let s = sin(Double(-card.rotation))
+        let localX = dx * c - dy * s
+        let localY = dx * s + dy * c
+        return SIMD2<Double>(localX, localY)
+    }
+
+    /// Check if a point in frame coordinates is on the card's resize handle (bottom-right corner)
+    /// Returns true if the point is within the handle hit area
+    func isPointOnCardHandle(_ pointInFrame: SIMD2<Double>, card: Card, zoom: Double) -> Bool {
+        // Convert to card-local coordinates
+        let localPoint = framePointToCardLocal(pointInFrame, card: card)
+
+        // Handle is in bottom-right corner
+        let halfW = card.size.x / 2.0
+        let halfH = card.size.y / 2.0
+
+        // Define handle hit area size (in world units)
+        // Make it screen-size independent by dividing by zoom
+        let handleSizePx: Double = 40.0 // 40px hit area
+        let handleSize = handleSizePx / max(zoom, 1e-6)
+
+        // Check if point is in bottom-right corner region
+        let isInRightEdge = localPoint.x >= (halfW - handleSize) && localPoint.x <= halfW
+        let isInBottomEdge = localPoint.y >= (halfH - handleSize) && localPoint.y <= halfH
+
+        return isInRightEdge && isInBottomEdge
+    }
+
+    private func cardOffsetFromCameraInLocalSpace(card: Card, cameraCenter: SIMD2<Double>) -> SIMD2<Double> {
+        let cameraLocal = framePointToCardLocal(cameraCenter, card: card)
+        return SIMD2<Double>(-cameraLocal.x, -cameraLocal.y)
+    }
+
+    private func shadowOffsetInCardLocalSpace(offsetPx: SIMD2<Float>,
+                                              rotation: Float,
+                                              zoom: Double) -> SIMD2<Double> {
+        let dx = Double(offsetPx.x) / max(zoom, 1e-6)
+        let dy = Double(offsetPx.y) / max(zoom, 1e-6)
+        let angle = Double(rotation)
+        let c = cos(angle)
+        let s = sin(angle)
+        let localX = dx * c + dy * s
+        let localY = -dx * s + dy * c
+        return SIMD2<Double>(localX, localY)
+    }
+
+    private func cardLocalToFramePoint(_ point: SIMD2<Double>, card: Card) -> SIMD2<Double> {
+        let c = cos(Double(card.rotation))
+        let s = sin(Double(card.rotation))
+        let rotX = point.x * c - point.y * s
+        let rotY = point.x * s + point.y * c
+        return SIMD2<Double>(card.origin.x + rotX, card.origin.y + rotY)
+    }
+
+    private func framesInActiveChain() -> [Frame] {
+        var frames: [Frame] = []
+
+        var current: Frame? = activeFrame
+        while let frame = current {
+            frames.append(frame)
+            current = frame.parent
+        }
+
+        current = childFrame(of: activeFrame)
+        while let frame = current {
+            frames.append(frame)
+            current = childFrame(of: frame)
+        }
+
+        return frames
+    }
+
+    private func pointInPolygon(_ point: SIMD2<Double>, polygon: [SIMD2<Double>]) -> Bool {
+        guard polygon.count >= 3 else { return false }
+        var inside = false
+        var j = polygon.count - 1
+        for i in 0..<polygon.count {
+            let pi = polygon[i]
+            let pj = polygon[j]
+            let denom = pj.y - pi.y
+            if abs(denom) > 1e-12 {
+                let intersect = ((pi.y > point.y) != (pj.y > point.y)) &&
+                    (point.x < (pj.x - pi.x) * (point.y - pi.y) / denom + pi.x)
+                if intersect {
+                    inside.toggle()
+                }
+            }
+            j = i
+        }
+        return inside
+    }
+
+    private func polygonEdges(_ points: [SIMD2<Double>]) -> [(SIMD2<Double>, SIMD2<Double>)] {
+        guard points.count >= 2 else { return [] }
+        var edges: [(SIMD2<Double>, SIMD2<Double>)] = []
+        edges.reserveCapacity(points.count)
+        for i in 0..<(points.count - 1) {
+            edges.append((points[i], points[i + 1]))
+        }
+        if let first = points.first, let last = points.last, first != last {
+            edges.append((last, first))
+        }
+        return edges
+    }
+
+    private func segmentsIntersect(_ p1: SIMD2<Double>, _ q1: SIMD2<Double>, _ p2: SIMD2<Double>, _ q2: SIMD2<Double>) -> Bool {
+        let eps = 1e-12
+
+        func cross(_ a: SIMD2<Double>, _ b: SIMD2<Double>, _ c: SIMD2<Double>) -> Double {
+            (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+        }
+
+        func onSegment(_ a: SIMD2<Double>, _ b: SIMD2<Double>, _ c: SIMD2<Double>) -> Bool {
+            min(a.x, c.x) - eps <= b.x && b.x <= max(a.x, c.x) + eps &&
+            min(a.y, c.y) - eps <= b.y && b.y <= max(a.y, c.y) + eps
+        }
+
+        let o1 = cross(p1, q1, p2)
+        let o2 = cross(p1, q1, q2)
+        let o3 = cross(p2, q2, p1)
+        let o4 = cross(p2, q2, q1)
+
+        if (o1 * o2 < 0) && (o3 * o4 < 0) {
+            return true
+        }
+
+        if abs(o1) <= eps && onSegment(p1, p2, q1) { return true }
+        if abs(o2) <= eps && onSegment(p1, q2, q1) { return true }
+        if abs(o3) <= eps && onSegment(p2, p1, q2) { return true }
+        if abs(o4) <= eps && onSegment(p2, q1, q2) { return true }
+
+        return false
+    }
+
+    private func strokeIntersectsPolygon(_ stroke: Stroke,
+                                         polygon: [SIMD2<Double>],
+                                         polygonBounds: CGRect,
+                                         edges: [(SIMD2<Double>, SIMD2<Double>)]) -> Bool {
+        let sBounds = stroke.localBounds
+        if sBounds == .null { return false }
+
+        let strokeBoundsWorld = CGRect(
+            x: stroke.origin.x + Double(sBounds.minX),
+            y: stroke.origin.y + Double(sBounds.minY),
+            width: Double(sBounds.width),
+            height: Double(sBounds.height)
+        )
+
+        if !strokeBoundsWorld.intersects(polygonBounds) {
+            return false
+        }
+
+        for seg in stroke.segments {
+            let p0 = SIMD2<Double>(stroke.origin.x + Double(seg.p0.x),
+                                   stroke.origin.y + Double(seg.p0.y))
+            let p1 = SIMD2<Double>(stroke.origin.x + Double(seg.p1.x),
+                                   stroke.origin.y + Double(seg.p1.y))
+
+            if pointInPolygon(p0, polygon: polygon) || pointInPolygon(p1, polygon: polygon) {
+                return true
+            }
+
+            for edge in edges {
+                if segmentsIntersect(p0, p1, edge.0, edge.1) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    private func selectStrokes(from strokes: [Stroke], polygon: [SIMD2<Double>]) -> Set<UUID> {
+        guard polygon.count >= 3 else { return [] }
+        let bounds = polygonBounds(polygon)
+        let edges = polygonEdges(polygon)
+
+        var ids = Set<UUID>()
+        for stroke in strokes {
+            if strokeIntersectsPolygon(stroke, polygon: polygon, polygonBounds: bounds, edges: edges) {
+                ids.insert(stroke.id)
+            }
+        }
+        return ids
+    }
+
+    private func selectStrokes(in frame: Frame, polygon: [SIMD2<Double>]) -> Set<UUID> {
+        selectStrokes(from: frame.strokes, polygon: polygon)
+    }
+
+    private func polygonIntersectsCard(_ polygonActive: [SIMD2<Double>],
+                                       card: Card,
+                                       transform: (scale: Double, translation: SIMD2<Double>)) -> Bool {
+        guard polygonActive.count >= 3 else { return false }
+        let polygonCard = polygonActive.map { activePoint in
+            let framePoint = SIMD2<Double>(
+                activePoint.x * transform.scale + transform.translation.x,
+                activePoint.y * transform.scale + transform.translation.y
+            )
+            return framePointToCardLocal(framePoint, card: card)
+        }
+
+        let bounds = polygonBounds(polygonCard)
+        let halfW = card.size.x * 0.5
+        let halfH = card.size.y * 0.5
+        let cardRect = CGRect(x: -halfW, y: -halfH, width: card.size.x, height: card.size.y)
+        if !bounds.intersects(cardRect) {
+            return false
+        }
+
+        // Any polygon point inside card rect?
+        if polygonCard.contains(where: { cardRect.contains(CGPoint(x: $0.x, y: $0.y)) }) {
+            return true
+        }
+
+        // Any card corner inside polygon?
+        let corners = [
+            SIMD2<Double>(-halfW, -halfH),
+            SIMD2<Double>(halfW, -halfH),
+            SIMD2<Double>(halfW, halfH),
+            SIMD2<Double>(-halfW, halfH)
+        ]
+        if corners.contains(where: { pointInPolygon($0, polygon: polygonCard) }) {
+            return true
+        }
+
+        // Edge intersection test.
+        let polygonEdges = polygonEdges(polygonCard)
+        let cardEdges: [(SIMD2<Double>, SIMD2<Double>)] = [
+            (corners[0], corners[1]),
+            (corners[1], corners[2]),
+            (corners[2], corners[3]),
+            (corners[3], corners[0])
+        ]
+
+        for edge in polygonEdges {
+            for cardEdge in cardEdges {
+                if segmentsIntersect(edge.0, edge.1, cardEdge.0, cardEdge.1) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
 	    // MARK: - Touch Handling
 
 	    private var isRunningOnMac: Bool {
@@ -1335,48 +2929,144 @@ import simd
 	        return touchType == .direct
 	    }
 	
-	    func handleTouchBegan(at point: CGPoint, touchType: UITouch.TouchType) {
-	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
-	        guard isDrawingTouchType(touchType) else { return }
-	
-	        guard let view = metalView else { return }
+    func handleTouchBegan(at point: CGPoint, touchType: UITouch.TouchType) {
+        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
+        guard isDrawingTouchType(touchType) else { return }
 
-        // USE NEW HIERARCHICAL HIT TEST
-        // This checks children (foreground), active frame (middle), and parent (background)
-        if let result = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
-            // Found a card (in active, parent, or child frame)
-            // Store BOTH the card AND the frame it belongs to for correct coordinate transforms
-            currentDrawingTarget = .card(result.card, result.frame)
+        guard let view = metalView else { return }
 
-            // For live rendering, we need the origin in ACTIVE World Space
-            liveStrokeOrigin = screenToWorldPixels_PureDouble(
-                point,
-                viewSize: view.bounds.size,
-                panOffset: panOffset,
-                zoomScale: zoomScale,
-                rotationAngle: rotationAngle
-            )
+        if brushSettings.isLasso {
+            clearLassoSelection()
+            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+                lassoTarget = .card(card, frame)
+            } else {
+                lassoTarget = .canvas
+            }
+            lassoDrawingPoints = [point]
+            lassoPredictedPoints = []
+            if let screenPoints = buildLassoScreenPoints() {
+                updateLassoPreviewFromScreenPoints(screenPoints, close: false, viewSize: view.bounds.size)
+            }
+            currentTouchPoints = []
+            predictedTouchPoints = []
+            liveStrokeOrigin = nil
+            currentDrawingTarget = nil
+            lastSavedPoint = nil
+            return
+        }
 
+        if brushSettings.isStrokeEraser {
+            eraseStrokeAtPoint(screenPoint: point, viewSize: view.bounds.size)
+            currentTouchPoints = []
+            predictedTouchPoints = []
+            liveStrokeOrigin = nil
+            currentDrawingTarget = nil
+            lastSavedPoint = nil
+            return
+        }
+
+        if brushSettings.isMaskEraser {
+            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+                // If we're over a card, always target that card's strokes.
+                currentDrawingTarget = .card(card, frame)
+                liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                    point,
+                    viewSize: view.bounds.size,
+                    panOffset: panOffset,
+                    zoomScale: zoomScale,
+                    rotationAngle: rotationAngle
+                )
+            } else if let strokeHit = hitTestStrokeHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+                switch strokeHit.target {
+                case .canvas(let frame, let pointInFrame):
+                    currentDrawingTarget = .canvas(frame)
+                    liveStrokeOrigin = pointInFrame
+                case .card(let card, let frame):
+                    currentDrawingTarget = .card(card, frame)
+                    liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                        point,
+                        viewSize: view.bounds.size,
+                        panOffset: panOffset,
+                        zoomScale: zoomScale,
+                        rotationAngle: rotationAngle
+                    )
+                }
+            } else {
+                currentDrawingTarget = .canvas(activeFrame)
+                liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                    point,
+                    viewSize: view.bounds.size,
+                    panOffset: panOffset,
+                    zoomScale: zoomScale,
+                    rotationAngle: rotationAngle
+                )
+            }
         } else {
-            // Draw on Canvas (Active Frame)
-            currentDrawingTarget = .canvas(activeFrame)
+            // USE HIERARCHICAL CARD HIT TEST
+            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+                // Found a card (in active, parent, or child frame)
+                // Store BOTH the card AND the frame it belongs to for correct coordinate transforms
+                currentDrawingTarget = .card(card, frame)
 
-            liveStrokeOrigin = screenToWorldPixels_PureDouble(
-                point,
-                viewSize: view.bounds.size,
-                panOffset: panOffset,
-                zoomScale: zoomScale,
-                rotationAngle: rotationAngle
-            )
+                // For live rendering, we need the origin in ACTIVE World Space
+                liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                    point,
+                    viewSize: view.bounds.size,
+                    panOffset: panOffset,
+                    zoomScale: zoomScale,
+                    rotationAngle: rotationAngle
+                )
+
+            } else {
+                // Draw on Canvas (Active Frame)
+                currentDrawingTarget = .canvas(activeFrame)
+
+                liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                    point,
+                    viewSize: view.bounds.size,
+                    panOffset: panOffset,
+                    zoomScale: zoomScale,
+                    rotationAngle: rotationAngle
+                )
+            }
         }
 
         // Keep points in SCREEN space during drawing
         currentTouchPoints = [point]
     }
 
-	    func handleTouchMoved(at point: CGPoint, predicted: [CGPoint], touchType: UITouch.TouchType) {
-	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
-	        guard isDrawingTouchType(touchType) else { return }
+    func handleTouchMoved(at point: CGPoint, predicted: [CGPoint], touchType: UITouch.TouchType) {
+        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
+        guard isDrawingTouchType(touchType) else { return }
+
+        if brushSettings.isLasso {
+            let minimumDistance: CGFloat = 2.0
+            var shouldAdd = false
+            if let last = lassoDrawingPoints.last {
+                let dist = hypot(point.x - last.x, point.y - last.y)
+                if dist > minimumDistance {
+                    shouldAdd = true
+                }
+            } else {
+                shouldAdd = true
+            }
+
+            if shouldAdd {
+                lassoDrawingPoints.append(point)
+            }
+
+            lassoPredictedPoints = predicted
+            if let view = metalView, let screenPoints = buildLassoScreenPoints() {
+                updateLassoPreviewFromScreenPoints(screenPoints, close: false, viewSize: view.bounds.size)
+            }
+            return
+        }
+
+        if brushSettings.isStrokeEraser {
+            guard let view = metalView else { return }
+            eraseStrokeAtPoint(screenPoint: point, viewSize: view.bounds.size)
+            return
+        }
 
         //  OPTIMIZATION: Distance Filter
         // Only add the point if it's far enough from the last one (e.g., 2.0 pixels)
@@ -1402,11 +3092,123 @@ import simd
         predictedTouchPoints = predicted
     }
 
-	    func handleTouchEnded(at point: CGPoint, touchType: UITouch.TouchType) {
-	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
-	        guard isDrawingTouchType(touchType), let target = currentDrawingTarget else { return }
-
+    func handleTouchEnded(at point: CGPoint, touchType: UITouch.TouchType) {
+        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
+        guard isDrawingTouchType(touchType) else { return }
         guard let view = metalView else { return }
+
+        if brushSettings.isLasso {
+            lassoPredictedPoints = []
+            lassoDrawingPoints.append(point)
+            let rawScreenPoints = lassoDrawingPoints
+            lassoDrawingPoints = []
+
+            let simplified = simplifyStroke(rawScreenPoints, minScreenDist: 2.0, minAngleDeg: 5.0)
+            guard simplified.count >= 3 else {
+                clearLassoSelection()
+                return
+            }
+
+            let worldPoints = simplified.map {
+                screenToWorldPixels_PureDouble(
+                    $0,
+                    viewSize: view.bounds.size,
+                    panOffset: panOffset,
+                    zoomScale: zoomScale,
+                    rotationAngle: rotationAngle
+                )
+            }
+
+            var closedPoints = worldPoints
+            if let first = worldPoints.first, let last = worldPoints.last {
+                let dx = last.x - first.x
+                let dy = last.y - first.y
+                if (dx * dx + dy * dy) > 1e-12 {
+                    closedPoints.append(first)
+                }
+            }
+
+            let bounds = polygonBounds(closedPoints)
+            let center = SIMD2<Double>(Double(bounds.midX), Double(bounds.midY))
+
+            switch lassoTarget {
+            case .card(let card, let frame):
+                guard let transform = transformFromActive(to: frame) else {
+                    clearLassoSelection()
+                    return
+                }
+
+                let polygonInCard = closedPoints.map { activePoint in
+                    let framePoint = SIMD2<Double>(
+                        activePoint.x * transform.scale + transform.translation.x,
+                        activePoint.y * transform.scale + transform.translation.y
+                    )
+                    return framePointToCardLocal(framePoint, card: card)
+                }
+
+                let selectedIDs = selectStrokes(from: card.strokes, polygon: polygonInCard)
+
+                lassoSelection = LassoSelection(
+                    points: closedPoints,
+                    bounds: bounds,
+                    center: center,
+                    frames: [],
+                    cards: [],
+                    cardStrokes: [LassoCardStrokeSelection(card: card, frame: frame, strokeIDs: selectedIDs)]
+                )
+
+            default:
+                var selections: [LassoFrameSelection] = []
+                var cardSelections: [LassoCardSelection] = []
+
+                for frame in framesInActiveChain() {
+                    guard let transform = transformFromActive(to: frame) else { continue }
+                    let polygonInFrame = closedPoints.map {
+                        SIMD2<Double>(
+                            $0.x * transform.scale + transform.translation.x,
+                            $0.y * transform.scale + transform.translation.y
+                        )
+                    }
+                    let selectedIDs = selectStrokes(in: frame, polygon: polygonInFrame)
+                    if !selectedIDs.isEmpty {
+                        selections.append(LassoFrameSelection(frame: frame, strokeIDs: selectedIDs))
+                    }
+
+                    for card in frame.cards {
+                        if polygonIntersectsCard(closedPoints, card: card, transform: transform) {
+                            cardSelections.append(LassoCardSelection(card: card, frame: frame))
+                        }
+                    }
+                }
+
+                lassoSelection = LassoSelection(
+                    points: closedPoints,
+                    bounds: bounds,
+                    center: center,
+                    frames: selections,
+                    cards: cardSelections,
+                    cardStrokes: []
+                )
+            }
+
+            if let selection = lassoSelection {
+                updateLassoPreview(for: selection)
+            }
+            lassoTarget = nil
+            return
+        }
+
+        if brushSettings.isStrokeEraser {
+            eraseStrokeAtPoint(screenPoint: point, viewSize: view.bounds.size)
+            predictedTouchPoints = []
+            currentTouchPoints = []
+            liveStrokeOrigin = nil
+            currentDrawingTarget = nil
+            lastSavedPoint = nil
+            return
+        }
+
+        guard let target = currentDrawingTarget else { return }
 
         // Clear predictions (no longer needed)
         predictedTouchPoints = []
@@ -1471,21 +3273,39 @@ import simd
         }
 
         //  MODAL INPUT: Route stroke to correct target
+        let isMaskEraser = brushSettings.isMaskEraser
+        let strokeColor = isMaskEraser ? SIMD4<Float>(0, 0, 0, 0) : brushSettings.color
+        let strokeDepthWriteEnabled = isMaskEraser ? true : brushSettings.depthWriteEnabled
         switch target {
         case .canvas(let frame):
-            // DRAW ON CANVAS (existing logic)
-	            let stroke = Stroke(screenPoints: smoothScreenPoints,
-	                                zoomAtCreation: zoomScale,
-	                                panAtCreation: panOffset,
-	                                viewSize: view.bounds.size,
-	                                rotationAngle: rotationAngle,
-	                                color: brushSettings.color,
-	                                baseWidth: brushSettings.size,
-	                                zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
-	                                device: device,
-	                                depthID: allocateStrokeDepthID(),
-	                                depthWriteEnabled: brushSettings.depthWriteEnabled)
-	            frame.strokes.append(stroke)
+            if frame === activeFrame {
+                // DRAW ON CANVAS (Active Frame)
+	                let stroke = Stroke(screenPoints: smoothScreenPoints,
+	                                    zoomAtCreation: zoomScale,
+	                                    panAtCreation: panOffset,
+	                                    viewSize: view.bounds.size,
+	                                    rotationAngle: rotationAngle,
+	                                    color: strokeColor,
+	                                    baseWidth: brushSettings.size,
+	                                    zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
+	                                    device: device,
+	                                    depthID: allocateStrokeDepthID(),
+	                                    depthWriteEnabled: strokeDepthWriteEnabled)
+	                frame.strokes.append(stroke)
+	                pushUndo(.drawStroke(stroke: stroke, target: target))
+            } else {
+                // DRAW ON CANVAS (Other Frame in Telescope Chain)
+                let stroke = createStrokeForFrame(
+                    screenPoints: smoothScreenPoints,
+                    frame: frame,
+                    viewSize: view.bounds.size,
+                    depthID: allocateStrokeDepthID(),
+                    color: strokeColor,
+                    depthWriteEnabled: strokeDepthWriteEnabled
+                )
+                frame.strokes.append(stroke)
+                pushUndo(.drawStroke(stroke: stroke, target: target))
+            }
 
         case .card(let card, let frame):
             // DRAW ON CARD (Cross-Depth Compatible)
@@ -1495,9 +3315,12 @@ import simd
 	                card: card,
 	                frame: frame,
 	                viewSize: view.bounds.size,
-	                depthID: allocateStrokeDepthID()
+	                depthID: allocateStrokeDepthID(),
+	                color: strokeColor,
+	                depthWriteEnabled: strokeDepthWriteEnabled
 	            )
 	            card.strokes.append(cardStroke)
+	            pushUndo(.drawStroke(stroke: cardStroke, target: target))
         }
 
         currentTouchPoints = []
@@ -1506,24 +3329,340 @@ import simd
         lastSavedPoint = nil  // Clear for next stroke
     }
 
-	    func handleTouchCancelled(touchType: UITouch.TouchType) {
-	        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
-	        guard isDrawingTouchType(touchType) else { return }
+    func handleTouchCancelled(touchType: UITouch.TouchType) {
+        // MODAL INPUT: Pencil on iPad; mouse/trackpad on Mac Catalyst.
+        guard isDrawingTouchType(touchType) else { return }
+        if brushSettings.isLasso {
+            lassoDrawingPoints = []
+            lassoPredictedPoints = []
+            if let selection = lassoSelection {
+                updateLassoPreview(for: selection)
+            } else {
+                lassoPreviewStroke = nil
+                lassoPreviewFrame = nil
+            }
+            return
+        }
         predictedTouchPoints = []  // Clear predictions
         currentTouchPoints = []
         liveStrokeOrigin = nil  // Clear temporary origin
         lastSavedPoint = nil  // Clear for next stroke
     }
 
+    // MARK: - Cross-Frame Hit Testing (Linked List Frames)
+
+    private struct FrameTransform {
+        let frame: Frame
+        let point: SIMD2<Double>
+        let scale: Double  // Active -> Frame scale factor
+    }
+
+    private struct StrokeHit {
+        enum Target {
+            case canvas(frame: Frame, pointInFrame: SIMD2<Double>)
+            case card(card: Card, frame: Frame)
+        }
+
+        let target: Target
+        let stroke: Stroke
+        let depthID: UInt32
+    }
+
+    private func childFrame(of frame: Frame) -> Frame? {
+        // Frames are a linked list: at most one child.
+        frame.children.first
+    }
+
+    private func collectFrameTransforms(pointActive: SIMD2<Double>) -> (ancestors: [FrameTransform], descendants: [FrameTransform]) {
+        var ancestors: [FrameTransform] = []
+        var descendants: [FrameTransform] = []
+
+        // Walk up to parents.
+        var current: Frame? = activeFrame
+        var point = pointActive
+        var scale = 1.0
+        while let frame = current, let parent = frame.parent {
+            point = frame.originInParent + (point / frame.scaleRelativeToParent)
+            scale /= frame.scaleRelativeToParent
+            ancestors.append(FrameTransform(frame: parent, point: point, scale: scale))
+            current = parent
+        }
+
+        // Walk down to child chain.
+        current = activeFrame
+        point = pointActive
+        scale = 1.0
+        while let frame = current, let child = childFrame(of: frame) {
+            point = (point - child.originInParent) * child.scaleRelativeToParent
+            scale *= child.scaleRelativeToParent
+            descendants.append(FrameTransform(frame: child, point: point, scale: scale))
+            current = child
+        }
+
+        return (ancestors, descendants)
+    }
+
+    private func transformFromActive(to target: Frame) -> (scale: Double, translation: SIMD2<Double>)? {
+        if target === activeFrame {
+            return (scale: 1.0, translation: .zero)
+        }
+
+        // Walk up to find ancestor.
+        var scale = 1.0
+        var translation = SIMD2<Double>(repeating: 0.0)
+        var current: Frame? = activeFrame
+        while let frame = current, let parent = frame.parent {
+            scale /= frame.scaleRelativeToParent
+            translation = translation / frame.scaleRelativeToParent + frame.originInParent
+            if parent === target {
+                return (scale, translation)
+            }
+            current = parent
+        }
+
+        // Walk down to find descendant.
+        scale = 1.0
+        translation = SIMD2<Double>(repeating: 0.0)
+        current = activeFrame
+        while let frame = current, let child = childFrame(of: frame) {
+            scale *= child.scaleRelativeToParent
+            translation = (translation - child.originInParent) * child.scaleRelativeToParent
+            if child === target {
+                return (scale, translation)
+            }
+            current = child
+        }
+
+        return nil
+    }
+
+    private func pointInFrame(screenPoint: CGPoint, viewSize: CGSize, frame: Frame) -> SIMD2<Double>? {
+        let pointActive = screenToWorldPixels_PureDouble(
+            screenPoint,
+            viewSize: viewSize,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
+
+        if frame === activeFrame {
+            return pointActive
+        }
+
+        guard let transform = transformFromActive(to: frame) else { return nil }
+        return pointActive * transform.scale + transform.translation
+    }
+
+    private func eraserRadiusWorld(forScale scale: Double) -> Double {
+        let safeZoom = max(zoomScale, 1e-6)
+        return (brushSettings.size * 0.5) * scale / safeZoom
+    }
+
+    private func hitTestStroke(_ stroke: Stroke,
+                               pointInFrame: SIMD2<Double>,
+                               eraserRadius: Double) -> Bool {
+        let localX = pointInFrame.x - stroke.origin.x
+        let localY = pointInFrame.y - stroke.origin.y
+
+        if stroke.localBounds != .null {
+            // Broad-phase: skip per-segment math if eraser bounds don't overlap stroke bounds.
+            let sBounds = stroke.localBounds
+            let eMinX = localX - eraserRadius
+            let eMaxX = localX + eraserRadius
+            let eMinY = localY - eraserRadius
+            let eMaxY = localY + eraserRadius
+
+            if eMaxX < Double(sBounds.minX) ||
+                eMinX > Double(sBounds.maxX) ||
+                eMaxY < Double(sBounds.minY) ||
+                eMinY > Double(sBounds.maxY) {
+                return false
+            }
+        }
+
+        let radius = Float(stroke.worldWidth * 0.5 + eraserRadius)
+        let radiusSq = radius * radius
+        let p = SIMD2<Float>(Float(localX), Float(localY))
+
+        for seg in stroke.segments {
+            let a = seg.p0
+            let b = seg.p1
+            let ab = b - a
+            let ap = p - a
+            let denom = simd_dot(ab, ab)
+            let t = denom > 0 ? max(0.0, min(1.0, simd_dot(ap, ab) / denom)) : 0.0
+            let closest = a + ab * t
+            let d = p - closest
+            let distSq = simd_dot(d, d)
+            if distSq <= radiusSq {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func hitTestCardStroke(card: Card,
+                                   pointInFrame: SIMD2<Double>,
+                                   eraserRadius: Double,
+                                   minimumDepthID: UInt32? = nil) -> Stroke? {
+        guard !card.strokes.isEmpty else { return nil }
+        guard card.hitTest(pointInFrame: pointInFrame) else { return nil }
+
+        let dx = pointInFrame.x - card.origin.x
+        let dy = pointInFrame.y - card.origin.y
+        let c = cos(-card.rotation)
+        let s = sin(-card.rotation)
+        let localX = dx * Double(c) - dy * Double(s)
+        let localY = dx * Double(s) + dy * Double(c)
+        let pointInCard = SIMD2<Double>(localX, localY)
+
+        for stroke in card.strokes.reversed() {
+            if let minimumDepthID, stroke.depthID <= minimumDepthID {
+                break
+            }
+            if hitTestStroke(stroke,
+                             pointInFrame: pointInCard,
+                             eraserRadius: eraserRadius) {
+                return stroke
+            }
+        }
+
+        return nil
+    }
+
+    private func hitTestStrokeHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> StrokeHit? {
+        let pointActive = screenToWorldPixels_PureDouble(
+            screenPoint,
+            viewSize: viewSize,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
+
+        let transforms = collectFrameTransforms(pointActive: pointActive)
+        var bestDepthID: UInt32?
+        var bestTarget: StrokeHit.Target?
+        var bestStroke: Stroke?
+
+        func considerCanvasStrokes(in frame: Frame,
+                                   pointInFrame: SIMD2<Double>,
+                                   eraserRadius: Double) {
+            guard !frame.strokes.isEmpty else { return }
+            for stroke in frame.strokes.reversed() {
+                if let best = bestDepthID, stroke.depthID <= best {
+                    break
+                }
+                if hitTestStroke(stroke,
+                                 pointInFrame: pointInFrame,
+                                 eraserRadius: eraserRadius) {
+                    bestDepthID = stroke.depthID
+                    bestTarget = .canvas(frame: frame, pointInFrame: pointInFrame)
+                    bestStroke = stroke
+                    break
+                }
+            }
+        }
+
+        func considerCardStrokes(in frame: Frame,
+                                 pointInFrame: SIMD2<Double>,
+                                 eraserRadius: Double) {
+            guard !frame.cards.isEmpty else { return }
+
+            for card in frame.cards.reversed() {
+                guard let newest = card.strokes.last?.depthID else { continue }
+                if let best = bestDepthID, newest <= best {
+                    continue
+                }
+                if let stroke = hitTestCardStroke(card: card,
+                                                  pointInFrame: pointInFrame,
+                                                  eraserRadius: eraserRadius,
+                                                  minimumDepthID: bestDepthID) {
+                    bestDepthID = stroke.depthID
+                    bestTarget = .card(card: card, frame: frame)
+                    bestStroke = stroke
+                    break
+                }
+            }
+        }
+
+        // Active frame first, then ancestors/descendants.
+        let activeEraserRadius = eraserRadiusWorld(forScale: 1.0)
+        considerCanvasStrokes(in: activeFrame,
+                              pointInFrame: pointActive,
+                              eraserRadius: activeEraserRadius)
+        considerCardStrokes(in: activeFrame,
+                            pointInFrame: pointActive,
+                            eraserRadius: activeEraserRadius)
+
+        for ancestor in transforms.ancestors {
+            let eraserRadius = eraserRadiusWorld(forScale: ancestor.scale)
+            considerCanvasStrokes(in: ancestor.frame,
+                                  pointInFrame: ancestor.point,
+                                  eraserRadius: eraserRadius)
+            considerCardStrokes(in: ancestor.frame,
+                                pointInFrame: ancestor.point,
+                                eraserRadius: eraserRadius)
+        }
+
+        for descendant in transforms.descendants {
+            let eraserRadius = eraserRadiusWorld(forScale: descendant.scale)
+            considerCanvasStrokes(in: descendant.frame,
+                                  pointInFrame: descendant.point,
+                                  eraserRadius: eraserRadius)
+            considerCardStrokes(in: descendant.frame,
+                                pointInFrame: descendant.point,
+                                eraserRadius: eraserRadius)
+        }
+
+        guard let depthID = bestDepthID, let target = bestTarget, let stroke = bestStroke else { return nil }
+        return StrokeHit(target: target, stroke: stroke, depthID: depthID)
+    }
+
+    private func eraseStrokeAtPoint(screenPoint: CGPoint, viewSize: CGSize) {
+        // Cards sit on top of the canvas; when covered, only card strokes are eligible.
+        if let (card, frame, conversionScale, _) = hitTestHierarchy(screenPoint: screenPoint, viewSize: viewSize) {
+            guard let pointInTargetFrame = pointInFrame(screenPoint: screenPoint,
+                                                        viewSize: viewSize,
+                                                        frame: frame) else { return }
+            let eraserRadius = eraserRadiusWorld(forScale: conversionScale)
+            if let stroke = hitTestCardStroke(card: card,
+                                              pointInFrame: pointInTargetFrame,
+                                              eraserRadius: eraserRadius),
+               let index = card.strokes.firstIndex(where: { $0 === stroke }) {
+                let strokeCopy = stroke // Keep reference before removing
+                card.strokes.remove(at: index)
+                pushUndo(.eraseStroke(stroke: strokeCopy, strokeIndex: index, target: .card(card, frame)))
+            }
+            return
+        }
+
+        guard let hit = hitTestStrokeHierarchy(screenPoint: screenPoint, viewSize: viewSize) else { return }
+        switch hit.target {
+        case .canvas(let frame, _):
+            if let index = frame.strokes.firstIndex(where: { $0 === hit.stroke }) {
+                let strokeCopy = hit.stroke // Keep reference before removing
+                frame.strokes.remove(at: index)
+                pushUndo(.eraseStroke(stroke: strokeCopy, strokeIndex: index, target: .canvas(frame)))
+            }
+        case .card(let card, let frame):
+            if let index = card.strokes.firstIndex(where: { $0 === hit.stroke }) {
+                let strokeCopy = hit.stroke // Keep reference before removing
+                card.strokes.remove(at: index)
+                pushUndo(.eraseStroke(stroke: strokeCopy, strokeIndex: index, target: .card(card, frame)))
+            }
+        }
+    }
+
     // MARK: - Card Management
 
-    /// Hit test across the entire visible hierarchy (Parent -> Active -> Children)
+    /// Hit test across the entire visible chain (Ancestors -> Active -> Descendants)
     /// Returns: The Card, The Frame it belongs to, and the Coordinate Conversion Scale
     /// The conversion scale is used to translate movement deltas between coordinate systems:
     ///   - Parent cards: scale < 1.0 (move slower - parent coords are smaller)
     ///   - Active cards: scale = 1.0 (normal movement)
     ///   - Child cards: scale > 1.0 (move faster - child coords are larger)
-    func hitTestHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> (card: Card, frame: Frame, conversionScale: Double)? {
+    func hitTestHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> (card: Card, frame: Frame, conversionScale: Double, pointInFrame: SIMD2<Double>)? {
 
         // 1. Calculate Point in Active Frame (World Space)
         let pointActive = screenToWorldPixels_PureDouble(
@@ -1534,17 +3673,13 @@ import simd
             rotationAngle: rotationAngle
         )
 
-        // --- CHECK 1: CHILDREN (Foreground - Top Priority) ---
-        // Iterate children (reverse to hit top-most first)
-        for child in activeFrame.children.reversed() {
-            // Convert Active Point -> Child Point
-            // Math: Translate to child origin, then Scale UP (child coords are huge)
-            let pointInChild = (pointActive - child.originInParent) * child.scaleRelativeToParent
+        let transforms = collectFrameTransforms(pointActive: pointActive)
 
-            for card in child.cards.reversed() {
-                if card.hitTest(pointInFrame: pointInChild) {
-                    // Conversion: 1 unit in Active = 'scale' units in Child
-                    return (card, child, child.scaleRelativeToParent)
+        // --- CHECK 1: DESCENDANTS (Foreground - Top Priority) ---
+        for descendant in transforms.descendants.reversed() {
+            for card in descendant.frame.cards.reversed() {
+                if card.hitTest(pointInFrame: descendant.point) {
+                    return (card, descendant.frame, descendant.scale, descendant.point)
                 }
             }
         }
@@ -1552,20 +3687,15 @@ import simd
         // --- CHECK 2: ACTIVE FRAME (Middle) ---
         for card in activeFrame.cards.reversed() {
             if card.hitTest(pointInFrame: pointActive) {
-                return (card, activeFrame, 1.0)
+                return (card, activeFrame, 1.0, pointActive)
             }
         }
 
-        // --- CHECK 3: PARENT FRAME (Background) ---
-        if let parent = activeFrame.parent {
-            // Convert Active Point -> Parent Point
-            // Math: Scale DOWN (parent coords are small), then Translate to Active's origin in Parent
-            let pointInParent = activeFrame.originInParent + (pointActive / activeFrame.scaleRelativeToParent)
-
-            for card in parent.cards.reversed() {
-                if card.hitTest(pointInFrame: pointInParent) {
-                    // Conversion: 1 unit in Active = (1/scale) units in Parent
-                    return (card, parent, 1.0 / activeFrame.scaleRelativeToParent)
+        // --- CHECK 3: ANCESTORS (Background) ---
+        for ancestor in transforms.ancestors {
+            for card in ancestor.frame.cards.reversed() {
+                if card.hitTest(pointInFrame: ancestor.point) {
+                    return (card, ancestor.frame, ancestor.scale, ancestor.point)
                 }
             }
         }
@@ -1579,9 +3709,9 @@ import simd
         guard let view = metalView else { return }
 
         // Use hierarchical hit test to find card at any depth
-        if let result = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+        if let (card, _, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
             // Found a card! Notify SwiftUI
-            onEditCard?(result.card)
+            onEditCard?(card)
         }
     }
 
@@ -1624,14 +3754,71 @@ import simd
         activeFrame.cards.append(card)
     }
 
+    /// Create a stroke in a target frame's coordinate system (canvas strokes).
+    /// Converts screen points into the target frame, even across telescope transitions.
+    func createStrokeForFrame(screenPoints: [CGPoint],
+                              frame: Frame,
+                              viewSize: CGSize,
+                              depthID: UInt32,
+                              color: SIMD4<Float>? = nil,
+                              depthWriteEnabled: Bool? = nil) -> Stroke {
+        guard let transform = transformFromActive(to: frame) else {
+            return Stroke(
+                screenPoints: screenPoints,
+                zoomAtCreation: zoomScale,
+                panAtCreation: panOffset,
+                viewSize: viewSize,
+                rotationAngle: rotationAngle,
+                color: color ?? brushSettings.color,
+                baseWidth: brushSettings.size,
+                zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
+                device: device,
+                depthID: depthID,
+                depthWriteEnabled: depthWriteEnabled ?? brushSettings.depthWriteEnabled
+            )
+        }
+
+        let effectiveZoom = max(zoomScale / transform.scale, 1e-6)
+        var virtualScreenPoints: [CGPoint] = []
+        virtualScreenPoints.reserveCapacity(screenPoints.count)
+
+        for screenPt in screenPoints {
+            let worldPtActive = screenToWorldPixels_PureDouble(
+                screenPt,
+                viewSize: viewSize,
+                panOffset: panOffset,
+                zoomScale: zoomScale,
+                rotationAngle: rotationAngle
+            )
+            let targetWorld = worldPtActive * transform.scale + transform.translation
+            virtualScreenPoints.append(CGPoint(x: targetWorld.x * effectiveZoom,
+                                               y: targetWorld.y * effectiveZoom))
+        }
+
+        let finalColor = color ?? brushSettings.color
+        let finalDepthWriteEnabled = depthWriteEnabled ?? brushSettings.depthWriteEnabled
+
+        return Stroke(
+            screenPoints: virtualScreenPoints,
+            zoomAtCreation: effectiveZoom,
+            panAtCreation: .zero,
+            viewSize: .zero,
+            rotationAngle: 0,
+            color: finalColor,
+            baseWidth: brushSettings.size,
+            zoomEffectiveAtCreation: Float(effectiveZoom),
+            device: device,
+            depthID: depthID,
+            depthWriteEnabled: finalDepthWriteEnabled
+        )
+    }
+
     /// Create a stroke in card-local coordinates
     /// Transforms screen-space points into the card's local coordinate system
     /// This ensures the stroke "sticks" to the card when it's moved or rotated
     ///
     /// **CROSS-DEPTH COMPATIBLE:**
-    /// This method now supports drawing on cards in different frames (Parent/Active/Child).
-    /// It determines the scale factor between the active frame and the target frame,
-    /// then applies the appropriate coordinate transforms.
+    /// Supports drawing on cards anywhere in the telescope chain (ancestor/active/descendant).
     ///
     /// - Parameters:
     ///   - screenPoints: Raw screen-space touch points
@@ -1639,7 +3826,13 @@ import simd
     ///   - frame: The frame the card belongs to (may be parent, active, or child)
     ///   - viewSize: Screen dimensions
     /// - Returns: A stroke with points relative to card center
-	    func createStrokeForCard(screenPoints: [CGPoint], card: Card, frame: Frame, viewSize: CGSize, depthID: UInt32) -> Stroke {
+	    func createStrokeForCard(screenPoints: [CGPoint],
+	                             card: Card,
+	                             frame: Frame,
+	                             viewSize: CGSize,
+	                             depthID: UInt32,
+	                             color: SIMD4<Float>? = nil,
+	                             depthWriteEnabled: Bool? = nil) -> Stroke {
         // 1. Get the Card's World Position & Rotation (in its Frame)
         let cardOrigin = card.origin
         let cardRot = Double(card.rotation)
@@ -1648,36 +3841,26 @@ import simd
         let c = cos(-cardRot)
         let s = sin(-cardRot)
 
-        // 2. Determine Scale Factor (Active -> Card's Frame)
-        // This tells us how to convert coordinates from active frame to the card's frame
-        var frameScale: Double = 1.0
-        if frame === activeFrame {
-            // Card is in active frame - no scaling needed
-            frameScale = 1.0
-        } else if let p = activeFrame.parent, frame === p {
-            // Card is in parent frame - parent coords are smaller, so scale down
-            frameScale = 1.0 / activeFrame.scaleRelativeToParent
-        } else if activeFrame.children.contains(where: { $0 === frame }) {
-            // Card is in child frame - child coords are larger, so scale up
-            frameScale = frame.scaleRelativeToParent
+        guard let transform = transformFromActive(to: frame) else {
+            return Stroke(
+                screenPoints: screenPoints,
+                zoomAtCreation: zoomScale,
+                panAtCreation: panOffset,
+                viewSize: viewSize,
+                rotationAngle: rotationAngle,
+                color: color ?? brushSettings.color,
+                baseWidth: brushSettings.size,
+                zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
+                device: device,
+                depthID: depthID,
+                depthWriteEnabled: depthWriteEnabled ?? brushSettings.depthWriteEnabled
+            )
         }
 
-        // 3. Calculate Effective Zoom for the Card's Frame
-        // This is critical for cross-depth drawing
-        var effectiveZoom: Double
-        if frame === activeFrame {
-            effectiveZoom = zoomScale
-        } else if let p = activeFrame.parent, frame === p {
-            // Parent frame is zoomed IN from our perspective
-            effectiveZoom = zoomScale * activeFrame.scaleRelativeToParent
-        } else if let child = activeFrame.children.first(where: { $0 === frame }) {
-            // Child frame is zoomed OUT from our perspective
-            effectiveZoom = zoomScale / child.scaleRelativeToParent
-        } else {
-            effectiveZoom = zoomScale
-        }
+        // 2. Calculate Effective Zoom for the Card's Frame
+        let effectiveZoom = max(zoomScale / transform.scale, 1e-6)
 
-        // 4. Transform Screen Points -> Card Local Points
+        // 3. Transform Screen Points -> Card Local Points
         var cardLocalPoints: [CGPoint] = []
 
         for screenPt in screenPoints {
@@ -1690,17 +3873,8 @@ import simd
                 rotationAngle: rotationAngle
             )
 
-            // B. Active World -> Card's Frame World (Apply scale transform)
-            var targetWorldPt = worldPtActive
-            if frame !== activeFrame {
-                if frameScale > 1.0 {
-                    // Child Frame: Translate and Scale UP
-                    targetWorldPt = (worldPtActive - frame.originInParent) * frame.scaleRelativeToParent
-                } else {
-                    // Parent Frame: Scale DOWN and Translate
-                    targetWorldPt = activeFrame.originInParent + (worldPtActive / activeFrame.scaleRelativeToParent)
-                }
-            }
+            // B. Active World -> Card's Frame World (Apply telescope transform)
+            let targetWorldPt = worldPtActive * transform.scale + transform.translation
 
             // C. Card's Frame World -> Card Local (Translate and Rotate)
             let dx = targetWorldPt.x - cardOrigin.x
@@ -1718,6 +3892,9 @@ import simd
             cardLocalPoints.append(CGPoint(x: virtualScreenX, y: virtualScreenY))
         }
 
+        let finalColor = color ?? brushSettings.color
+        let finalDepthWriteEnabled = depthWriteEnabled ?? brushSettings.depthWriteEnabled
+
         // 5. Create the Stroke with Effective Zoom
 	        return Stroke(
 	            screenPoints: cardLocalPoints,   // Virtual screen space (world units * effectiveZoom)
@@ -1725,12 +3902,12 @@ import simd
 	            panAtCreation: .zero,            // We handled position manually
 	            viewSize: .zero,                 // We handled centering manually
 	            rotationAngle: 0,                // We handled rotation manually
-	            color: brushSettings.color,      // Use brush settings color
+	            color: finalColor,               // Use brush settings color unless overridden
 	            baseWidth: brushSettings.size,   // Use brush settings size
 	            zoomEffectiveAtCreation: Float(max(effectiveZoom, 1e-6)),
 	            device: device,                  // Pass device for buffer caching
 	            depthID: depthID,
-	            depthWriteEnabled: brushSettings.depthWriteEnabled
+	            depthWriteEnabled: finalDepthWriteEnabled
 	        )
 	    }
 

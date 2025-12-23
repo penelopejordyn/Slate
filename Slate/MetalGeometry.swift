@@ -47,6 +47,15 @@ struct CardTransform {
     var screenWidth: Float
     var screenHeight: Float
     var rotationAngle: Float
+    var depth: Float
+}
+
+struct CardStyleUniforms {
+    var cardHalfSize: SIMD2<Float>
+    var zoomScale: Float
+    var cornerRadiusPx: Float
+    var shadowBlurPx: Float
+    var shadowOpacity: Float
 }
 
 // MARK: - Geometry / Tessellation

@@ -1,6 +1,7 @@
 // Card.swift defines the Card model, covering metadata, stroke contents, and size/transform state.
 import SwiftUI
 import Metal
+import UIKit
 
 // Configuration for procedural backgrounds
 struct LinedBackgroundConfig {
@@ -27,7 +28,7 @@ struct CardShaderUniforms {
 }
 
 class Card: Identifiable {
-    let id = UUID()
+    let id: UUID
 
     // MARK: - Physical Properties
     // These are stored in the Parent Frame's coordinate space.
@@ -35,6 +36,7 @@ class Card: Identifiable {
     var origin: SIMD2<Double>
     var size: SIMD2<Double>   // Width, Height
     var rotation: Float       // Radians
+    var backgroundColor: SIMD4<Float>
 
     // MARK: - Creation Context
     // The "Scale Factor" - Zoom level when this card was created.
@@ -44,7 +46,13 @@ class Card: Identifiable {
     var creationZoom: Double
 
     // MARK: - Content
-    var type: CardType
+    var type: CardType {
+        didSet {
+            cachedImageSampleColor = nil
+        }
+    }
+
+    private var cachedImageSampleColor: SIMD4<Float>?
 
     // MARK: - Interaction State
     // When true, the card is selected and can be dragged with finger
@@ -61,12 +69,26 @@ class Card: Identifiable {
     // This optimization means we don't have to do math every frame.
     var localVertices: [StrokeVertex] = []
 
-    init(origin: SIMD2<Double>, size: SIMD2<Double>, rotation: Float = 0, zoom: Double, type: CardType) {
+    init(id: UUID = UUID(),
+         origin: SIMD2<Double>,
+         size: SIMD2<Double>,
+         rotation: Float = 0,
+         zoom: Double,
+         type: CardType,
+         backgroundColor: SIMD4<Float>? = nil) {
+        self.id = id
         self.origin = origin
         self.size = size
         self.rotation = rotation
         self.creationZoom = zoom // Store this!
         self.type = type
+        if let backgroundColor = backgroundColor {
+            self.backgroundColor = backgroundColor
+        } else if case .solidColor(let color) = type {
+            self.backgroundColor = color
+        } else {
+            self.backgroundColor = SIMD4<Float>(1, 1, 1, 1)
+        }
 
         // Generate the geometry immediately
         rebuildGeometry()
@@ -100,6 +122,42 @@ class Card: Identifiable {
         // Tri 1: TL -> BL -> TR
         // Tri 2: BL -> BR -> TR
         self.localVertices = [v1, v2, v3, v2, v4, v3]
+    }
+
+    func handleBaseColor() -> SIMD4<Float> {
+        switch type {
+        case .image(let texture):
+            if let cached = cachedImageSampleColor {
+                return cached
+            }
+            if let sample = sampleTextureColor(texture) {
+                cachedImageSampleColor = sample
+                return sample
+            }
+            return backgroundColor
+        default:
+            return backgroundColor
+        }
+    }
+
+    private func sampleTextureColor(_ texture: MTLTexture) -> SIMD4<Float>? {
+        let format = texture.pixelFormat
+        guard format == .bgra8Unorm || format == .bgra8Unorm_srgb else { return nil }
+        guard texture.storageMode != .private else { return nil }
+
+        let x = max(0, texture.width / 2)
+        let y = max(0, texture.height / 2)
+        var pixel = [UInt8](repeating: 0, count: 4)
+        texture.getBytes(&pixel,
+                         bytesPerRow: 4,
+                         from: MTLRegionMake2D(x, y, 1, 1),
+                         mipmapLevel: 0)
+
+        let b = Float(pixel[0]) / 255.0
+        let g = Float(pixel[1]) / 255.0
+        let r = Float(pixel[2]) / 255.0
+        let a = Float(pixel[3]) / 255.0
+        return SIMD4<Float>(r, g, b, a)
     }
 
     // MARK: - Hit Testing
@@ -146,5 +204,72 @@ class Card: Identifiable {
             SIMD2<Float>(-halfW,  halfH), // Bottom-Left
             SIMD2<Float>( halfW,  halfH)  // Bottom-Right
         ]
+    }
+}
+
+// MARK: - Serialization
+extension Card {
+    func toDTO() -> CardDTO {
+        let content: CardContentDTO
+
+        switch type {
+        case .solidColor:
+            content = .solid(color: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w])
+        case .lined(let cfg):
+            content = .lined(spacing: cfg.spacing, lineWidth: cfg.lineWidth, color: [cfg.color.x, cfg.color.y, cfg.color.z, cfg.color.w])
+        case .grid(let cfg):
+            content = .grid(spacing: cfg.spacing, lineWidth: cfg.lineWidth, color: [cfg.color.x, cfg.color.y, cfg.color.z, cfg.color.w])
+        case .image(let texture):
+            if let data = textureToPNGData(texture) {
+                content = .image(pngData: data)
+            } else {
+                content = .solid(color: [1, 0, 1, 1])
+            }
+        case .drawing:
+            content = .solid(color: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w])
+        }
+
+        return CardDTO(
+            id: id,
+            origin: [origin.x, origin.y],
+            size: [size.x, size.y],
+            rotation: rotation,
+            creationZoom: creationZoom,
+            content: content,
+            strokes: strokes.map { $0.toDTO() },
+            backgroundColor: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w]
+        )
+    }
+
+    private func textureToPNGData(_ texture: MTLTexture) -> Data? {
+        let format = texture.pixelFormat
+        guard format == .bgra8Unorm || format == .bgra8Unorm_srgb else { return nil }
+
+        let width = texture.width
+        let height = texture.height
+        let rowBytes = width * 4
+        var bytes = [UInt8](repeating: 0, count: rowBytes * height)
+
+        let region = MTLRegionMake2D(0, 0, width, height)
+        texture.getBytes(&bytes, bytesPerRow: rowBytes, from: region, mipmapLevel: 0)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+            .union(.byteOrder32Little)
+
+        guard let context = CGContext(
+            data: &bytes,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: rowBytes,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo.rawValue
+        ),
+        let cgImage = context.makeImage() else {
+            return nil
+        }
+
+        return UIImage(cgImage: cgImage).pngData()
     }
 }
