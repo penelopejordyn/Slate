@@ -19,10 +19,16 @@ private struct AssociatedKeys {
 private class DragContext {
     let card: Card
     let conversionScale: Double
+    let isResizing: Bool // True if dragging the handle (resize), false if dragging card body (move)
+    let startOrigin: SIMD2<Double>
+    let startSize: SIMD2<Double>
 
-    init(card: Card, conversionScale: Double) {
+    init(card: Card, conversionScale: Double, isResizing: Bool = false) {
         self.card = card
         self.conversionScale = conversionScale
+        self.isResizing = isResizing
+        self.startOrigin = card.origin
+        self.startSize = card.size
     }
 }
 
@@ -68,6 +74,18 @@ class TouchableMTKView: MTKView {
 
     var lastPinchTouchCount: Int = 0
     var lastRotationTouchCount: Int = 0
+    var lassoDragActive: Bool = false
+    var lassoPinchActive: Bool = false
+    var lassoRotationActive: Bool = false
+    var cardPinchActive: Bool = false
+    var cardRotationActive: Bool = false
+    weak var cardPinchTarget: Card?
+    weak var cardRotationTarget: Card?
+
+    // Track lasso operation start state for undo
+    // TODO: Implement lasso undo support
+    // var lassoMoveStartSnapshot: Coordinator.LassoMoveSnapshot?
+    // var lassoTransformStartSnapshot: Coordinator.LassoTransformSnapshot?
 
 
 
@@ -508,6 +526,10 @@ class TouchableMTKView: MTKView {
         let loc = gesture.location(in: self)
         guard let coord = coordinator else { return }
 
+        if coord.handleLassoTap(screenPoint: loc, viewSize: bounds.size) {
+            return
+        }
+
         // Use the new hierarchical hit test to find cards at any depth
         if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size) {
             // Toggle Edit on the card (wherever it lives - parent, active, or child)
@@ -539,11 +561,25 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            lassoDragActive = false
+            if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
+                lassoDragActive = true
+                dragContext = nil
+                // TODO: Capture lasso state for undo
+                return
+            }
             // Hit test hierarchy to find card AND its coordinate scale
             if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size) {
                 if result.card.isEditing {
-                    // Store Card + Scale Factor for cross-depth dragging
-                    dragContext = DragContext(card: result.card, conversionScale: result.conversionScale)
+                    // Get zoom level in the target frame
+                    let zoomInFrame = coord.zoomScale / result.conversionScale
+
+                    // Check if touch is on handle vs card body
+                    // result.pointInFrame is already in the correct frame's coordinates
+                    let isOnHandle = coord.isPointOnCardHandle(result.pointInFrame, card: result.card, zoom: zoomInFrame)
+
+                    // Store Card + Scale Factor + Resize Mode
+                    dragContext = DragContext(card: result.card, conversionScale: result.conversionScale, isResizing: isOnHandle)
                     return
                 }
             }
@@ -552,9 +588,22 @@ class TouchableMTKView: MTKView {
 	        case .changed:
             let translation = gesture.translation(in: self)
 
-            if let context = dragContext {
-                //  DRAG CARD (Cross-Depth Compatible)
+            if lassoDragActive {
+                let dxActive = Double(translation.x) / coord.zoomScale
+                let dyActive = Double(translation.y) / coord.zoomScale
 
+                let ang = Double(coord.rotationAngle)
+                let c = cos(ang)
+                let s = sin(ang)
+                let dxRot = dxActive * c + dyActive * s
+                let dyRot = -dxActive * s + dyActive * c
+
+                coord.translateLassoSelection(by: SIMD2<Double>(dxRot, dyRot))
+                gesture.setTranslation(.zero, in: self)
+                return
+            }
+
+            if let context = dragContext {
                 // 1. Convert Screen Delta -> Active World Delta
                 let dxActive = Double(translation.x) / coord.zoomScale
                 let dyActive = Double(translation.y) / coord.zoomScale
@@ -566,18 +615,61 @@ class TouchableMTKView: MTKView {
                 let dyRot = -dxActive * s + dyActive * c
 
                 // 3. Convert Active Delta -> Target Frame Delta
-                // Use the conversion scale we found during Hit Test!
-                // Parent: Scale < 1.0 (Move slower - parent coords are smaller)
-                // Child: Scale > 1.0 (Move faster - child coords are larger)
-                context.card.origin.x += dxRot * context.conversionScale
-                context.card.origin.y += dyRot * context.conversionScale
+                let frameDelta = SIMD2<Double>(dxRot * context.conversionScale, dyRot * context.conversionScale)
+
+                if context.isResizing {
+                    //  RESIZE CARD (Drag Handle)
+                    // Goal: Bottom-right corner tracks finger exactly, top-left corner stays fixed
+                    // Since the card is centered at origin, changing size by S moves each corner by S/2
+                    // To make corner track finger 1:1, size changes by localDelta, origin by localDelta/2
+
+                    let cardRot = Double(context.card.rotation)
+                    let cardC = cos(cardRot), cardS = sin(cardRot)
+
+                    // Convert frame delta to card-local delta
+                    let localDx = frameDelta.x * cardC + frameDelta.y * cardS
+                    let localDy = -frameDelta.x * cardS + frameDelta.y * cardC
+
+                    // Size changes by the desired corner movement
+                    let newSizeX = max(context.card.size.x + localDx, 10.0)
+                    let newSizeY = max(context.card.size.y + localDy, 10.0)
+
+                    // Calculate actual size change (accounting for minimum size clamping)
+                    let deltaX = newSizeX - context.card.size.x
+                    let deltaY = newSizeY - context.card.size.y
+
+                    // Apply size change
+                    context.card.size.x = newSizeX
+                    context.card.size.y = newSizeY
+
+                    // Origin shifts by half the size change to keep top-left fixed
+                    let originDx = deltaX * 0.5
+                    let originDy = deltaY * 0.5
+
+                    // Convert origin shift to frame coordinates
+                    let originShiftX = originDx * cardC - originDy * cardS
+                    let originShiftY = originDx * cardS + originDy * cardC
+
+                    context.card.origin.x += originShiftX
+                    context.card.origin.y += originShiftY
+
+                    // Update geometry
+                    context.card.rebuildGeometry()
+                } else {
+                    //  DRAG CARD (Move)
+                    // Parent: Scale < 1.0 (Move slower - parent coords are smaller)
+                    // Child: Scale > 1.0 (Move faster - child coords are larger)
+                    context.card.origin.x += frameDelta.x
+                    context.card.origin.y += frameDelta.y
+                }
 
                 gesture.setTranslation(.zero, in: self)
 
             } else {
-                //  PAN CANVAS (Existing Logic)
-                let dx = Double(translation.x) / coord.zoomScale
-                let dy = Double(translation.y) / coord.zoomScale
+                //  PAN CANVAS
+                // panOffset is in screen/pixel space, so we don't divide by zoom
+                let dx = Double(translation.x)
+                let dy = Double(translation.y)
 
                 let ang = Double(coord.rotationAngle)
                 let c = cos(ang), s = sin(ang)
@@ -588,6 +680,28 @@ class TouchableMTKView: MTKView {
             }
 
         case .ended, .cancelled, .failed:
+            // TODO: Record undo action for lasso move
+
+            // Record undo action for card move/resize
+            if let context = dragContext {
+                if context.isResizing {
+                    // Only record if size or origin actually changed
+                    if context.card.size != context.startSize || context.card.origin != context.startOrigin {
+                        coord.pushUndoResizeCard(card: context.card,
+                                                frame: coord.activeFrame,
+                                                oldOrigin: context.startOrigin,
+                                                oldSize: context.startSize)
+                    }
+                } else {
+                    // Only record if origin actually changed
+                    if context.card.origin != context.startOrigin {
+                        coord.pushUndoMoveCard(card: context.card,
+                                              frame: coord.activeFrame,
+                                              oldOrigin: context.startOrigin)
+                    }
+                }
+            }
+            lassoDragActive = false
             dragContext = nil
 
         default:
@@ -602,6 +716,20 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
+                lassoPinchActive = true
+                coord.beginLassoTransformIfNeeded()
+                // TODO: Capture state for undo on first transform operation
+                gesture.scale = 1.0
+                return
+            }
+            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size),
+               result.card.isEditing {
+                cardPinchActive = true
+                cardPinchTarget = result.card
+                gesture.scale = 1.0
+                return
+            }
             // Start of pinch: claim the anchor if nobody owns it yet.
             lastPinchTouchCount = tc
             if activeOwner == .none {
@@ -609,6 +737,18 @@ class TouchableMTKView: MTKView {
             }
 
         case .changed:
+            if lassoPinchActive {
+                coord.updateLassoTransformScale(delta: Double(gesture.scale))
+                gesture.scale = 1.0
+                return
+            }
+            if cardPinchActive, let card = cardPinchTarget {
+                let scale = Double(gesture.scale)
+                card.size = SIMD2<Double>(card.size.x * scale, card.size.y * scale)
+                card.rebuildGeometry()
+                gesture.scale = 1.0
+                return
+            }
             // If finger count changes, re-lock to new centroid WITHOUT moving content.
             if activeOwner == .pinch, tc != lastPinchTouchCount {
                 relockAnchorAtCurrentCentroid(owner: .pinch,
@@ -661,6 +801,19 @@ class TouchableMTKView: MTKView {
             }
 
         case .ended, .cancelled, .failed:
+            if lassoPinchActive {
+                lassoPinchActive = false
+                if !lassoRotationActive {
+                    coord.endLassoTransformIfNeeded()
+                    // TODO: Record undo for lasso transform
+                }
+                return
+            }
+            if cardPinchActive {
+                cardPinchActive = false
+                cardPinchTarget = nil
+                return
+            }
             if activeOwner == .pinch {
                 // If rotation is active, hand off the anchor smoothly.
                 if rotationGesture.state == .changed || rotationGesture.state == .began {
@@ -683,10 +836,35 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
+                lassoRotationActive = true
+                coord.beginLassoTransformIfNeeded()
+                // TODO: Capture state for undo on first transform operation
+                gesture.rotation = 0.0
+                return
+            }
+            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size),
+               result.card.isEditing {
+                cardRotationActive = true
+                cardRotationTarget = result.card
+                gesture.rotation = 0.0
+                return
+            }
             lastRotationTouchCount = tc
             if activeOwner == .none { lockAnchor(owner: .rotation, at: loc, coord: coord) }
 
         case .changed:
+            if lassoRotationActive {
+                coord.updateLassoTransformRotation(delta: Double(gesture.rotation))
+                gesture.rotation = 0.0
+                return
+            }
+            if cardRotationActive, let card = cardRotationTarget {
+                card.rotation += Float(gesture.rotation)
+                card.rebuildGeometry()
+                gesture.rotation = 0.0
+                return
+            }
             // Re-lock when finger count changes to prevent jump.
             if activeOwner == .rotation, tc != lastRotationTouchCount {
                 relockAnchorAtCurrentCentroid(owner: .rotation, screenPt: loc, coord: coord)
@@ -709,6 +887,19 @@ class TouchableMTKView: MTKView {
             if activeOwner == .rotation { anchorScreen = target }
 
         case .ended, .cancelled, .failed:
+            if lassoRotationActive {
+                lassoRotationActive = false
+                if !lassoPinchActive {
+                    coord.endLassoTransformIfNeeded()
+                    // TODO: Record undo for lasso transform
+                }
+                return
+            }
+            if cardRotationActive {
+                cardRotationActive = false
+                cardRotationTarget = nil
+                return
+            }
             if activeOwner == .rotation {
                 if pinchGesture.state == .changed || pinchGesture.state == .began {
                     let ploc = pinchGesture.location(in: self)

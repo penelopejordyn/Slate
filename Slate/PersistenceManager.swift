@@ -50,13 +50,15 @@ final class PersistenceManager {
 
         frame.cards = dto.cards.map { cardDto in
             let type = cardType(from: cardDto.content, device: device)
+            let background = cardBackgroundColor(from: cardDto)
             let card = Card(
                 id: cardDto.id,
                 origin: double2(cardDto.origin),
                 size: double2(cardDto.size),
                 rotation: cardDto.rotation,
                 zoom: cardDto.creationZoom,
-                type: type
+                type: type,
+                backgroundColor: background
             )
             card.strokes = cardDto.strokes.map { Stroke(dto: $0, device: device) }
             return card
@@ -88,6 +90,18 @@ final class PersistenceManager {
                 return .image(texture)
             }
             return .solidColor(SIMD4<Float>(1, 0, 1, 1))
+        }
+    }
+
+    private func cardBackgroundColor(from dto: CardDTO) -> SIMD4<Float> {
+        if let background = dto.backgroundColor {
+            return float4(background)
+        }
+        switch dto.content {
+        case .solid(let color):
+            return float4(color)
+        default:
+            return SIMD4<Float>(1, 1, 1, 1)
         }
     }
 

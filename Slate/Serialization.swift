@@ -45,6 +45,7 @@ struct CardDTO: Codable {
     let creationZoom: Double
     let content: CardContentDTO
     let strokes: [StrokeDTO]
+    let backgroundColor: [Float]?
 }
 
 enum CardContentDTO: Codable {

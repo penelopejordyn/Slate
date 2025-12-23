@@ -36,6 +36,7 @@ class Card: Identifiable {
     var origin: SIMD2<Double>
     var size: SIMD2<Double>   // Width, Height
     var rotation: Float       // Radians
+    var backgroundColor: SIMD4<Float>
 
     // MARK: - Creation Context
     // The "Scale Factor" - Zoom level when this card was created.
@@ -45,7 +46,13 @@ class Card: Identifiable {
     var creationZoom: Double
 
     // MARK: - Content
-    var type: CardType
+    var type: CardType {
+        didSet {
+            cachedImageSampleColor = nil
+        }
+    }
+
+    private var cachedImageSampleColor: SIMD4<Float>?
 
     // MARK: - Interaction State
     // When true, the card is selected and can be dragged with finger
@@ -62,13 +69,26 @@ class Card: Identifiable {
     // This optimization means we don't have to do math every frame.
     var localVertices: [StrokeVertex] = []
 
-    init(id: UUID = UUID(), origin: SIMD2<Double>, size: SIMD2<Double>, rotation: Float = 0, zoom: Double, type: CardType) {
+    init(id: UUID = UUID(),
+         origin: SIMD2<Double>,
+         size: SIMD2<Double>,
+         rotation: Float = 0,
+         zoom: Double,
+         type: CardType,
+         backgroundColor: SIMD4<Float>? = nil) {
         self.id = id
         self.origin = origin
         self.size = size
         self.rotation = rotation
         self.creationZoom = zoom // Store this!
         self.type = type
+        if let backgroundColor = backgroundColor {
+            self.backgroundColor = backgroundColor
+        } else if case .solidColor(let color) = type {
+            self.backgroundColor = color
+        } else {
+            self.backgroundColor = SIMD4<Float>(1, 1, 1, 1)
+        }
 
         // Generate the geometry immediately
         rebuildGeometry()
@@ -102,6 +122,42 @@ class Card: Identifiable {
         // Tri 1: TL -> BL -> TR
         // Tri 2: BL -> BR -> TR
         self.localVertices = [v1, v2, v3, v2, v4, v3]
+    }
+
+    func handleBaseColor() -> SIMD4<Float> {
+        switch type {
+        case .image(let texture):
+            if let cached = cachedImageSampleColor {
+                return cached
+            }
+            if let sample = sampleTextureColor(texture) {
+                cachedImageSampleColor = sample
+                return sample
+            }
+            return backgroundColor
+        default:
+            return backgroundColor
+        }
+    }
+
+    private func sampleTextureColor(_ texture: MTLTexture) -> SIMD4<Float>? {
+        let format = texture.pixelFormat
+        guard format == .bgra8Unorm || format == .bgra8Unorm_srgb else { return nil }
+        guard texture.storageMode != .private else { return nil }
+
+        let x = max(0, texture.width / 2)
+        let y = max(0, texture.height / 2)
+        var pixel = [UInt8](repeating: 0, count: 4)
+        texture.getBytes(&pixel,
+                         bytesPerRow: 4,
+                         from: MTLRegionMake2D(x, y, 1, 1),
+                         mipmapLevel: 0)
+
+        let b = Float(pixel[0]) / 255.0
+        let g = Float(pixel[1]) / 255.0
+        let r = Float(pixel[2]) / 255.0
+        let a = Float(pixel[3]) / 255.0
+        return SIMD4<Float>(r, g, b, a)
     }
 
     // MARK: - Hit Testing
@@ -157,8 +213,8 @@ extension Card {
         let content: CardContentDTO
 
         switch type {
-        case .solidColor(let c):
-            content = .solid(color: [c.x, c.y, c.z, c.w])
+        case .solidColor:
+            content = .solid(color: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w])
         case .lined(let cfg):
             content = .lined(spacing: cfg.spacing, lineWidth: cfg.lineWidth, color: [cfg.color.x, cfg.color.y, cfg.color.z, cfg.color.w])
         case .grid(let cfg):
@@ -170,7 +226,7 @@ extension Card {
                 content = .solid(color: [1, 0, 1, 1])
             }
         case .drawing:
-            content = .solid(color: [1, 1, 1, 1])
+            content = .solid(color: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w])
         }
 
         return CardDTO(
@@ -180,7 +236,8 @@ extension Card {
             rotation: rotation,
             creationZoom: creationZoom,
             content: content,
-            strokes: strokes.map { $0.toDTO() }
+            strokes: strokes.map { $0.toDTO() },
+            backgroundColor: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w]
         )
     }
 

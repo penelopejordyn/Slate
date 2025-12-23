@@ -134,6 +134,51 @@ struct ContentView: View {
                             .background(.ultraThinMaterial)
                             .cornerRadius(12)
                         }
+
+                        Button(action: {
+                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isLasso ? .paint : .lasso
+                        }) {
+                            VStack(spacing: 2) {
+                                Image(systemName: "lasso")
+                                    .font(.system(size: 20))
+                                Text("Lasso")
+                                    .font(.caption)
+                            }
+                            .foregroundColor(coordinator.brushSettings.isLasso ? .cyan : .white)
+                            .padding(8)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(12)
+                        }
+
+                        Button(action: {
+                            coordinator.undo()
+                        }) {
+                            VStack(spacing: 2) {
+                                Image(systemName: "arrow.uturn.backward")
+                                    .font(.system(size: 20))
+                                Text("Undo")
+                                    .font(.caption)
+                            }
+                            .foregroundColor(.white)
+                            .padding(8)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(12)
+                        }
+
+                        Button(action: {
+                            coordinator.redo()
+                        }) {
+                            VStack(spacing: 2) {
+                                Image(systemName: "arrow.uturn.forward")
+                                    .font(.system(size: 20))
+                                Text("Redo")
+                                    .font(.caption)
+                            }
+                            .foregroundColor(.white)
+                            .padding(8)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(12)
+                        }
                     }
                 }
 

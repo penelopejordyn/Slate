@@ -9,6 +9,7 @@ class BrushSettings: ObservableObject {
         case paint
         case maskEraser
         case strokeEraser
+        case lasso
     }
 
     @Published var size: Double = 10.0  // Stroke width in world units (1-100)
@@ -22,4 +23,5 @@ class BrushSettings: ObservableObject {
 
     var isMaskEraser: Bool { toolMode == .maskEraser }
     var isStrokeEraser: Bool { toolMode == .strokeEraser }
+    var isLasso: Bool { toolMode == .lasso }
 }

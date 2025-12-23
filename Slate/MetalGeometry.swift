@@ -50,6 +50,14 @@ struct CardTransform {
     var depth: Float
 }
 
+struct CardStyleUniforms {
+    var cardHalfSize: SIMD2<Float>
+    var zoomScale: Float
+    var cornerRadiusPx: Float
+    var shadowBlurPx: Float
+    var shadowOpacity: Float
+}
+
 // MARK: - Geometry / Tessellation
 
 /// Convert a world (canvas pixel) point to NDC, applying pan/zoom.
