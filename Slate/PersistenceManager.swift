@@ -58,7 +58,9 @@ final class PersistenceManager {
                 rotation: cardDto.rotation,
                 zoom: cardDto.creationZoom,
                 type: type,
-                backgroundColor: background
+                backgroundColor: background,
+                opacity: cardDto.opacity ?? 1.0,
+                isLocked: cardDto.isLocked ?? false
             )
             card.strokes = cardDto.strokes.map { Stroke(dto: $0, device: device) }
             return card

@@ -5,15 +5,23 @@ import UIKit
 
 struct CardSettingsView: View {
     let card: Card // Reference class, so modifying it updates Metal immediately
+    let onDelete: (() -> Void)?
 
     @State private var selectedTab = 0
     @State private var spacing: Float = 25.0
     @State private var lineWidth: Float = 1.0
     @State private var backgroundColor: Color = .white
     @State private var lineColor: Color = Color(.sRGB, red: 0.7, green: 0.8, blue: 1.0, opacity: 0.5)
+    @State private var cardOpacity: Float = 1.0
+    @State private var isLocked: Bool = false
     @State private var showImagePicker = false
     @State private var uiImage: UIImage?
     @Environment(\.dismiss) var dismiss
+
+    init(card: Card, onDelete: (() -> Void)? = nil) {
+        self.card = card
+        self.onDelete = onDelete
+    }
 
     private var backgroundBinding: Binding<Color> {
         Binding(
@@ -37,100 +45,146 @@ struct CardSettingsView: View {
 
     var body: some View {
         NavigationView {
-            VStack(spacing: 20) {
-                // Type Picker
-                Picker("Background Type", selection: $selectedTab) {
-                    Text("Solid").tag(0)
-                    Text("Lined").tag(1)
-                    Text("Grid").tag(2)
-                    Text("Image").tag(3)
-                }
-                .pickerStyle(.segmented)
-                .padding()
-                .onChange(of: selectedTab) { _, newValue in
-                    updateCardType(for: newValue)
-                }
+            ScrollView {
+                VStack(spacing: 20) {
+                    // Type Picker
+                    Picker("Background Type", selection: $selectedTab) {
+                        Text("Solid").tag(0)
+                        Text("Lined").tag(1)
+                        Text("Grid").tag(2)
+                        Text("Image").tag(3)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding()
+                    .onChange(of: selectedTab) { _, newValue in
+                        updateCardType(for: newValue)
+                    }
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Background Color")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                    ColorPicker("Background Color", selection: backgroundBinding, supportsOpacity: false)
-                        .font(.subheadline)
-                }
-                .padding(.horizontal)
-
-                // Settings for selected type
-                if selectedTab == 1 || selectedTab == 2 {
-                    // Lined or Grid settings
-                    VStack(alignment: .leading, spacing: 16) {
-                        // Line Spacing Slider
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Line Spacing: \(Int(spacing)) pt")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                            Slider(value: $spacing, in: 10...100, step: 5)
-                                .onChange(of: spacing) {
-                                    updateCardType(for: selectedTab)
-                                }
-                        }
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Line Color")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                            ColorPicker("Line Color", selection: lineColorBinding, supportsOpacity: true)
-                                .font(.subheadline)
-                        }
-
-                        // Line Width Slider
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Line Width: \(String(format: "%.1f", lineWidth)) pt")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                            Slider(value: $lineWidth, in: 0.5...5.0, step: 0.5)
-                                .onChange(of: lineWidth) {
-                                    updateCardType(for: selectedTab)
-                                }
-                        }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Background Color")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        ColorPicker("Background Color", selection: backgroundBinding, supportsOpacity: false)
+                            .font(.subheadline)
                     }
                     .padding(.horizontal)
 
-                } else if selectedTab == 0 {
-                    // Solid color settings
-                    Text("Solid color background")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                        .padding()
-
-                } else if selectedTab == 3 {
-                    // Image settings
-                    VStack(spacing: 16) {
-                        Button(action: {
-                            showImagePicker = true
-                        }) {
-                            HStack {
-                                Image(systemName: "photo.on.rectangle")
-                                Text("Select Image")
+                    // Opacity Slider (appears on all tabs)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Opacity: \(Int(cardOpacity * 100))%")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        Slider(value: $cardOpacity, in: 0.0...1.0, step: 0.05)
+                            .onChange(of: cardOpacity) { _, newValue in
+                                card.opacity = newValue
                             }
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .padding()
-                            .frame(maxWidth: .infinity)
-                            .background(Color.blue)
-                            .cornerRadius(12)
+                    }
+                    .padding(.horizontal)
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle(isOn: Binding(
+                            get: { isLocked },
+                            set: { newValue in
+                                isLocked = newValue
+                                card.isLocked = newValue
+                                if newValue {
+                                    card.isEditing = false
+                                }
+                            }
+                        )) {
+                            HStack(spacing: 8) {
+                                Image(systemName: isLocked ? "lock.fill" : "lock.open")
+                                Text("Lock Card")
+                            }
+                            .font(.subheadline)
                         }
 
-                        if case .image = card.type {
-                            Text("Image loaded")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
+                        Button(role: .destructive) {
+                            onDelete?()
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "trash")
+                                Text("Delete Card")
+                            }
+                            .font(.subheadline)
                         }
                     }
                     .padding(.horizontal)
-                }
 
-                Spacer()
+                    // Settings for selected type
+                    if selectedTab == 1 || selectedTab == 2 {
+                        // Lined or Grid settings
+                        VStack(alignment: .leading, spacing: 16) {
+                            // Line Spacing Slider
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Line Spacing: \(Int(spacing)) pt")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                                Slider(value: $spacing, in: 10...100, step: 5)
+                                    .onChange(of: spacing) {
+                                        updateCardType(for: selectedTab)
+                                    }
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Line Color")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                                ColorPicker("Line Color", selection: lineColorBinding, supportsOpacity: true)
+                                    .font(.subheadline)
+                            }
+
+                            // Line Width Slider
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Line Width: \(String(format: "%.1f", lineWidth)) pt")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                                Slider(value: $lineWidth, in: 0.5...5.0, step: 0.5)
+                                    .onChange(of: lineWidth) {
+                                        updateCardType(for: selectedTab)
+                                    }
+                            }
+                        }
+                        .padding(.horizontal)
+
+                    } else if selectedTab == 0 {
+                        // Solid color settings
+                        Text("Solid color background")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .padding()
+
+                    } else if selectedTab == 3 {
+                        // Image settings
+                        VStack(spacing: 16) {
+                            Button(action: {
+                                showImagePicker = true
+                            }) {
+                                HStack {
+                                    Image(systemName: "photo.on.rectangle")
+                                    Text("Select Image")
+                                }
+                                .font(.headline)
+                                .foregroundColor(.white)
+                                .padding()
+                                .frame(maxWidth: .infinity)
+                                .background(Color.blue)
+                                .cornerRadius(12)
+                            }
+
+                            if case .image = card.type {
+                                Text("Image loaded")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(.horizontal)
+                    }
+
+                    Spacer(minLength: 20)
+                }
+                .padding(.vertical, 12)
             }
             .navigationTitle("Card Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -165,8 +219,10 @@ struct CardSettingsView: View {
             }
         }
         .onAppear {
-            // Initialize state from current card type
+            // Initialize state from current card
             backgroundColor = colorFromSIMD(card.backgroundColor)
+            cardOpacity = card.opacity
+            isLocked = card.isLocked
             switch card.type {
             case .solidColor:
                 selectedTab = 0

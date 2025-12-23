@@ -358,6 +358,7 @@ struct CardStyleUniforms {
     float cornerRadiusPx;
     float shadowBlurPx;
     float shadowOpacity;
+    float cardOpacity;  // Overall card opacity (0.0 - 1.0)
 };
 
 /// Vertex input structure for cards - matches Swift's StrokeVertex
@@ -427,7 +428,8 @@ inline float4 applyCardMask(float4 baseColor,
         discard_fragment();
     }
 
-    return float4(baseColor.rgb, baseColor.a * edgeAlpha);
+    // Apply both edge alpha and card opacity
+    return float4(baseColor.rgb, baseColor.a * edgeAlpha * style.cardOpacity);
 }
 
 /// Fragment shader for solid color cards - no texture required

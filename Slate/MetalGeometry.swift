@@ -56,6 +56,7 @@ struct CardStyleUniforms {
     var cornerRadiusPx: Float
     var shadowBlurPx: Float
     var shadowOpacity: Float
+    var cardOpacity: Float  // Overall card opacity (0.0 - 1.0)
 }
 
 // MARK: - Geometry / Tessellation

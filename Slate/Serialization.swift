@@ -46,6 +46,8 @@ struct CardDTO: Codable {
     let content: CardContentDTO
     let strokes: [StrokeDTO]
     let backgroundColor: [Float]?
+    let opacity: Float?
+    let isLocked: Bool?
 }
 
 enum CardContentDTO: Codable {

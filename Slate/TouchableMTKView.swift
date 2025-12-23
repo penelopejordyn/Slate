@@ -531,7 +531,7 @@ class TouchableMTKView: MTKView {
         }
 
         // Use the new hierarchical hit test to find cards at any depth
-        if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size) {
+        if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true) {
             // Toggle Edit on the card (wherever it lives - parent, active, or child)
             result.card.isEditing.toggle()
             return
@@ -569,8 +569,8 @@ class TouchableMTKView: MTKView {
                 return
             }
             // Hit test hierarchy to find card AND its coordinate scale
-            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size) {
-                if result.card.isEditing {
+            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true) {
+                if result.card.isEditing, !result.card.isLocked {
                     // Get zoom level in the target frame
                     let zoomInFrame = coord.zoomScale / result.conversionScale
 
@@ -723,8 +723,9 @@ class TouchableMTKView: MTKView {
                 gesture.scale = 1.0
                 return
             }
-            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size),
-               result.card.isEditing {
+            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true),
+               result.card.isEditing,
+               !result.card.isLocked {
                 cardPinchActive = true
                 cardPinchTarget = result.card
                 gesture.scale = 1.0
@@ -843,8 +844,9 @@ class TouchableMTKView: MTKView {
                 gesture.rotation = 0.0
                 return
             }
-            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size),
-               result.card.isEditing {
+            if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true),
+               result.card.isEditing,
+               !result.card.isLocked {
                 cardRotationActive = true
                 cardRotationTarget = result.card
                 gesture.rotation = 0.0

@@ -37,6 +37,7 @@ class Card: Identifiable {
     var size: SIMD2<Double>   // Width, Height
     var rotation: Float       // Radians
     var backgroundColor: SIMD4<Float>
+    var opacity: Float = 1.0  // Card opacity (0.0 - 1.0), applied to entire card including strokes
 
     // MARK: - Creation Context
     // The "Scale Factor" - Zoom level when this card was created.
@@ -58,6 +59,7 @@ class Card: Identifiable {
     // When true, the card is selected and can be dragged with finger
     // When false, finger touches pass through to canvas pan
     var isEditing: Bool = false
+    var isLocked: Bool = false
 
     // MARK: - Card-Local Strokes
     // Strokes drawn on this card are stored relative to the card's center (0,0)
@@ -75,13 +77,17 @@ class Card: Identifiable {
          rotation: Float = 0,
          zoom: Double,
          type: CardType,
-         backgroundColor: SIMD4<Float>? = nil) {
+         backgroundColor: SIMD4<Float>? = nil,
+         opacity: Float = 1.0,
+         isLocked: Bool = false) {
         self.id = id
         self.origin = origin
         self.size = size
         self.rotation = rotation
         self.creationZoom = zoom // Store this!
         self.type = type
+        self.opacity = opacity
+        self.isLocked = isLocked
         if let backgroundColor = backgroundColor {
             self.backgroundColor = backgroundColor
         } else if case .solidColor(let color) = type {
@@ -237,7 +243,9 @@ extension Card {
             creationZoom: creationZoom,
             content: content,
             strokes: strokes.map { $0.toDTO() },
-            backgroundColor: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w]
+            backgroundColor: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w],
+            opacity: opacity,
+            isLocked: isLocked
         )
     }
 

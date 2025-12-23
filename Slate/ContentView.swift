@@ -1,5 +1,6 @@
 // ContentView.swift wires the SwiftUI interface, hosting the toolbar and MetalView canvas binding.
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -193,7 +194,11 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettingsSheet) {
             if let card = editingCard {
-                CardSettingsView(card: card)
+                CardSettingsView(card: card, onDelete: {
+                    metalViewCoordinator?.deleteCard(card)
+                    editingCard = nil
+                    showSettingsSheet = false
+                })
                     .presentationDetents([.medium])
             }
         }
@@ -232,7 +237,7 @@ struct StrokeSizeSlider: View {
     private var strokeColor: Binding<Color> {
         Binding(
             get: {
-                Color(
+                Color(.sRGB,
                     red: Double(brushSettings.color.x),
                     green: Double(brushSettings.color.y),
                     blue: Double(brushSettings.color.z),
@@ -241,16 +246,21 @@ struct StrokeSizeSlider: View {
             },
             set: { newColor in
                 // Convert SwiftUI Color back to SIMD4<Float>
-                if let components = newColor.cgColor?.components, components.count >= 3 {
-                    brushSettings.color = SIMD4<Float>(
-                        Float(components[0]),
-                        Float(components[1]),
-                        Float(components[2]),
-                        components.count >= 4 ? Float(components[3]) : 1.0
-                    )
+                if let rgba = sRGBComponents(from: newColor) {
+                    brushSettings.color = rgba
                 }
             }
         )
+    }
+
+    private func sRGBComponents(from color: Color) -> SIMD4<Float>? {
+        let uiColor = UIColor(color)
+        var r: CGFloat = 1
+        var g: CGFloat = 1
+        var b: CGFloat = 1
+        var a: CGFloat = 1
+        guard uiColor.getRed(&r, green: &g, blue: &b, alpha: &a) else { return nil }
+        return SIMD4<Float>(Float(r), Float(g), Float(b), Float(a))
     }
 
     var body: some View {
@@ -307,6 +317,21 @@ struct StrokeSizeSlider: View {
                 )
                 .tint(.white)
             }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+
+            // Constant Screen Size Toggle
+            Toggle(isOn: $brushSettings.constantScreenSize) {
+                HStack(spacing: 8) {
+                    Image(systemName: brushSettings.constantScreenSize ? "pencil.tip" : "pencil.tip.crop.circle")
+                        .font(.system(size: 14))
+                        .foregroundColor(.white)
+                    Text(brushSettings.constantScreenSize ? "Fixed Screen Size" : "Scales with Zoom")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(.white)
+                }
+            }
+            .toggleStyle(SwitchToggleStyle(tint: .blue))
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
         }

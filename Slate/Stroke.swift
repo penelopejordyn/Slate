@@ -88,7 +88,8 @@ class Stroke: Identifiable {
                      zoomEffectiveAtCreation: Float,
                      device: MTLDevice?,
                      depthID: UInt32,
-                     depthWriteEnabled: Bool = true) {
+                     depthWriteEnabled: Bool = true,
+                     constantScreenSize: Bool = true) {
         let safeZoom = max(zoomAtCreation, 1e-6)
         let effectiveZoom = max(zoomEffectiveAtCreation, 1e-6)
 
@@ -158,8 +159,10 @@ class Stroke: Identifiable {
             centerPoints = downsampled
         }
 
-        // 3. World width is the base width divided by zoom
-        let worldWidth = baseWidth / zoom
+        // 3. World width calculation
+        // If constantScreenSize is true, divide by zoom so stroke appears same size on screen
+        // If false, scale from screen width by the effective zoom
+        let worldWidth = constantScreenSize ? (baseWidth / zoom) : ((baseWidth / zoom) * Double(effectiveZoom))
 
         // 4. Build segment instances
         let builtSegments = Stroke.buildSegments(from: centerPoints, color: color)

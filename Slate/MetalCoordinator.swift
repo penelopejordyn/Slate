@@ -728,7 +728,8 @@ import simd
                 zoomScale: Float(currentZoom),
                 cornerRadiusPx: cardCornerRadiusPx,
                 shadowBlurPx: cardShadowBlurPx,
-                shadowOpacity: cardShadowOpacity
+                shadowOpacity: cardShadowOpacity,
+                cardOpacity: card.opacity
             )
 
             // B. Handle Rotation
@@ -986,7 +987,15 @@ import simd
 
             // E. Draw Resize Handles (If Selected) 
             // Handles should not be affected by stencil
-            if card.isEditing {
+            if card.isLocked {
+                drawCardLockIcon(card: card,
+                                 cameraCenter: cameraCenterInThisFrame,
+                                 viewSize: viewSize,
+                                 zoom: currentZoom,
+                                 rotation: currentRotation,
+                                 encoder: encoder)
+            }
+            if card.isEditing && !card.isLocked {
                 encoder.setDepthStencilState(stencilStateDefault) // Disable stencil for handles
                 drawCardHandles(card: card,
                                 cameraCenter: cameraCenterInThisFrame,
@@ -1165,7 +1174,13 @@ import simd
                 Float((dx * s + dy * c) * zoom)
             )
 
-            let halfPixelWidth = max(Float(brushSettings.size) * 0.5, 0.5)
+            let basePixelWidth: Float
+            if brushSettings.constantScreenSize {
+                basePixelWidth = Float(brushSettings.size)
+            } else {
+                basePixelWidth = Float(brushSettings.size) * Float(zoom)
+            }
+            let halfPixelWidth = max(basePixelWidth * 0.5, 0.5)
 
             // Canvas live stroke depth: use peek for current drawing stroke
             let canvasLiveStrokeDepth = strokeDepth(for: peekStrokeDepthID())
@@ -1219,7 +1234,8 @@ import simd
                 zoomScale: Float(zoomInTarget),
                 cornerRadiusPx: cardCornerRadiusPx,
                 shadowBlurPx: cardShadowBlurPx,
-                shadowOpacity: cardShadowOpacity
+                shadowOpacity: cardShadowOpacity,
+                cardOpacity: card.opacity
             )
 
             var cardTransform = CardTransform(
@@ -1551,6 +1567,123 @@ import simd
                     drawSegment(arc[i], arc[i + 1], handleThicknessPx * 0.5)
                 }
             }
+        }
+    }
+
+    func drawCardLockIcon(card: Card,
+                          cameraCenter: SIMD2<Double>,
+                          viewSize: CGSize,
+                          zoom: Double,
+                          rotation: Float,
+                          encoder: MTLRenderCommandEncoder) {
+        guard zoom.isFinite, zoom > 0 else { return }
+
+        let iconWidthPx: Double = 18.0
+        let iconHeightPx: Double = 20.0
+        let paddingPx: Double = 8.0
+        let strokePx: Float = 2.0
+        let shackleInsetPx: Double = 4.0
+        let shackleHeightPx: Double = 7.0
+
+        let iconWidthWorld = iconWidthPx / zoom
+        let iconHeightWorld = iconHeightPx / zoom
+        let paddingWorld = paddingPx / zoom
+
+        let minWidth = iconWidthWorld + paddingWorld * 2.0
+        let minHeight = iconHeightWorld + paddingWorld * 2.0
+        guard card.size.x > minWidth, card.size.y > minHeight else { return }
+
+        let halfW = card.size.x * 0.5
+        let halfH = card.size.y * 0.5
+
+        let right = halfW - paddingWorld
+        let left = right - iconWidthWorld
+        let top = -halfH + paddingWorld
+        let bottom = top + iconHeightWorld
+
+        let shackleInsetWorld = shackleInsetPx / zoom
+        let shackleHeightWorld = shackleHeightPx / zoom
+        let shackleLeft = left + shackleInsetWorld
+        let shackleRight = right - shackleInsetWorld
+        let shackleBottom = top + shackleHeightWorld
+
+        struct LockSegment {
+            let p0: SIMD2<Double>
+            let p1: SIMD2<Double>
+        }
+
+        let segments: [LockSegment] = [
+            // Shackle
+            LockSegment(p0: SIMD2<Double>(shackleLeft, top),
+                        p1: SIMD2<Double>(shackleRight, top)),
+            LockSegment(p0: SIMD2<Double>(shackleLeft, top),
+                        p1: SIMD2<Double>(shackleLeft, shackleBottom)),
+            LockSegment(p0: SIMD2<Double>(shackleRight, top),
+                        p1: SIMD2<Double>(shackleRight, shackleBottom)),
+
+            // Body
+            LockSegment(p0: SIMD2<Double>(left, shackleBottom),
+                        p1: SIMD2<Double>(right, shackleBottom)),
+            LockSegment(p0: SIMD2<Double>(left, shackleBottom),
+                        p1: SIMD2<Double>(left, bottom)),
+            LockSegment(p0: SIMD2<Double>(right, shackleBottom),
+                        p1: SIMD2<Double>(right, bottom)),
+            LockSegment(p0: SIMD2<Double>(left, bottom),
+                        p1: SIMD2<Double>(right, bottom))
+        ]
+
+        let iconColor = cardHandleColor(for: card)
+        let angle = Double(rotation)
+        let c = cos(angle)
+        let s = sin(angle)
+
+        encoder.setRenderPipelineState(strokeSegmentPipelineState)
+        encoder.setDepthStencilState(stencilStateDefault)
+        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
+
+        let drawSegment: (SIMD2<Double>, SIMD2<Double>) -> Void = { p0Local, p1Local in
+            let p0Frame = self.cardLocalToFramePoint(p0Local, card: card)
+            let p1Frame = self.cardLocalToFramePoint(p1Local, card: card)
+            let origin = SIMD2<Double>((p0Frame.x + p1Frame.x) * 0.5,
+                                       (p0Frame.y + p1Frame.y) * 0.5)
+
+            let localP0 = SIMD2<Float>(Float(p0Frame.x - origin.x),
+                                       Float(p0Frame.y - origin.y))
+            let localP1 = SIMD2<Float>(Float(p1Frame.x - origin.x),
+                                       Float(p1Frame.y - origin.y))
+
+            var segmentInstance = StrokeSegmentInstance(p0: localP0, p1: localP1, color: iconColor)
+            guard let segmentBuffer = self.device.makeBuffer(bytes: &segmentInstance,
+                                                             length: MemoryLayout<StrokeSegmentInstance>.stride,
+                                                             options: .storageModeShared) else { return }
+
+            let dx = origin.x - cameraCenter.x
+            let dy = origin.y - cameraCenter.y
+            let rotatedOffsetScreen = SIMD2<Float>(
+                Float((dx * c - dy * s) * zoom),
+                Float((dx * s + dy * c) * zoom)
+            )
+
+            var transform = StrokeTransform(
+                relativeOffset: .zero,
+                rotatedOffsetScreen: rotatedOffsetScreen,
+                zoomScale: Float(zoom),
+                screenWidth: Float(viewSize.width),
+                screenHeight: Float(viewSize.height),
+                rotationAngle: rotation,
+                halfPixelWidth: strokePx * 0.5,
+                featherPx: 1.0,
+                depth: 0.0
+            )
+
+            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: 1)
+        }
+
+        for segment in segments {
+            drawSegment(segment.p0, segment.p1)
         }
     }
 
@@ -2226,6 +2359,7 @@ import simd
         }
 
         for cardSelection in selection.cards {
+            if cardSelection.card.isLocked { continue }
             guard let transform = transformFromActive(to: cardSelection.frame) else { continue }
             let deltaFrame = SIMD2<Double>(delta.x * transform.scale, delta.y * transform.scale)
             cardSelection.card.origin.x += deltaFrame.x
@@ -2233,6 +2367,7 @@ import simd
         }
 
         for cardStrokeSelection in selection.cardStrokes {
+            if cardStrokeSelection.card.isLocked { continue }
             guard let transform = transformFromActive(to: cardStrokeSelection.frame) else { continue }
             let deltaFrame = SIMD2<Double>(delta.x * transform.scale, delta.y * transform.scale)
             let c = cos(Double(-cardStrokeSelection.card.rotation))
@@ -2313,6 +2448,7 @@ import simd
         }
 
         for cardSelection in selection.cards {
+            if cardSelection.card.isLocked { continue }
             guard let transform = transformFromActive(to: cardSelection.frame) else { continue }
             let invScale = transform.scale != 0 ? (1.0 / transform.scale) : 1.0
             let originActive = SIMD2<Double>(
@@ -2332,6 +2468,7 @@ import simd
         }
 
         for cardStrokeSelection in selection.cardStrokes {
+            if cardStrokeSelection.card.isLocked { continue }
             guard let transform = transformFromActive(to: cardStrokeSelection.frame) else { continue }
             let invScale = transform.scale != 0 ? (1.0 / transform.scale) : 1.0
             let cardOrigin = cardStrokeSelection.card.origin
@@ -2473,6 +2610,7 @@ import simd
         }
 
         for cardSnapshot in state.baseCards {
+            if cardSnapshot.card.isLocked { continue }
             let transformedOriginActive = transformPoint(cardSnapshot.originActive)
             let originFrame = SIMD2<Double>(
                 transformedOriginActive.x * cardSnapshot.frameScale + cardSnapshot.frameTranslation.x,
@@ -2489,6 +2627,7 @@ import simd
         }
 
         for snapshot in state.baseCardStrokes {
+            if snapshot.card.isLocked { continue }
             guard snapshot.index < snapshot.card.strokes.count else { continue }
 
             let transformedActivePoints = snapshot.activePoints.map(transformPoint)
@@ -2937,7 +3076,7 @@ import simd
 
         if brushSettings.isLasso {
             clearLassoSelection()
-            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size, ignoringLocked: true) {
                 lassoTarget = .card(card, frame)
             } else {
                 lassoTarget = .canvas
@@ -2966,7 +3105,7 @@ import simd
         }
 
         if brushSettings.isMaskEraser {
-            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size, ignoringLocked: true) {
                 // If we're over a card, always target that card's strokes.
                 currentDrawingTarget = .card(card, frame)
                 liveStrokeOrigin = screenToWorldPixels_PureDouble(
@@ -3003,7 +3142,7 @@ import simd
             }
         } else {
             // USE HIERARCHICAL CARD HIT TEST
-            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size) {
+            if let (card, frame, _, _) = hitTestHierarchy(screenPoint: point, viewSize: view.bounds.size, ignoringLocked: true) {
                 // Found a card (in active, parent, or child frame)
                 // Store BOTH the card AND the frame it belongs to for correct coordinate transforms
                 currentDrawingTarget = .card(card, frame)
@@ -3131,12 +3270,17 @@ import simd
             let bounds = polygonBounds(closedPoints)
             let center = SIMD2<Double>(Double(bounds.midX), Double(bounds.midY))
 
-            switch lassoTarget {
-            case .card(let card, let frame):
-                guard let transform = transformFromActive(to: frame) else {
-                    clearLassoSelection()
-                    return
-                }
+        switch lassoTarget {
+        case .card(let card, let frame):
+            guard !card.isLocked else {
+                clearLassoSelection()
+                lassoTarget = nil
+                return
+            }
+            guard let transform = transformFromActive(to: frame) else {
+                clearLassoSelection()
+                return
+            }
 
                 let polygonInCard = closedPoints.map { activePoint in
                     let framePoint = SIMD2<Double>(
@@ -3174,7 +3318,7 @@ import simd
                         selections.append(LassoFrameSelection(frame: frame, strokeIDs: selectedIDs))
                     }
 
-                    for card in frame.cards {
+                    for card in frame.cards where !card.isLocked {
                         if polygonIntersectsCard(closedPoints, card: card, transform: transform) {
                             cardSelections.append(LassoCardSelection(card: card, frame: frame))
                         }
@@ -3290,7 +3434,8 @@ import simd
 	                                    zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
 	                                    device: device,
 	                                    depthID: allocateStrokeDepthID(),
-	                                    depthWriteEnabled: strokeDepthWriteEnabled)
+	                                    depthWriteEnabled: strokeDepthWriteEnabled,
+	                                    constantScreenSize: brushSettings.constantScreenSize)
 	                frame.strokes.append(stroke)
 	                pushUndo(.drawStroke(stroke: stroke, target: target))
             } else {
@@ -3506,6 +3651,7 @@ import simd
                                    pointInFrame: SIMD2<Double>,
                                    eraserRadius: Double,
                                    minimumDepthID: UInt32? = nil) -> Stroke? {
+        guard !card.isLocked else { return nil }
         guard !card.strokes.isEmpty else { return nil }
         guard card.hitTest(pointInFrame: pointInFrame) else { return nil }
 
@@ -3570,6 +3716,7 @@ import simd
             guard !frame.cards.isEmpty else { return }
 
             for card in frame.cards.reversed() {
+                if card.isLocked { continue }
                 guard let newest = card.strokes.last?.depthID else { continue }
                 if let best = bestDepthID, newest <= best {
                     continue
@@ -3621,7 +3768,7 @@ import simd
 
     private func eraseStrokeAtPoint(screenPoint: CGPoint, viewSize: CGSize) {
         // Cards sit on top of the canvas; when covered, only card strokes are eligible.
-        if let (card, frame, conversionScale, _) = hitTestHierarchy(screenPoint: screenPoint, viewSize: viewSize) {
+        if let (card, frame, conversionScale, _) = hitTestHierarchy(screenPoint: screenPoint, viewSize: viewSize, ignoringLocked: true) {
             guard let pointInTargetFrame = pointInFrame(screenPoint: screenPoint,
                                                         viewSize: viewSize,
                                                         frame: frame) else { return }
@@ -3662,7 +3809,9 @@ import simd
     ///   - Parent cards: scale < 1.0 (move slower - parent coords are smaller)
     ///   - Active cards: scale = 1.0 (normal movement)
     ///   - Child cards: scale > 1.0 (move faster - child coords are larger)
-    func hitTestHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> (card: Card, frame: Frame, conversionScale: Double, pointInFrame: SIMD2<Double>)? {
+    func hitTestHierarchy(screenPoint: CGPoint,
+                          viewSize: CGSize,
+                          ignoringLocked: Bool = false) -> (card: Card, frame: Frame, conversionScale: Double, pointInFrame: SIMD2<Double>)? {
 
         // 1. Calculate Point in Active Frame (World Space)
         let pointActive = screenToWorldPixels_PureDouble(
@@ -3678,6 +3827,7 @@ import simd
         // --- CHECK 1: DESCENDANTS (Foreground - Top Priority) ---
         for descendant in transforms.descendants.reversed() {
             for card in descendant.frame.cards.reversed() {
+                if ignoringLocked, card.isLocked { continue }
                 if card.hitTest(pointInFrame: descendant.point) {
                     return (card, descendant.frame, descendant.scale, descendant.point)
                 }
@@ -3686,6 +3836,7 @@ import simd
 
         // --- CHECK 2: ACTIVE FRAME (Middle) ---
         for card in activeFrame.cards.reversed() {
+            if ignoringLocked, card.isLocked { continue }
             if card.hitTest(pointInFrame: pointActive) {
                 return (card, activeFrame, 1.0, pointActive)
             }
@@ -3694,6 +3845,7 @@ import simd
         // --- CHECK 3: ANCESTORS (Background) ---
         for ancestor in transforms.ancestors {
             for card in ancestor.frame.cards.reversed() {
+                if ignoringLocked, card.isLocked { continue }
                 if card.hitTest(pointInFrame: ancestor.point) {
                     return (card, ancestor.frame, ancestor.scale, ancestor.point)
                 }
@@ -3713,6 +3865,31 @@ import simd
             // Found a card! Notify SwiftUI
             onEditCard?(card)
         }
+    }
+
+    func deleteCard(_ card: Card) {
+        guard let frame = findFrame(containing: card, in: rootFrame),
+              let index = frame.cards.firstIndex(where: { $0 === card }) else { return }
+
+        frame.cards.remove(at: index)
+        card.isEditing = false
+        clearLassoSelection()
+
+        if case .card(let targetCard, _) = currentDrawingTarget, targetCard === card {
+            currentDrawingTarget = nil
+        }
+    }
+
+    private func findFrame(containing card: Card, in frame: Frame) -> Frame? {
+        if frame.cards.contains(where: { $0 === card }) {
+            return frame
+        }
+        for child in frame.children {
+            if let found = findFrame(containing: card, in: child) {
+                return found
+            }
+        }
+        return nil
     }
 
     /// Add a new card to the canvas at the camera center
@@ -3774,7 +3951,8 @@ import simd
                 zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
                 device: device,
                 depthID: depthID,
-                depthWriteEnabled: depthWriteEnabled ?? brushSettings.depthWriteEnabled
+                depthWriteEnabled: depthWriteEnabled ?? brushSettings.depthWriteEnabled,
+                constantScreenSize: brushSettings.constantScreenSize
             )
         }
 
@@ -3809,7 +3987,8 @@ import simd
             zoomEffectiveAtCreation: Float(effectiveZoom),
             device: device,
             depthID: depthID,
-            depthWriteEnabled: finalDepthWriteEnabled
+            depthWriteEnabled: finalDepthWriteEnabled,
+            constantScreenSize: brushSettings.constantScreenSize
         )
     }
 
@@ -3853,7 +4032,8 @@ import simd
                 zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
                 device: device,
                 depthID: depthID,
-                depthWriteEnabled: depthWriteEnabled ?? brushSettings.depthWriteEnabled
+                depthWriteEnabled: depthWriteEnabled ?? brushSettings.depthWriteEnabled,
+                constantScreenSize: brushSettings.constantScreenSize
             )
         }
 
@@ -3907,7 +4087,8 @@ import simd
 	            zoomEffectiveAtCreation: Float(max(effectiveZoom, 1e-6)),
 	            device: device,                  // Pass device for buffer caching
 	            depthID: depthID,
-	            depthWriteEnabled: finalDepthWriteEnabled
+	            depthWriteEnabled: finalDepthWriteEnabled,
+	            constantScreenSize: brushSettings.constantScreenSize
 	        )
 	    }
 
