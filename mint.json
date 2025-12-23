@@ -1,0 +1,19 @@
+{
+  "name": "My Docs",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "favicon": "/favicon.png",
+  "colors": {
+    "primary": "#0F172A",
+    "light": "#3B82F6",
+    "dark": "#0B1120"
+  },
+  "navigation": [
+    {
+      "group": "Getting Started",
+      "pages": ["introduction", "quickstart"]
+    }
+  ]
+}
